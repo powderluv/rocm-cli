@@ -18,6 +18,7 @@ use ratatui::{
 };
 use rocm_core::{AppPaths, RocmCliConfig};
 use std::io::{self, Stdout};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 pub fn run(initial_provider: Option<String>) -> Result<()> {
@@ -51,6 +52,11 @@ struct App {
     history_index: Option<usize>,
     status: String,
     should_quit: bool,
+}
+
+struct CommandOutput {
+    ok: bool,
+    rendered: String,
 }
 
 impl App {
@@ -242,11 +248,10 @@ impl App {
                     self.push_block("Engines", &render_engine_inventory_text());
                     self.status = "Engine inventory refreshed.".to_owned();
                 } else {
-                    self.push_block(
-                        "Plan",
-                        "Engine installs are not executed inside the TUI yet.\n\nUse `rocm engines install <engine>` from the CLI.",
-                    );
-                    self.status = "Install redirected to CLI.".to_owned();
+                    self.status = "Running engine command...".to_owned();
+                    let mut cli_args = vec!["engines".to_owned()];
+                    cli_args.extend(args.iter().map(|value| (*value).to_owned()));
+                    self.run_cli_command("Engines", &cli_args);
                 }
                 true
             }
@@ -256,12 +261,19 @@ impl App {
                     self.push_block("Config", &render_config_text(&self.paths, &self.config));
                     self.status = "Config loaded.".to_owned();
                 } else {
-                    self.push_block(
-                        "Plan",
-                        "Config writes are not executed inside the TUI yet.\n\nUse `rocm config ...` from the CLI.",
-                    );
-                    self.status = "Config write redirected to CLI.".to_owned();
+                    self.status = "Running config command...".to_owned();
+                    let mut cli_args = vec!["config".to_owned()];
+                    cli_args.extend(args.iter().map(|value| (*value).to_owned()));
+                    self.run_cli_command("Config", &cli_args);
+                    self.refresh_config();
                 }
+                true
+            }
+            "install" => {
+                self.status = "Running install command...".to_owned();
+                let mut cli_args = vec!["install".to_owned()];
+                cli_args.extend(args.iter().map(|value| (*value).to_owned()));
+                self.run_cli_command("Install", &cli_args);
                 true
             }
             "services" => {
@@ -347,6 +359,14 @@ impl App {
                 }
                 true
             }
+            "serve" => {
+                self.push_block(
+                    "Plan",
+                    "Serving is not executed inline in the TUI yet because foreground servers would take over the session.\n\nUse `rocm serve ...` from another shell, or use `--managed` once you want rocmd to supervise it.",
+                );
+                self.status = "Serve redirected to CLI.".to_owned();
+                true
+            }
             "clear" => {
                 self.transcript.clear();
                 self.transcript_scroll = 0;
@@ -358,6 +378,23 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn run_cli_command(&mut self, title: &str, args: &[String]) {
+        match run_cli_command(args) {
+            Ok(output) => {
+                self.push_block(title, &output.rendered);
+                self.status = if output.ok {
+                    format!("{title} command completed.")
+                } else {
+                    format!("{title} command failed.")
+                };
+            }
+            Err(error) => {
+                self.push_block("Error", &error.to_string());
+                self.status = format!("{title} command failed to launch.");
+            }
         }
     }
 }
@@ -488,4 +525,74 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .min(layout[1].right().saturating_sub(2));
     let cursor_y = layout[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn run_cli_command(args: &[String]) -> Result<CommandOutput> {
+    let current_exe =
+        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+    let output = ProcessCommand::new(&current_exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to execute `{}`",
+                format_command_for_display(
+                    current_exe.as_os_str().to_string_lossy().as_ref(),
+                    args
+                )
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let mut rendered = String::new();
+    rendered.push_str("command: ");
+    rendered.push_str(&format_command_for_display("rocm", args));
+    rendered.push('\n');
+    rendered.push_str("status: ");
+    rendered.push_str(if output.status.success() {
+        "ok"
+    } else {
+        "failed"
+    });
+    rendered.push('\n');
+
+    if !stdout.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(stdout.as_str());
+        if !stdout.ends_with('\n') {
+            rendered.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        rendered.push('\n');
+        rendered.push_str("stderr:\n");
+        rendered.push_str(stderr.as_str());
+        if !stderr.ends_with('\n') {
+            rendered.push('\n');
+        }
+    }
+
+    Ok(CommandOutput {
+        ok: output.status.success(),
+        rendered: rendered.trim_end().to_owned(),
+    })
+}
+
+fn format_command_for_display(binary: &str, args: &[String]) -> String {
+    let mut rendered = String::from(binary);
+    for arg in args {
+        rendered.push(' ');
+        if arg.contains(' ') {
+            rendered.push('"');
+            rendered.push_str(arg);
+            rendered.push('"');
+        } else {
+            rendered.push_str(arg);
+        }
+    }
+    rendered
 }
