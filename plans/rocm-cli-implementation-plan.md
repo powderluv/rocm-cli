@@ -1,7 +1,7 @@
 # rocm-cli Implementation Plan
 
 ## Summary
-- Build `rocm-cli` as a TheRock-only local AI control plane for AMD systems. It should install and manage TheRock runtimes on Linux and Windows, optionally install Linux DKMS drivers through official AMD flows, run local model servers, and provide a chat-first terminal experience for ROCm/TheRock operations.
+- Build `rocm-cli` as the ROCm AI Command Center CLI for AMD systems. It should install and manage TheRock runtimes on Linux and Windows, optionally install Linux DKMS drivers through official AMD flows, run local model servers, and provide a chat-first terminal experience for ROCm/TheRock operations.
 - Make `rocm` default to an interactive TUI on a real TTY. The TUI should feel like a Codex-style interface: transcript, visible plans, tool execution, approvals, logs, and local state in one screen.
 - Keep TheRock as the only managed runtime stream:
   - `release`: latest stable TheRock release

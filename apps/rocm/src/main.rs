@@ -21,7 +21,7 @@ use std::time::Duration;
 const DEFAULT_RUNTIME_ID: &str = "therock-release";
 
 #[derive(Parser, Debug)]
-#[command(name = "rocm", about = "TheRock-oriented local AI control plane")]
+#[command(name = "rocm", about = "ROCm AI Command Center CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
