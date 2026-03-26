@@ -18,23 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-nightly-
-
       - name: Check for changes since last nightly
         id: check
         env:
@@ -53,7 +36,20 @@ jobs:
 
       - name: Build release binaries
         if: steps.check.outputs.skip != 'true'
-        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp/rocm-cli-home \
+            -v "$PWD":/work \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p "$HOME"
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cargo build --release --workspace
+            '
 
       - name: Package nightly bundle
         if: steps.check.outputs.skip != 'true'
@@ -63,7 +59,7 @@ jobs:
           DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}" dist x86_64-unknown-linux-musl
+          ./scripts/package-linux-release.sh "${DIST}"
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-nightly-linux-amd64.tar.gz
           cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-nightly-linux-amd64.tar.gz.sha256
