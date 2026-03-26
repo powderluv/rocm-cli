@@ -21,4 +21,8 @@ Workspace layout:
 - `crates/rocm-engine-protocol`: shared engine request and response types
 - `engines/pytorch`: first-party PyTorch serving engine
 
+Planning docs:
+- `plans/rocm-cli-implementation-plan.md`
+- `plans/rocm-cli-pytorch-engine-spec.md`
+
 This is the initial implementation scaffold, not a production release.
