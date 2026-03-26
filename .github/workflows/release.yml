@@ -22,23 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
-
       - name: Determine version
         id: version
         run: |
@@ -46,7 +29,20 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
-        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp/rocm-cli-home \
+            -v "$PWD":/work \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p "$HOME"
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cargo build --release --workspace
+            '
 
       - name: Package release bundle
         run: |
@@ -54,7 +50,7 @@ jobs:
           DIST="rocm-cli-${VERSION}-linux-amd64"
 
           chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}" dist x86_64-unknown-linux-musl
+          ./scripts/package-linux-release.sh "${DIST}"
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-linux-amd64.tar.gz
           cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-linux-amd64.tar.gz.sha256
