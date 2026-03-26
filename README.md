@@ -1,6 +1,6 @@
 # rocm-cli
 
-`rocm-cli` is a TheRock-focused local AI control plane for AMD systems.
+`rocm-cli` is a ROCm local AI control plane for AMD systems.
 
 Install on Linux x86_64:
 
