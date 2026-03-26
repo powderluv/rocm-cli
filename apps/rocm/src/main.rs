@@ -176,7 +176,7 @@ fn main() -> Result<()> {
 
 fn launch_default() -> Result<()> {
     if interactive_terminal() {
-        return tui::run();
+        return tui::run(None);
     }
 
     let paths = AppPaths::discover()?;
@@ -196,18 +196,18 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Chat { provider }) => {
-            println!("chat scaffold");
-            println!(
-                "  provider: {}",
-                provider.map(provider_name).unwrap_or("local")
+            if interactive_terminal() {
+                return tui::run(provider.map(provider_name).map(str::to_owned));
+            }
+            print!(
+                "{}",
+                render_chat_text(provider.map(provider_name).unwrap_or("local"))
             );
-            println!("  note: provider-backed chat will be layered on top of the TUI.");
             Ok(())
         }
         Some(Command::Install { target }) => install(target),
         Some(Command::Update) => {
-            println!("update scaffold");
-            println!("  policy: check every run, prompt before mutating state.");
+            print!("{}", render_update_text());
             Ok(())
         }
         Some(Command::Engines { command }) => engines(command),
@@ -228,15 +228,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs) => {
             let paths = AppPaths::discover()?;
-            println!("logs dir: {}", paths.data_dir.join("logs").display());
+            print!("{}", render_logs_text(&paths));
             Ok(())
         }
         Some(Command::Daemon) => {
-            println!("rocmd lifecycle");
-            println!("  default: on-demand");
-            println!(
-                "  persistent: only when automations or managed background services are enabled"
-            );
+            print!("{}", render_daemon_text());
             Ok(())
         }
         Some(Command::Uninstall {
@@ -698,6 +694,17 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
     output
 }
 
+pub(crate) fn render_chat_text(provider: &str) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "chat shell");
+    let _ = writeln!(output, "  provider: {provider}");
+    let _ = writeln!(
+        output,
+        "  note: launch from an interactive terminal to enter the TUI."
+    );
+    output
+}
+
 pub(crate) fn render_doctor_text() -> Result<String> {
     Ok(DoctorSummary::gather()?.render_text())
 }
@@ -783,7 +790,39 @@ pub(crate) fn render_services_text(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
-pub(crate) fn render_sidebar_text(paths: &AppPaths, config: &RocmCliConfig) -> String {
+pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "logs");
+    let _ = writeln!(output, "  dir: {}", paths.data_dir.join("logs").display());
+    output
+}
+
+pub(crate) fn render_update_text() -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "update");
+    let _ = writeln!(
+        output,
+        "  policy: check every run, prompt before mutating state."
+    );
+    output
+}
+
+pub(crate) fn render_daemon_text() -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "rocmd lifecycle");
+    let _ = writeln!(output, "  default: on-demand");
+    let _ = writeln!(
+        output,
+        "  persistent: only when automations or managed background services are enabled"
+    );
+    output
+}
+
+pub(crate) fn render_sidebar_text(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    provider: &str,
+) -> String {
     let records = load_managed_services(paths).unwrap_or_default();
     let default_engine = config
         .default_engine
@@ -793,6 +832,7 @@ pub(crate) fn render_sidebar_text(paths: &AppPaths, config: &RocmCliConfig) -> S
     let _ = writeln!(output, "ROCm AI Command Center CLI");
     let _ = writeln!(output, "os: {}", std::env::consts::OS);
     let _ = writeln!(output, "arch: {}", std::env::consts::ARCH);
+    let _ = writeln!(output, "provider: {provider}");
     let _ = writeln!(output, "default engine: {default_engine}");
     let _ = writeln!(output, "interactive: {}", interactive_terminal());
     let _ = writeln!(output, "services: {}", records.len());
@@ -850,12 +890,21 @@ pub(crate) fn tui_help_text() -> String {
     let _ = writeln!(output, "  /engines       show bundled engine inventory");
     let _ = writeln!(output, "  /config        show persisted config");
     let _ = writeln!(output, "  /services      show managed service manifests");
+    let _ = writeln!(output, "  /logs          show log directories");
+    let _ = writeln!(output, "  /update        show update policy");
+    let _ = writeln!(output, "  /daemon        show rocmd lifecycle");
+    let _ = writeln!(output, "  /provider X    switch provider for this session");
     let _ = writeln!(
         output,
         "  /uninstall     show the default uninstall dry-run"
     );
     let _ = writeln!(output, "  /clear         clear the transcript");
     let _ = writeln!(output, "  /quit          exit the TUI");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "keyboard");
+    let _ = writeln!(output, "  Up/Down        recall input history");
+    let _ = writeln!(output, "  PgUp/PgDn      scroll the transcript");
+    let _ = writeln!(output, "  Home/End       jump to top or bottom");
     let _ = writeln!(output);
     let _ = writeln!(output, "natural language");
     let _ = writeln!(output, "  serve Qwen3.5 with vllm");
