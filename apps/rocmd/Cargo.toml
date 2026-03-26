@@ -1,0 +1,13 @@
+[package]
+name = "rocmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rocm-core = { path = "../../crates/rocm-core" }
+serde_json.workspace = true

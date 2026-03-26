@@ -1,0 +1,24 @@
+# rocm-cli
+
+`rocm-cli` is a TheRock-focused local AI control plane for AMD systems.
+
+Current repository status:
+- Rust workspace scaffold for `rocm`, `rocmd`, shared core types, and engine protocol
+- first-party `pytorch` engine crate intended to be the default native Windows local serving path
+- placeholder CLI flows for `doctor`, `serve`, `engines`, `install`, and daemon lifecycle
+- initial plugin protocol structs shared across the workspace
+
+Planned product shape:
+- `rocm` chat-first TUI with Codex-like plan and tool execution views
+- TheRock-managed runtime installs with `pip` venvs by default and tarballs as an explicit option
+- native automations and watchers with contained sandbox execution
+- pluggable serving engines including `pytorch`, `llama.cpp`, `vllm`, `sglang`, and `atom`
+
+Workspace layout:
+- `apps/rocm`: main CLI and future TUI
+- `apps/rocmd`: local supervisor and daemon entrypoint
+- `crates/rocm-core`: app paths, host summary, shared defaults
+- `crates/rocm-engine-protocol`: shared engine request and response types
+- `engines/pytorch`: first-party PyTorch serving engine
+
+This is the initial implementation scaffold, not a production release.

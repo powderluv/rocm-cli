@@ -1,0 +1,29 @@
+[workspace]
+members = [
+  "apps/rocm",
+  "apps/rocmd",
+  "crates/rocm-core",
+  "crates/rocm-engine-protocol",
+  "engines/pytorch",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/powderluv/rocm-cli"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
