@@ -41,6 +41,7 @@ need_cmd tar
 need_cmd mkdir
 need_cmd mktemp
 need_cmd install
+need_cmd rm
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -84,6 +85,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+manifest_path="${INSTALL_DIR}/.rocm-cli-manifest"
+
 archive_path="${tmp_dir}/${asset_base}"
 sha_path="${archive_path}.sha256"
 
@@ -113,14 +116,39 @@ bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -f "${bundle_dir}/bin/rocm-engine-pytorch" ] || fail "bundle did not contain bin/rocm-engine-pytorch"
 
 mkdir -p "$INSTALL_DIR"
-for bin_name in rocm rocmd rocm-engine-pytorch; do
-  install -m 0755 "${bundle_dir}/bin/${bin_name}" "${INSTALL_DIR}/${bin_name}"
+
+if [ -f "$manifest_path" ]; then
+  echo "removing previous rocm-cli install"
+  while IFS= read -r installed_path; do
+    [ -n "$installed_path" ] || continue
+    case "$installed_path" in
+      "$INSTALL_DIR"/*)
+        rm -f "$installed_path"
+        ;;
+      *)
+        echo "warning: skipping manifest entry outside install dir: $installed_path" >&2
+        ;;
+    esac
+  done < "$manifest_path"
+  rm -f "$manifest_path"
+fi
+
+manifest_tmp="${tmp_dir}/install-manifest"
+: > "$manifest_tmp"
+for bin_path in "${bundle_dir}"/bin/*; do
+  [ -f "$bin_path" ] || continue
+  bin_name="${bin_path##*/}"
+  rm -f "${INSTALL_DIR}/${bin_name}"
+  install -m 0755 "$bin_path" "${INSTALL_DIR}/${bin_name}"
+  echo "${INSTALL_DIR}/${bin_name}" >> "$manifest_tmp"
 done
+install -m 0644 "$manifest_tmp" "$manifest_path"
 
 echo "installed:"
-echo "  ${INSTALL_DIR}/rocm"
-echo "  ${INSTALL_DIR}/rocmd"
-echo "  ${INSTALL_DIR}/rocm-engine-pytorch"
+while IFS= read -r installed_path; do
+  [ -n "$installed_path" ] || continue
+  echo "  ${installed_path}"
+done < "$manifest_path"
 
 case ":$PATH:" in
   *:"${INSTALL_DIR}":*)
