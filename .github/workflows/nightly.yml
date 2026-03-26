@@ -18,7 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -48,7 +53,7 @@ jobs:
 
       - name: Build release binaries
         if: steps.check.outputs.skip != 'true'
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
 
       - name: Package nightly bundle
         if: steps.check.outputs.skip != 'true'
@@ -58,7 +63,7 @@ jobs:
           DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}"
+          ./scripts/package-linux-release.sh "${DIST}" dist x86_64-unknown-linux-musl
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-nightly-linux-amd64.tar.gz
           cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-nightly-linux-amd64.tar.gz.sha256

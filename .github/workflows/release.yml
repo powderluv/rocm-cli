@@ -22,7 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -41,7 +46,7 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
 
       - name: Package release bundle
         run: |
@@ -49,7 +54,7 @@ jobs:
           DIST="rocm-cli-${VERSION}-linux-amd64"
 
           chmod +x install.sh scripts/package-linux-release.sh
-          ./scripts/package-linux-release.sh "${DIST}"
+          ./scripts/package-linux-release.sh "${DIST}" dist x86_64-unknown-linux-musl
 
           cp "dist/${DIST}.tar.gz" dist/rocm-cli-linux-amd64.tar.gz
           cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-linux-amd64.tar.gz.sha256
