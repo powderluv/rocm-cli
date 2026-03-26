@@ -910,6 +910,14 @@ pub(crate) fn tui_help_text() -> String {
     let _ = writeln!(output, "  serve Qwen3.5 with vllm");
     let _ = writeln!(output, "  install the latest therock release");
     let _ = writeln!(output, "  uninstall rocm-cli");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "plain commands");
+    let _ = writeln!(output, "  config set-default-engine pytorch");
+    let _ = writeln!(
+        output,
+        "  config set-engine pytorch --runtime-id therock-release"
+    );
+    let _ = writeln!(output, "  engines install pytorch --reinstall");
     output
 }
 
