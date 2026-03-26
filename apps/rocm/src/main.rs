@@ -1205,7 +1205,7 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
         if !path.is_file() {
             continue;
         }
-        if is_rocm_binary_name(name) {
+        if is_rocm_install_entry_name(name) {
             binaries.push(path);
         }
     }
@@ -1213,7 +1213,10 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
     Ok(binaries)
 }
 
-fn is_rocm_binary_name(name: &str) -> bool {
+fn is_rocm_install_entry_name(name: &str) -> bool {
+    if name == ".rocm-cli-manifest" {
+        return true;
+    }
     let normalized = name.strip_suffix(".exe").unwrap_or(name);
     normalized == "rocm" || normalized == "rocmd" || normalized.starts_with("rocm-engine-")
 }
