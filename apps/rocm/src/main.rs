@@ -1,3 +1,5 @@
+mod tui;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
@@ -11,9 +13,11 @@ use rocm_engine_protocol::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -72,6 +76,22 @@ enum Command {
     },
     Logs,
     Daemon,
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        keep_binaries: bool,
+        #[arg(long)]
+        keep_config: bool,
+        #[arg(long)]
+        keep_data: bool,
+        #[arg(long)]
+        keep_cache: bool,
+        #[arg(long)]
+        force_dev_binaries: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -155,45 +175,20 @@ fn main() -> Result<()> {
 }
 
 fn launch_default() -> Result<()> {
+    if interactive_terminal() {
+        return tui::run();
+    }
+
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    let selected_default_engine = config
-        .default_engine
-        .as_deref()
-        .unwrap_or(default_engine_for_platform());
-    println!("rocm interactive mode scaffold");
-    println!(
-        "  terminal: {}",
-        if interactive_terminal() {
-            "interactive"
-        } else {
-            "non-interactive"
-        }
-    );
-    println!("  default engine: {selected_default_engine}");
-    println!("  config dir: {}", paths.config_dir.display());
-    println!("  config file: {}", paths.config_path().display());
-    println!("  data dir: {}", paths.data_dir.display());
-    println!("  cache dir: {}", paths.cache_dir.display());
-    println!("  note: TUI is not implemented yet in this scaffold.");
+    print!("{}", render_launch_summary(&paths, &config));
     Ok(())
 }
 
 fn run_freeform(request: String) -> Result<()> {
-    println!("natural-language request captured");
-    println!("  request: {request}");
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    println!(
-        "  default engine: {}",
-        config
-            .default_engine
-            .as_deref()
-            .unwrap_or(default_engine_for_platform())
-    );
-    println!(
-        "  note: planner execution is not wired yet; this scaffold only captures the request."
-    );
+    print!("{}", render_freeform_plan(&request, &paths, &config));
     Ok(())
 }
 
@@ -244,13 +239,29 @@ fn dispatch(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::Uninstall {
+            yes,
+            dry_run,
+            keep_binaries,
+            keep_config,
+            keep_data,
+            keep_cache,
+            force_dev_binaries,
+        }) => uninstall(UninstallOptions {
+            yes,
+            dry_run,
+            keep_binaries,
+            keep_config,
+            keep_data,
+            keep_cache,
+            force_dev_binaries,
+        }),
         None => launch_default(),
     }
 }
 
 fn doctor() -> Result<()> {
-    let summary = DoctorSummary::gather()?;
-    print!("{}", summary.render_text());
+    print!("{}", render_doctor_text()?);
     Ok(())
 }
 
@@ -300,22 +311,7 @@ fn install(target: InstallTarget) -> Result<()> {
 fn engines(command: EnginesCommand) -> Result<()> {
     match command {
         EnginesCommand::List => {
-            let default_engine = default_engine_for_platform();
-            println!("engine inventory");
-            for (name, note) in [
-                ("pytorch", "default Windows local serving engine"),
-                ("llama.cpp", "CPU and quantized fallback engine"),
-                ("vllm", "default Linux ROCm GPU serving engine"),
-                ("sglang", "deferred advanced serving engine"),
-                ("atom", "deferred AMD-optimized serving engine"),
-            ] {
-                let marker = if name == default_engine { "*" } else { " " };
-                println!("{marker} {name:10} {note}");
-            }
-            println!(
-                "  protocol: {}",
-                rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
-            );
+            print!("{}", render_engine_inventory_text());
             Ok(())
         }
         EnginesCommand::Install {
@@ -643,41 +639,7 @@ fn config(command: ConfigCommand) -> Result<()> {
 
     match command {
         ConfigCommand::Show => {
-            println!("rocm config");
-            println!("  file: {}", paths.config_path().display());
-            println!(
-                "  default_engine: {}",
-                config
-                    .default_engine
-                    .as_deref()
-                    .unwrap_or("<platform default>")
-            );
-            if config.engines.is_empty() {
-                println!("  engines: none");
-                return Ok(());
-            }
-            for (engine, entry) in &config.engines {
-                println!("  engine: {engine}");
-                println!(
-                    "    preferred_runtime_id: {}",
-                    entry.preferred_runtime_id.as_deref().unwrap_or("<unset>")
-                );
-                println!(
-                    "    preferred_env_id: {}",
-                    entry.preferred_env_id.as_deref().unwrap_or("<unset>")
-                );
-                println!(
-                    "    last_installed_runtime_id: {}",
-                    entry
-                        .last_installed_runtime_id
-                        .as_deref()
-                        .unwrap_or("<unset>")
-                );
-                println!(
-                    "    last_installed_env_id: {}",
-                    entry.last_installed_env_id.as_deref().unwrap_or("<unset>")
-                );
-            }
+            print!("{}", render_config_text(&paths, &config));
         }
         ConfigCommand::SetEngine {
             engine,
@@ -714,6 +676,560 @@ fn config(command: ConfigCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    let selected_default_engine = config
+        .default_engine
+        .as_deref()
+        .unwrap_or(default_engine_for_platform());
+    let mut output = String::new();
+    let _ = writeln!(output, "rocm interactive shell");
+    let _ = writeln!(output, "  terminal: non-interactive");
+    let _ = writeln!(output, "  default engine: {selected_default_engine}");
+    let _ = writeln!(output, "  config dir: {}", paths.config_dir.display());
+    let _ = writeln!(output, "  config file: {}", paths.config_path().display());
+    let _ = writeln!(output, "  data dir: {}", paths.data_dir.display());
+    let _ = writeln!(output, "  cache dir: {}", paths.cache_dir.display());
+    let _ = writeln!(
+        output,
+        "  note: launch from an interactive terminal to enter the TUI."
+    );
+    output
+}
+
+pub(crate) fn render_doctor_text() -> Result<String> {
+    Ok(DoctorSummary::gather()?.render_text())
+}
+
+pub(crate) fn render_engine_inventory_text() -> String {
+    let default_engine = default_engine_for_platform();
+    let mut output = String::new();
+    let _ = writeln!(output, "engine inventory");
+    for (name, note) in engine_inventory() {
+        let marker = if *name == default_engine { "*" } else { " " };
+        let _ = writeln!(output, "{marker} {name:10} {note}");
+    }
+    let _ = writeln!(
+        output,
+        "  protocol: {}",
+        rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+    );
+    output
+}
+
+pub(crate) fn render_config_text(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "rocm config");
+    let _ = writeln!(output, "  file: {}", paths.config_path().display());
+    let _ = writeln!(
+        output,
+        "  default_engine: {}",
+        config
+            .default_engine
+            .as_deref()
+            .unwrap_or("<platform default>")
+    );
+    if config.engines.is_empty() {
+        let _ = writeln!(output, "  engines: none");
+        return output;
+    }
+    for (engine, entry) in &config.engines {
+        let _ = writeln!(output, "  engine: {engine}");
+        let _ = writeln!(
+            output,
+            "    preferred_runtime_id: {}",
+            entry.preferred_runtime_id.as_deref().unwrap_or("<unset>")
+        );
+        let _ = writeln!(
+            output,
+            "    preferred_env_id: {}",
+            entry.preferred_env_id.as_deref().unwrap_or("<unset>")
+        );
+        let _ = writeln!(
+            output,
+            "    last_installed_runtime_id: {}",
+            entry
+                .last_installed_runtime_id
+                .as_deref()
+                .unwrap_or("<unset>")
+        );
+        let _ = writeln!(
+            output,
+            "    last_installed_env_id: {}",
+            entry.last_installed_env_id.as_deref().unwrap_or("<unset>")
+        );
+    }
+    output
+}
+
+pub(crate) fn render_services_text(paths: &AppPaths) -> Result<String> {
+    let records = load_managed_services(paths)?;
+    let mut output = String::new();
+    let _ = writeln!(output, "managed services");
+    if records.is_empty() {
+        let _ = writeln!(output, "  services: none");
+        return Ok(output);
+    }
+
+    for record in records {
+        let _ = writeln!(
+            output,
+            "  service {} engine={} status={} endpoint={}",
+            record.service_id, record.engine, record.status, record.endpoint_url
+        );
+    }
+
+    Ok(output)
+}
+
+pub(crate) fn render_sidebar_text(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    let records = load_managed_services(paths).unwrap_or_default();
+    let default_engine = config
+        .default_engine
+        .as_deref()
+        .unwrap_or(default_engine_for_platform());
+    let mut output = String::new();
+    let _ = writeln!(output, "ROCm AI Command Center CLI");
+    let _ = writeln!(output, "os: {}", std::env::consts::OS);
+    let _ = writeln!(output, "arch: {}", std::env::consts::ARCH);
+    let _ = writeln!(output, "default engine: {default_engine}");
+    let _ = writeln!(output, "interactive: {}", interactive_terminal());
+    let _ = writeln!(output, "services: {}", records.len());
+    let _ = writeln!(output, "config: {}", paths.config_path().display());
+    let _ = writeln!(output, "data: {}", paths.data_dir.display());
+    let _ = writeln!(output, "cache: {}", paths.cache_dir.display());
+    if !config.engines.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "engine prefs:");
+        for (engine, entry) in &config.engines {
+            let selected = entry
+                .preferred_env_id
+                .as_deref()
+                .or(entry.preferred_runtime_id.as_deref())
+                .or(entry.last_installed_env_id.as_deref())
+                .or(entry.last_installed_runtime_id.as_deref())
+                .unwrap_or("<unset>");
+            let _ = writeln!(output, "  {engine}: {selected}");
+        }
+    }
+    output
+}
+
+pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
+    let services_dir = paths.services_dir();
+    if !services_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&services_dir)
+        .with_context(|| format!("failed to read {}", services_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        if let Ok(record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
+            records.push(record);
+        }
+    }
+
+    records.sort_by(|left, right| right.created_at_unix_ms.cmp(&left.created_at_unix_ms));
+    Ok(records)
+}
+
+pub(crate) fn tui_help_text() -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "slash commands");
+    let _ = writeln!(output, "  /help          show this help");
+    let _ = writeln!(output, "  /doctor        inspect host and default paths");
+    let _ = writeln!(output, "  /engines       show bundled engine inventory");
+    let _ = writeln!(output, "  /config        show persisted config");
+    let _ = writeln!(output, "  /services      show managed service manifests");
+    let _ = writeln!(
+        output,
+        "  /uninstall     show the default uninstall dry-run"
+    );
+    let _ = writeln!(output, "  /clear         clear the transcript");
+    let _ = writeln!(output, "  /quit          exit the TUI");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "natural language");
+    let _ = writeln!(output, "  serve Qwen3.5 with vllm");
+    let _ = writeln!(output, "  install the latest therock release");
+    let _ = writeln!(output, "  uninstall rocm-cli");
+    output
+}
+
+pub(crate) fn render_freeform_plan(
+    request: &str,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> String {
+    let trimmed = request.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let default_engine = config
+        .default_engine
+        .as_deref()
+        .unwrap_or(default_engine_for_platform());
+    let engine = infer_engine_from_request(&lower).unwrap_or(default_engine);
+    let mut output = String::new();
+    let _ = writeln!(output, "request plan");
+    let _ = writeln!(output, "  request: {trimmed}");
+
+    if lower.contains("serve") {
+        let model = infer_model_from_request(trimmed).unwrap_or("<model>");
+        let _ = writeln!(output, "  intent: serve");
+        let _ = writeln!(output, "  selected engine: {engine}");
+        let _ = writeln!(output, "  selected model: {model}");
+        let _ = writeln!(output, "  plan:");
+        let _ = writeln!(output, "    1. resolve the model recipe and engine runtime");
+        let _ = writeln!(
+            output,
+            "    2. verify the preferred env or install one if needed"
+        );
+        let _ = writeln!(output, "    3. start a local OpenAI-compatible endpoint");
+        let _ = writeln!(
+            output,
+            "  suggested command: rocm serve {model} --engine {engine}"
+        );
+        return output;
+    }
+
+    if lower.contains("driver") {
+        let _ = writeln!(output, "  intent: install driver");
+        let _ = writeln!(
+            output,
+            "  suggested command: rocm install driver{}",
+            if lower.contains("dkms") {
+                " --dkms"
+            } else {
+                ""
+            }
+        );
+        let _ = writeln!(
+            output,
+            "  note: driver changes are always explicit and never silent."
+        );
+        return output;
+    }
+
+    if lower.contains("install") || lower.contains("therock") || lower.contains("sdk") {
+        let channel = if lower.contains("nightly") {
+            "nightly"
+        } else {
+            "release"
+        };
+        let _ = writeln!(output, "  intent: install sdk");
+        let _ = writeln!(output, "  selected channel: {channel}");
+        let _ = writeln!(
+            output,
+            "  suggested command: rocm install sdk --channel {channel}"
+        );
+        return output;
+    }
+
+    if lower.contains("update") {
+        let _ = writeln!(output, "  intent: update check");
+        let _ = writeln!(output, "  suggested command: rocm update");
+        let _ = writeln!(
+            output,
+            "  note: update checks should compare against the selected release channel."
+        );
+        return output;
+    }
+
+    if lower.contains("uninstall") || lower.contains("remove rocm") {
+        let _ = writeln!(output, "  intent: uninstall");
+        let _ = writeln!(output, "  suggested command: rocm uninstall --dry-run");
+        let _ = writeln!(output, "  data dir: {}", paths.data_dir.display());
+        return output;
+    }
+
+    let _ = writeln!(output, "  intent: ask or inspect");
+    let _ = writeln!(output, "  selected engine: {engine}");
+    let _ = writeln!(
+        output,
+        "  note: enter the TUI with `rocm` to inspect config, services, and plans interactively."
+    );
+    output
+}
+
+#[derive(Debug, Clone, Default)]
+struct UninstallOptions {
+    yes: bool,
+    dry_run: bool,
+    keep_binaries: bool,
+    keep_config: bool,
+    keep_data: bool,
+    keep_cache: bool,
+    force_dev_binaries: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UninstallPlanEntry {
+    kind: &'static str,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UninstallPlan {
+    actions: Vec<UninstallPlanEntry>,
+    skipped: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn uninstall(options: UninstallOptions) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let plan = build_uninstall_plan(&paths, &options)?;
+    print!("{}", render_uninstall_plan(&plan, &options));
+
+    if plan.actions.is_empty() || options.dry_run {
+        return Ok(());
+    }
+
+    if !options.yes {
+        if !interactive_terminal() {
+            bail!("uninstall requires --yes outside an interactive terminal");
+        }
+        if !confirm_uninstall()? {
+            println!("uninstall cancelled");
+            return Ok(());
+        }
+    }
+
+    for entry in &plan.actions {
+        remove_path(&entry.path)
+            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
+        println!("removed {} {}", entry.kind, entry.path.display());
+    }
+    println!("uninstall complete");
+    Ok(())
+}
+
+fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
+    let mut plan = UninstallPlan::default();
+
+    if !options.keep_binaries {
+        let current_exe =
+            std::env::current_exe().context("failed to discover current rocm executable")?;
+        if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+            plan.skipped.push(format!(
+                "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+                current_exe.display()
+            ));
+        } else {
+            for path in collect_installed_binary_candidates(&current_exe)? {
+                if cfg!(windows) && path == current_exe {
+                    plan.skipped.push(format!(
+                        "skipping running executable on Windows: {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                plan.actions.push(UninstallPlanEntry {
+                    kind: "binary",
+                    path,
+                });
+            }
+        }
+    } else {
+        plan.skipped
+            .push("binary removal disabled by --keep-binaries".to_owned());
+    }
+
+    for (keep, kind, path) in [
+        (options.keep_config, "config", paths.config_dir.clone()),
+        (options.keep_data, "data", paths.data_dir.clone()),
+        (options.keep_cache, "cache", paths.cache_dir.clone()),
+    ] {
+        if keep {
+            plan.skipped
+                .push(format!("{kind} removal disabled by command line flag"));
+            continue;
+        }
+        if path.exists() {
+            plan.actions.push(UninstallPlanEntry { kind, path });
+        } else {
+            plan.skipped
+                .push(format!("{kind} path not present: {}", path.display()));
+        }
+    }
+
+    let managed_services = load_managed_services(paths).unwrap_or_default();
+    if !managed_services.is_empty() {
+        plan.warnings.push(format!(
+            "{} managed service record(s) exist under {}; background processes are not stopped automatically in this pass",
+            managed_services.len(),
+            paths.services_dir().display()
+        ));
+    }
+
+    plan.actions
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    plan.actions.dedup_by(|left, right| left.path == right.path);
+    Ok(plan)
+}
+
+pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
+    let options = UninstallOptions {
+        dry_run: true,
+        ..UninstallOptions::default()
+    };
+    let plan = build_uninstall_plan(paths, &options)?;
+    Ok(render_uninstall_plan(&plan, &options))
+}
+
+fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "uninstall plan");
+    let _ = writeln!(
+        output,
+        "  mode: {}",
+        if options.dry_run { "dry-run" } else { "apply" }
+    );
+    if plan.actions.is_empty() {
+        let _ = writeln!(output, "  actions: none");
+    } else {
+        let _ = writeln!(output, "  actions:");
+        for entry in &plan.actions {
+            let _ = writeln!(
+                output,
+                "    remove {:7} {}",
+                entry.kind,
+                entry.path.display()
+            );
+        }
+    }
+    for warning in &plan.warnings {
+        let _ = writeln!(output, "  warning: {warning}");
+    }
+    for skipped in &plan.skipped {
+        let _ = writeln!(output, "  skipped: {skipped}");
+    }
+    if options.dry_run {
+        let _ = writeln!(
+            output,
+            "  next step: rerun with `rocm uninstall --yes` to apply"
+        );
+    }
+    output
+}
+
+fn confirm_uninstall() -> Result<bool> {
+    print!("Proceed with uninstall? [y/N]: ");
+    io::stdout()
+        .flush()
+        .context("failed to flush uninstall prompt")?;
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .context("failed to read uninstall confirmation")?;
+    let normalized = response.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf>> {
+    let binary_dir = current_exe
+        .parent()
+        .context("current executable has no parent directory")?;
+    let mut binaries = Vec::new();
+    for entry in fs::read_dir(binary_dir)
+        .with_context(|| format!("failed to read {}", binary_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        if is_rocm_binary_name(name) {
+            binaries.push(path);
+        }
+    }
+    binaries.sort();
+    Ok(binaries)
+}
+
+fn is_rocm_binary_name(name: &str) -> bool {
+    let normalized = name.strip_suffix(".exe").unwrap_or(name);
+    normalized == "rocm" || normalized == "rocmd" || normalized.starts_with("rocm-engine-")
+}
+
+fn is_dev_binary_layout(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(parent_name) = parent.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if parent_name != "debug" && parent_name != "release" {
+        return false;
+    }
+    parent
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        == Some("target")
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        bail!("unsupported filesystem entry for {}", path.display());
+    }
+    Ok(())
+}
+
+fn engine_inventory() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("pytorch", "default Windows local serving engine"),
+        ("llama.cpp", "CPU and quantized fallback engine"),
+        ("vllm", "default Linux ROCm GPU serving engine"),
+        ("sglang", "deferred advanced serving engine"),
+        ("atom", "deferred AMD-optimized serving engine"),
+    ]
+}
+
+fn infer_engine_from_request<'a>(lower: &'a str) -> Option<&'a str> {
+    for engine in ["pytorch", "llama.cpp", "vllm", "sglang", "atom"] {
+        if lower.contains(engine) {
+            return Some(engine);
+        }
+    }
+    if lower.contains("llama cpp") {
+        return Some("llama.cpp");
+    }
+    None
+}
+
+fn infer_model_from_request(request: &str) -> Option<&str> {
+    let trimmed = request.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let serve_index = lower.find("serve")?;
+    let after = trimmed.get(serve_index + "serve".len()..)?.trim();
+    if after.is_empty() {
+        return None;
+    }
+    let end = after
+        .find(" with ")
+        .or_else(|| after.find(" using "))
+        .unwrap_or(after.len());
+    let model = after[..end].trim();
+    (!model.is_empty()).then_some(model)
 }
 
 fn provider_name(provider: Provider) -> &'static str {
@@ -953,6 +1469,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "config",
         "logs",
         "daemon",
+        "uninstall",
         "help",
         "--help",
         "-h",

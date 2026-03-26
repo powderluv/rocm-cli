@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 serde.workspace = true
