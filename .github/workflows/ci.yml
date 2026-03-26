@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Acceptance install lifecycle
+        run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
+
   fmt:
     runs-on: ubuntu-latest
     steps:
