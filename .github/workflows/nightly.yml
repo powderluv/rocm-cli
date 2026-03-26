@@ -1,0 +1,94 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: Build and publish nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nightly-
+
+      - name: Check for changes since last nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
+          COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
+          echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
+          if [ "${COMMITS}" -eq 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits since last nightly — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${COMMITS} new commit(s) since last nightly"
+          fi
+
+      - name: Build release binaries
+        if: steps.check.outputs.skip != 'true'
+        run: cargo build --release --workspace
+
+      - name: Package nightly bundle
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
+
+          chmod +x install.sh scripts/package-linux-release.sh
+          ./scripts/package-linux-release.sh "${DIST}"
+
+          cp "dist/${DIST}.tar.gz" dist/rocm-cli-nightly-linux-amd64.tar.gz
+          cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-nightly-linux-amd64.tar.gz.sha256
+
+          echo "DIST=${DIST}" >> "$GITHUB_ENV"
+          echo "DATE=${DATE}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Update nightly release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create nightly \
+            --title "rocm-cli nightly (${DATE} · ${SHORT_SHA})" \
+            --notes "$(cat <<EOF
+          Automated nightly build from \`main\` at $(date -u +"%Y-%m-%d %H:%M UTC").
+
+          Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
+
+          ${{ steps.check.outputs.commits }} commit(s) since the previous nightly.
+
+          Install the latest nightly on Linux x86_64:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- nightly
+          \`\`\`
+          EOF
+          )" \
+            --prerelease \
+            dist/*.tar.gz dist/*.tar.gz.sha256

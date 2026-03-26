@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Package release bundle
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          DIST="rocm-cli-${VERSION}-linux-amd64"
+
+          chmod +x install.sh scripts/package-linux-release.sh
+          ./scripts/package-linux-release.sh "${DIST}"
+
+          cp "dist/${DIST}.tar.gz" dist/rocm-cli-linux-amd64.tar.gz
+          cp "dist/${DIST}.tar.gz.sha256" dist/rocm-cli-linux-amd64.tar.gz.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          gh release create "${VERSION}" \
+            --title "rocm-cli ${VERSION}" \
+            --notes "$(cat <<EOF
+          Install the latest stable release on Linux x86_64:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+          \`\`\`
+
+          Install a specific tagged release:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- ${VERSION}
+          \`\`\`
+          EOF
+          )" \
+            dist/*.tar.gz dist/*.tar.gz.sha256

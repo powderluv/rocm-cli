@@ -2,6 +2,18 @@
 
 `rocm-cli` is a TheRock-focused local AI control plane for AMD systems.
 
+Install on Linux x86_64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh | sh
+```
+
+Install the latest nightly on Linux x86_64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh | sh -s -- nightly
+```
+
 Current repository status:
 - Rust workspace scaffold for `rocm`, `rocmd`, shared core types, and engine protocol
 - first-party `pytorch` engine crate intended to be the default native Windows local serving path
