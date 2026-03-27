@@ -4,6 +4,7 @@ set -eu
 REPO="${ROCM_CLI_GITHUB_REPO:-powderluv/rocm-cli}"
 CHANNEL="${1:-release}"
 INSTALL_DIR="${ROCM_CLI_INSTALL_DIR:-$HOME/.local/bin}"
+UPDATE_SHELL_PATH="${ROCM_CLI_UPDATE_SHELL_PATH:-1}"
 
 fail() {
   echo "rocm-cli installer: $*" >&2
@@ -29,9 +30,17 @@ fetch() {
   url="$1"
   output="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$output"
+    if [ -t 2 ]; then
+      curl -fL --progress-bar "$url" -o "$output"
+    else
+      curl -fsSL "$url" -o "$output"
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$output" "$url"
+    if [ -t 2 ]; then
+      wget --show-progress -O "$output" "$url"
+    else
+      wget -qO "$output" "$url"
+    fi
   else
     fail "missing curl or wget"
   fi
@@ -42,6 +51,110 @@ need_cmd mkdir
 need_cmd mktemp
 need_cmd install
 need_cmd rm
+need_cmd grep
+need_cmd sed
+
+shell_name() {
+  if [ -n "${ROCM_CLI_SHELL_NAME:-}" ]; then
+    printf '%s\n' "${ROCM_CLI_SHELL_NAME}"
+    return
+  fi
+
+  shell_path="${SHELL:-}"
+  if [ -z "$shell_path" ]; then
+    printf '%s\n' "sh"
+    return
+  fi
+  printf '%s\n' "${shell_path##*/}"
+}
+
+profile_path_for_shell() {
+  if [ -n "${ROCM_CLI_SHELL_PROFILE:-}" ]; then
+    printf '%s\n' "${ROCM_CLI_SHELL_PROFILE}"
+    return
+  fi
+
+  case "$(shell_name)" in
+    bash) printf '%s\n' "$HOME/.bashrc" ;;
+    zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
+    ksh) printf '%s\n' "$HOME/.kshrc" ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+path_expr_for_profile() {
+  path="$1"
+  case "$path" in
+    "$HOME")
+      printf '%s\n' '$HOME'
+      ;;
+    "$HOME"/*)
+      printf '%s\n' "\$HOME/${path#$HOME/}"
+      ;;
+    *)
+      printf '%s\n' "$path"
+      ;;
+  esac
+}
+
+escape_for_double_quotes() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+profile_has_path_entry() {
+  profile="$1"
+  path_expr="$2"
+  [ -f "$profile" ] || return 1
+  grep -F "# >>> rocm-cli path >>>" "$profile" >/dev/null 2>&1 && return 0
+  grep -F "$path_expr" "$profile" >/dev/null 2>&1 && return 0
+  grep -F "$INSTALL_DIR" "$profile" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+append_path_snippet() {
+  profile="$1"
+  shell_kind="$2"
+  path_expr="$3"
+  escaped_path_expr="$(escape_for_double_quotes "$path_expr")"
+
+  profile_dir="${profile%/*}"
+  if [ "$profile_dir" != "$profile" ]; then
+    mkdir -p "$profile_dir"
+  fi
+  [ -f "$profile" ] || : > "$profile"
+
+  if profile_has_path_entry "$profile" "$path_expr"; then
+    printf '%s\n' "unchanged:${profile}"
+    return 0
+  fi
+
+  case "$shell_kind" in
+    fish)
+      cat >> "$profile" <<EOF
+
+# >>> rocm-cli path >>>
+if not contains -- "${escaped_path_expr}" \$PATH
+    set -gx PATH "${escaped_path_expr}" \$PATH
+end
+# <<< rocm-cli path <<<
+EOF
+      ;;
+    *)
+      cat >> "$profile" <<EOF
+
+# >>> rocm-cli path >>>
+case ":\$PATH:" in
+  *:"${escaped_path_expr}":*) ;;
+  *) export PATH="${escaped_path_expr}:\$PATH" ;;
+esac
+# <<< rocm-cli path <<<
+EOF
+      ;;
+  esac
+
+  printf '%s\n' "updated:${profile}"
+}
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -154,9 +267,33 @@ case ":$PATH:" in
   *:"${INSTALL_DIR}":*)
     ;;
   *)
-    echo "note: ${INSTALL_DIR} is not on PATH"
-    echo "  add this to your shell profile:"
-    echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    if [ "$UPDATE_SHELL_PATH" = "1" ]; then
+      profile_path="$(profile_path_for_shell)"
+      path_expr="$(path_expr_for_profile "$INSTALL_DIR")"
+      profile_result="$(append_path_snippet "$profile_path" "$(shell_name)" "$path_expr")" || true
+      case "$profile_result" in
+        updated:*)
+          echo "shell path updated:"
+          echo "  profile: ${profile_result#updated:}"
+          echo "  added: ${path_expr}"
+          echo "  restart your shell or run:"
+          echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+          ;;
+        unchanged:*)
+          echo "shell path already configured:"
+          echo "  profile: ${profile_result#unchanged:}"
+          ;;
+        *)
+          echo "note: ${INSTALL_DIR} is not on PATH"
+          echo "  add this to your shell profile:"
+          echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+          ;;
+      esac
+    else
+      echo "note: ${INSTALL_DIR} is not on PATH"
+      echo "  add this to your shell profile:"
+      echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    fi
     ;;
 esac
 

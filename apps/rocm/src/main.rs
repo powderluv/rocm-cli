@@ -13,8 +13,9 @@ use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, InstallRequest,
     InstallResponse, ResolveModelRequest, ResolveModelResponse,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
@@ -126,6 +127,15 @@ enum EnginesCommand {
         python_version: Option<String>,
         #[arg(long)]
         reinstall: bool,
+    },
+    Shell {
+        engine: String,
+        #[arg(long, conflicts_with = "env_id")]
+        runtime_id: Option<String>,
+        #[arg(long, conflicts_with = "runtime_id")]
+        env_id: Option<String>,
+        #[arg(long)]
+        shell: Option<String>,
     },
 }
 
@@ -383,6 +393,190 @@ fn engines(command: EnginesCommand) -> Result<()> {
             }
             Ok(())
         }
+        EnginesCommand::Shell {
+            engine,
+            runtime_id,
+            env_id,
+            shell,
+        } => engine_shell(
+            &engine,
+            runtime_id.as_deref(),
+            env_id.as_deref(),
+            shell.as_deref(),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManagedEngineEnvManifest {
+    env_id: String,
+    runtime_id: String,
+    python_executable: String,
+    env_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEngineEnv {
+    env_id: String,
+    runtime_id: String,
+    python_executable: String,
+    env_path: PathBuf,
+    source: String,
+}
+
+fn engine_shell(
+    engine: &str,
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+    shell_override: Option<&str>,
+) -> Result<()> {
+    if !interactive_terminal() {
+        bail!("`rocm engines shell` requires an interactive terminal");
+    }
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths)?;
+    let resolved = resolve_engine_env(&paths, &config, engine, runtime_id, env_id)?;
+    let shell_program = shell_override
+        .map(str::to_owned)
+        .or_else(default_shell_program)
+        .context("unable to determine an interactive shell; set --shell or SHELL")?;
+    let venv_bin = managed_env_bin_dir(&resolved.env_path);
+    let shell_hint = activation_hint(&resolved.env_path);
+
+    println!("engine shell");
+    println!("  engine: {engine}");
+    println!("  source: {}", resolved.source);
+    println!("  env_id: {}", resolved.env_id);
+    println!("  runtime_id: {}", resolved.runtime_id);
+    println!("  env_path: {}", resolved.env_path.display());
+    println!("  python: {}", resolved.python_executable);
+    println!("  shell: {shell_program}");
+    println!("  activate_hint: {shell_hint}");
+    println!("  exit_hint: use `exit` or Ctrl-D to leave the managed env shell");
+
+    let path_with_env = prepend_path(&venv_bin, std::env::var_os("PATH"))
+        .context("failed to compose PATH for managed engine env shell")?;
+    let mut command = ProcessCommand::new(&shell_program);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("VIRTUAL_ENV", &resolved.env_path)
+        .env("PATH", path_with_env)
+        .env("ROCM_CLI_ENGINE", engine)
+        .env("ROCM_CLI_ENV_ID", &resolved.env_id)
+        .env("ROCM_CLI_RUNTIME_ID", &resolved.runtime_id)
+        .env("ROCM_CLI_PYTHON", &resolved.python_executable);
+
+    if !cfg!(windows) {
+        let prompt = format!("(rocm:{engine}) ");
+        command.env("VIRTUAL_ENV_PROMPT", &prompt);
+        command.env("PS1", format!("{prompt}${{PS1:-}}"));
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch shell `{shell_program}`"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("managed engine shell exited with status {status}");
+    }
+}
+
+fn resolve_engine_env(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    engine: &str,
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+) -> Result<ResolvedEngineEnv> {
+    let selection = resolve_engine_selection(config, engine, runtime_id, env_id);
+    if let Some(env_id) = selection.env_id.as_deref() {
+        let manifest = load_engine_env_manifest(paths, engine, env_id)?;
+        return Ok(ResolvedEngineEnv {
+            env_id: manifest.env_id,
+            runtime_id: manifest.runtime_id,
+            python_executable: manifest.python_executable,
+            env_path: manifest.env_path,
+            source: selection
+                .source
+                .unwrap_or_else(|| "manifest_env_id".to_owned()),
+        });
+    }
+
+    let runtime_id = selection
+        .runtime_id
+        .unwrap_or_else(|| DEFAULT_RUNTIME_ID.to_owned());
+    let response = engine_request::<_, InstallResponse>(
+        engine,
+        EngineMethod::Install,
+        &InstallRequest {
+            runtime_id: runtime_id.clone(),
+            python_version: None,
+            reinstall: false,
+        },
+    )?;
+    Ok(ResolvedEngineEnv {
+        env_id: response.env_id,
+        runtime_id,
+        python_executable: response.python_executable,
+        env_path: PathBuf::from(response.env_path),
+        source: selection
+            .source
+            .unwrap_or_else(|| "auto_install".to_owned()),
+    })
+}
+
+fn load_engine_env_manifest(
+    paths: &AppPaths,
+    engine: &str,
+    env_id: &str,
+) -> Result<ManagedEngineEnvManifest> {
+    let path = paths
+        .engine_manifests_dir(engine)
+        .join(format!("{env_id}.json"));
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn managed_env_bin_dir(env_path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        env_path.join("Scripts")
+    } else {
+        env_path.join("bin")
+    }
+}
+
+fn prepend_path(prefix: &Path, current_path: Option<OsString>) -> Result<OsString> {
+    let mut parts = vec![prefix.to_path_buf()];
+    if let Some(current_path) = current_path.as_ref() {
+        parts.extend(std::env::split_paths(current_path));
+    }
+    std::env::join_paths(parts).context("failed to join PATH entries")
+}
+
+fn default_shell_program() -> Option<String> {
+    if cfg!(windows) {
+        std::env::var("COMSPEC")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }
+}
+
+fn activation_hint(env_path: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "{}",
+            env_path.join("Scripts").join("activate.bat").display()
+        )
+    } else {
+        format!("source {}", env_path.join("bin").join("activate").display())
     }
 }
 
@@ -1053,6 +1247,10 @@ pub(crate) fn tui_help_text() -> String {
     );
     let _ = writeln!(output, "  /services      show managed service manifests");
     let _ = writeln!(output, "  /logs          show log directories");
+    let _ = writeln!(
+        output,
+        "  /gpu           show the latest amd-smi telemetry snapshot"
+    );
     let _ = writeln!(output, "  /update        show update policy");
     let _ = writeln!(output, "  /daemon        show rocmd lifecycle");
     let _ = writeln!(output, "  /provider X    switch provider for this session");
