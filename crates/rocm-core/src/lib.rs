@@ -33,6 +33,7 @@ impl AppPaths {
             &self.config_dir,
             &self.data_dir,
             &self.cache_dir,
+            &self.automations_dir(),
             &self.data_dir.join("engines"),
             &self.data_dir.join("logs"),
             &self.data_dir.join("services"),
@@ -75,6 +76,18 @@ impl AppPaths {
 
     pub fn services_dir(&self) -> PathBuf {
         self.data_dir.join("services")
+    }
+
+    pub fn automations_dir(&self) -> PathBuf {
+        self.data_dir.join("automations")
+    }
+
+    pub fn automation_state_path(&self) -> PathBuf {
+        self.automations_dir().join("runtime-state.json")
+    }
+
+    pub fn automation_events_path(&self) -> PathBuf {
+        self.automations_dir().join("events.jsonl")
     }
 
     pub fn service_manifest_path(&self, service_id: &str) -> PathBuf {
@@ -149,6 +162,58 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherMode {
+    Observe,
+    Propose,
+    Contained,
+}
+
+impl WatcherMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Propose => "propose",
+            Self::Contained => "contained",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinWatcherSpec {
+    pub id: &'static str,
+    pub summary: &'static str,
+    pub trigger: &'static str,
+    pub default_mode: WatcherMode,
+    pub actions: &'static [&'static str],
+}
+
+const BUILTIN_WATCHERS: &[BuiltinWatcherSpec] = &[
+    BuiltinWatcherSpec {
+        id: "therock-update",
+        summary: "Emit scheduled TheRock update reminders and proposals.",
+        trigger: "schedule: every 6h",
+        default_mode: WatcherMode::Observe,
+        actions: &["remind_update_check", "queue_update_proposal"],
+    },
+    BuiltinWatcherSpec {
+        id: "server-recover",
+        summary: "Observe or restart failed managed services when restart metadata exists.",
+        trigger: "event: managed_service_failed",
+        default_mode: WatcherMode::Contained,
+        actions: &["collect_failure_snapshot", "restart_managed_service"],
+    },
+];
+
+pub fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
+    BUILTIN_WATCHERS
+}
+
+pub fn builtin_watcher(id: &str) -> Option<&'static BuiltinWatcherSpec> {
+    builtin_watchers().iter().find(|watcher| watcher.id == id)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineUserConfig {
     #[serde(default)]
@@ -162,11 +227,29 @@ pub struct EngineUserConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatcherUserConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: Option<WatcherMode>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutomationsConfig {
+    #[serde(default)]
+    pub daemon_enabled: bool,
+    #[serde(default)]
+    pub watchers: BTreeMap<String, WatcherUserConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RocmCliConfig {
     #[serde(default)]
     pub default_engine: Option<String>,
     #[serde(default)]
     pub engines: BTreeMap<String, EngineUserConfig>,
+    #[serde(default)]
+    pub automations: AutomationsConfig,
 }
 
 impl RocmCliConfig {
@@ -200,6 +283,142 @@ impl RocmCliConfig {
     pub fn engine_config_mut(&mut self, engine: &str) -> &mut EngineUserConfig {
         self.engines.entry(engine.to_owned()).or_default()
     }
+
+    pub fn watcher_config(&self, watcher: &str) -> Option<&WatcherUserConfig> {
+        self.automations.watchers.get(watcher)
+    }
+
+    pub fn watcher_config_mut(&mut self, watcher: &str) -> &mut WatcherUserConfig {
+        self.automations
+            .watchers
+            .entry(watcher.to_owned())
+            .or_default()
+    }
+
+    pub fn automation_daemon_enabled(&self) -> bool {
+        self.automations.daemon_enabled || self.automations.watchers.values().any(|cfg| cfg.enabled)
+    }
+
+    pub fn watcher_enabled(&self, watcher: &BuiltinWatcherSpec) -> bool {
+        self.watcher_config(watcher.id)
+            .map(|cfg| cfg.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn effective_watcher_mode(&self, watcher: &BuiltinWatcherSpec) -> WatcherMode {
+        self.watcher_config(watcher.id)
+            .and_then(|cfg| cfg.mode)
+            .unwrap_or(watcher.default_mode)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherRuntimeSnapshot {
+    pub id: String,
+    pub enabled: bool,
+    pub mode: WatcherMode,
+    pub summary: String,
+    #[serde(default)]
+    pub last_event: Option<String>,
+    #[serde(default)]
+    pub last_event_unix_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationRuntimeState {
+    pub running: bool,
+    pub automations_enabled: bool,
+    pub daemon_pid: u32,
+    pub started_at_unix_ms: u128,
+    pub last_tick_unix_ms: u128,
+    pub active_watchers: Vec<WatcherRuntimeSnapshot>,
+}
+
+impl AutomationRuntimeState {
+    pub fn load(paths: &AppPaths) -> Result<Option<Self>> {
+        let path = paths.automation_state_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let state = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    pub fn write(&self, paths: &AppPaths) -> Result<()> {
+        paths.ensure()?;
+        let path = paths.automation_state_path();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(self)
+                .context("failed to serialize automation runtime state")?,
+        )
+        .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn watcher_mut(&mut self, watcher_id: &str) -> Option<&mut WatcherRuntimeSnapshot> {
+        self.active_watchers
+            .iter_mut()
+            .find(|watcher| watcher.id == watcher_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationEventRecord {
+    pub at_unix_ms: u128,
+    pub watcher_id: String,
+    pub level: String,
+    pub action: String,
+    pub message: String,
+    #[serde(default)]
+    pub service_id: Option<String>,
+}
+
+pub fn append_automation_event(paths: &AppPaths, event: &AutomationEventRecord) -> Result<()> {
+    paths.ensure()?;
+    let path = paths.automation_events_path();
+    let mut line =
+        serde_json::to_string(event).context("failed to serialize automation event record")?;
+    line.push('\n');
+    let mut existing = if path.is_file() {
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    existing.push_str(&line);
+    fs::write(&path, existing).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_recent_automation_events(
+    paths: &AppPaths,
+    limit: usize,
+) -> Result<Vec<AutomationEventRecord>> {
+    let path = paths.automation_events_path();
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let text =
+        String::from_utf8(bytes).with_context(|| format!("failed to decode {}", path.display()))?;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<AutomationEventRecord>(line)
+            .with_context(|| format!("failed to parse event in {}", path.display()))?;
+        events.push(event);
+    }
+    if events.len() > limit {
+        events.drain(0..events.len() - limit);
+    }
+    Ok(events)
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -215,6 +434,16 @@ pub struct ManagedServiceRecord {
     pub status: String,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub env_id: Option<String>,
+    #[serde(default)]
+    pub device_policy: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub last_restart_unix_ms: Option<u128>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -232,6 +461,9 @@ impl ManagedServiceRecord {
         port: u16,
         mode: impl Into<String>,
         supervisor_pid: u32,
+        runtime_id: Option<String>,
+        env_id: Option<String>,
+        device_policy: Option<String>,
     ) -> Self {
         let service_id = service_id.into();
         let engine = engine.into();
@@ -251,6 +483,11 @@ impl ManagedServiceRecord {
             status: "starting".to_owned(),
             supervisor_pid,
             engine_pid: None,
+            runtime_id,
+            env_id,
+            device_policy,
+            restart_count: 0,
+            last_restart_unix_ms: None,
             manifest_path,
             log_path,
             engine_state_path,

@@ -1,11 +1,13 @@
+mod therock;
 mod tui;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord, RocmCliConfig,
-    daemon_binary_path, default_engine_for_platform, engine_binary_path, generate_service_id,
-    interactive_terminal,
+    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord,
+    RocmCliConfig, WatcherMode, builtin_watcher, builtin_watchers, daemon_binary_path,
+    default_engine_for_platform, engine_binary_path, generate_service_id, interactive_terminal,
+    load_recent_automation_events,
 };
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, InstallRequest,
@@ -103,6 +105,8 @@ enum InstallTarget {
         format: InstallFormat,
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
     },
     Driver {
         #[arg(long)]
@@ -127,7 +131,14 @@ enum EnginesCommand {
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
     List,
-    Enable { watcher: String },
+    Enable {
+        watcher: String,
+        #[arg(long)]
+        mode: Option<WatcherModeArg>,
+    },
+    Disable {
+        watcher: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -159,6 +170,13 @@ enum Provider {
     Local,
     Anthropic,
     Openai,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WatcherModeArg {
+    Observe,
+    Propose,
+    Contained,
 }
 
 fn main() -> Result<()> {
@@ -207,7 +225,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Install { target }) => install(target),
         Some(Command::Update) => {
-            print!("{}", render_update_text());
+            let paths = AppPaths::discover()?;
+            print!("{}", render_update_text(&paths)?);
             Ok(())
         }
         Some(Command::Engines { command }) => engines(command),
@@ -232,7 +251,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Daemon) => {
-            print!("{}", render_daemon_text());
+            let paths = AppPaths::discover()?;
+            let config = RocmCliConfig::load(&paths)?;
+            print!("{}", render_daemon_text(&paths, &config));
             Ok(())
         }
         Some(Command::Uninstall {
@@ -268,28 +289,16 @@ fn install(target: InstallTarget) -> Result<()> {
             channel,
             format,
             prefix,
+            dry_run,
         } => {
-            println!("sdk install plan");
-            println!("  channel: {channel}");
-            println!(
-                "  format: {}",
-                match format {
-                    InstallFormat::Pip => "pip",
-                    InstallFormat::Tarball => "tarball",
-                }
+            let format_name = match format {
+                InstallFormat::Pip => "pip",
+                InstallFormat::Tarball => "tarball",
+            };
+            print!(
+                "{}",
+                therock::install_sdk(&paths, &channel, format_name, prefix, dry_run)?
             );
-            println!(
-                "  target: {}",
-                prefix
-                    .as_ref()
-                    .map(|value| value.display().to_string())
-                    .unwrap_or_else(|| paths
-                        .data_dir
-                        .join("runtimes/therock")
-                        .display()
-                        .to_string())
-            );
-            println!("  note: installer implementation is not wired yet.");
         }
         InstallTarget::Driver { dkms } => {
             println!("driver install policy");
@@ -556,6 +565,9 @@ fn run_foreground_service(
         port,
         "foreground",
         std::process::id(),
+        runtime_id.map(str::to_owned),
+        env_id.map(str::to_owned),
+        Some(device_policy_name(device_policy).to_owned()),
     );
     record.write()?;
 
@@ -613,17 +625,50 @@ fn run_foreground_service(
 }
 
 fn automations(command: Option<AutomationsCommand>) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let mut config = RocmCliConfig::load(&paths)?;
     match command.unwrap_or(AutomationsCommand::List) {
         AutomationsCommand::List => {
-            println!("automation watchers");
-            println!("  therock-update    observe");
-            println!("  server-recover    contained");
-            println!("  note: native watcher execution is not implemented yet.");
+            print!("{}", render_automations_text(&paths, &config)?);
         }
-        AutomationsCommand::Enable { watcher } => {
-            println!("enable watcher");
-            println!("  watcher: {watcher}");
-            println!("  note: watcher persistence is not implemented yet.");
+        AutomationsCommand::Enable { watcher, mode } => {
+            let Some(spec) = builtin_watcher(&watcher) else {
+                bail!("unknown watcher: {watcher}");
+            };
+            let entry = config.watcher_config_mut(spec.id);
+            entry.enabled = true;
+            if let Some(mode) = mode {
+                entry.mode = Some(mode.into());
+            }
+            config.automations.daemon_enabled = true;
+            config.save(&paths)?;
+            println!("automation watcher enabled");
+            println!("  watcher: {}", spec.id);
+            println!("  mode: {}", config.effective_watcher_mode(spec).as_str());
+            println!("  trigger: {}", spec.trigger);
+            println!("  config: {}", paths.config_path().display());
+            println!(
+                "  next step: run `rocmd run --automations-enabled` to start the persistent watcher loop"
+            );
+        }
+        AutomationsCommand::Disable { watcher } => {
+            let Some(spec) = builtin_watcher(&watcher) else {
+                bail!("unknown watcher: {watcher}");
+            };
+            let entry = config.watcher_config_mut(spec.id);
+            entry.enabled = false;
+            if !config
+                .automations
+                .watchers
+                .values()
+                .any(|watcher| watcher.enabled)
+            {
+                config.automations.daemon_enabled = false;
+            }
+            config.save(&paths)?;
+            println!("automation watcher disabled");
+            println!("  watcher: {}", spec.id);
+            println!("  config: {}", paths.config_path().display());
         }
     }
     Ok(())
@@ -797,17 +842,83 @@ pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
     output
 }
 
-pub(crate) fn render_update_text() -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "update");
-    let _ = writeln!(
-        output,
-        "  policy: check every run, prompt before mutating state."
-    );
-    output
+pub(crate) fn render_update_text(paths: &AppPaths) -> Result<String> {
+    therock::render_update_report(paths)
 }
 
-pub(crate) fn render_daemon_text() -> String {
+pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    let runtime_state = AutomationRuntimeState::load(paths).unwrap_or(None);
+    let recent_events = load_recent_automation_events(paths, 5).unwrap_or_default();
+    let mut output = String::new();
+    let _ = writeln!(output, "automation watchers");
+    let _ = writeln!(output, "  config: {}", paths.config_path().display());
+    let _ = writeln!(
+        output,
+        "  daemon desired: {}",
+        if config.automation_daemon_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    match runtime_state.as_ref() {
+        Some(state) => {
+            let _ = writeln!(
+                output,
+                "  daemon runtime: {} pid={} last_tick_unix_ms={}",
+                if state.running { "running" } else { "stopped" },
+                state.daemon_pid,
+                state.last_tick_unix_ms
+            );
+        }
+        None => {
+            let _ = writeln!(output, "  daemon runtime: inactive");
+        }
+    }
+    for watcher in builtin_watchers() {
+        let runtime_snapshot = runtime_state.as_ref().and_then(|state| {
+            state
+                .active_watchers
+                .iter()
+                .find(|item| item.id == watcher.id)
+        });
+        let _ = writeln!(
+            output,
+            "  watcher {} enabled={} mode={} trigger={}",
+            watcher.id,
+            config.watcher_enabled(watcher),
+            config.effective_watcher_mode(watcher).as_str(),
+            watcher.trigger
+        );
+        let _ = writeln!(output, "    summary: {}", watcher.summary);
+        let _ = writeln!(output, "    actions: {}", watcher.actions.join(", "));
+        if let Some(snapshot) = runtime_snapshot {
+            let _ = writeln!(
+                output,
+                "    runtime: last_event={} last_event_unix_ms={}",
+                snapshot.last_event.as_deref().unwrap_or("<none>"),
+                snapshot
+                    .last_event_unix_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<never>".to_owned())
+            );
+        }
+    }
+    if !recent_events.is_empty() {
+        let _ = writeln!(output, "  recent events:");
+        for event in recent_events {
+            let _ = writeln!(
+                output,
+                "    {} {} {} {}",
+                event.at_unix_ms, event.watcher_id, event.action, event.message
+            );
+        }
+    }
+    Ok(output)
+}
+
+pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> String {
+    let runtime_state = AutomationRuntimeState::load(paths).unwrap_or(None);
     let mut output = String::new();
     let _ = writeln!(output, "rocmd lifecycle");
     let _ = writeln!(output, "  default: on-demand");
@@ -815,6 +926,34 @@ pub(crate) fn render_daemon_text() -> String {
         output,
         "  persistent: only when automations or managed background services are enabled"
     );
+    let _ = writeln!(
+        output,
+        "  automations desired: {}",
+        if config.automation_daemon_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "  runtime state: {}",
+        paths.automation_state_path().display()
+    );
+    match runtime_state {
+        Some(state) => {
+            let _ = writeln!(
+                output,
+                "  daemon status: {} pid={} last_tick_unix_ms={}",
+                if state.running { "running" } else { "stopped" },
+                state.daemon_pid,
+                state.last_tick_unix_ms
+            );
+        }
+        None => {
+            let _ = writeln!(output, "  daemon status: inactive");
+        }
+    }
     output
 }
 
@@ -836,6 +975,20 @@ pub(crate) fn render_sidebar_text(
     let _ = writeln!(output, "default engine: {default_engine}");
     let _ = writeln!(output, "interactive: {}", interactive_terminal());
     let _ = writeln!(output, "services: {}", records.len());
+    let enabled_watchers = builtin_watchers()
+        .iter()
+        .filter(|watcher| config.watcher_enabled(watcher))
+        .count();
+    let _ = writeln!(output, "watchers: {}", enabled_watchers);
+    let _ = writeln!(
+        output,
+        "daemon: {}",
+        if config.automation_daemon_enabled() {
+            "desired"
+        } else {
+            "off"
+        }
+    );
     let _ = writeln!(output, "config: {}", paths.config_path().display());
     let _ = writeln!(output, "data: {}", paths.data_dir.display());
     let _ = writeln!(output, "cache: {}", paths.cache_dir.display());
@@ -889,6 +1042,10 @@ pub(crate) fn tui_help_text() -> String {
     let _ = writeln!(output, "  /doctor        inspect host and default paths");
     let _ = writeln!(output, "  /engines       show bundled engine inventory");
     let _ = writeln!(output, "  /config        show persisted config");
+    let _ = writeln!(
+        output,
+        "  /automations   show watcher config and daemon state"
+    );
     let _ = writeln!(output, "  /services      show managed service manifests");
     let _ = writeln!(output, "  /logs          show log directories");
     let _ = writeln!(output, "  /update        show update policy");
@@ -918,6 +1075,7 @@ pub(crate) fn tui_help_text() -> String {
         "  config set-engine pytorch --runtime-id therock-release"
     );
     let _ = writeln!(output, "  engines install pytorch --reinstall");
+    let _ = writeln!(output, "  automations enable server-recover");
     output
 }
 
@@ -1297,6 +1455,16 @@ fn provider_name(provider: Provider) -> &'static str {
         Provider::Local => "local",
         Provider::Anthropic => "anthropic",
         Provider::Openai => "openai",
+    }
+}
+
+impl From<WatcherModeArg> for WatcherMode {
+    fn from(value: WatcherModeArg) -> Self {
+        match value {
+            WatcherModeArg::Observe => WatcherMode::Observe,
+            WatcherModeArg::Propose => WatcherMode::Propose,
+            WatcherModeArg::Contained => WatcherMode::Contained,
+        }
     }
 }
 

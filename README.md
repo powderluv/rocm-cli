@@ -17,15 +17,15 @@ curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh 
 ```
 
 Current repository status:
-- Rust workspace scaffold for `rocm`, `rocmd`, shared core types, and engine protocol
-- first-party `pytorch` engine crate intended to be the default native Windows local serving path
-- placeholder CLI flows for `doctor`, `serve`, `engines`, `install`, and daemon lifecycle
-- initial plugin protocol structs shared across the workspace
+- interactive `rocm` TUI plus non-interactive CLI commands for `doctor`, `serve`, `engines`, `install`, `update`, `automations`, `daemon`, and `uninstall`
+- `rocmd` supervisor with managed service supervision and persisted automation/watcher runtime state
+- first-party `pytorch` engine with managed venv installs, TheRock PyTorch wheel resolution, and OpenAI-compatible local serving
+- TheRock SDK resolver for `pip` and tarball installs, plus managed runtime update checks
 
 Planned product shape:
-- `rocm` chat-first TUI with Codex-like plan and tool execution views
+- `rocm` chat-first TUI with deeper inline tool execution and approvals
 - TheRock-managed runtime installs with `pip` venvs by default and tarballs as an explicit option
-- native automations and watchers with contained sandbox execution
+- native automations and watchers with broader contained sandbox execution
 - pluggable serving engines including `pytorch`, `llama.cpp`, `vllm`, `sglang`, and `atom`
 
 Workspace layout:
@@ -39,4 +39,4 @@ Planning docs:
 - `plans/rocm-cli-implementation-plan.md`
 - `plans/rocm-cli-pytorch-engine-spec.md`
 
-This is the initial implementation scaffold, not a production release.
+This is an early implementation, not a production release.

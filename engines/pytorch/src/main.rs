@@ -41,10 +41,7 @@ const KNOWN_THEROCK_FAMILIES: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "rocm-engine-pytorch",
-    about = "rocm-cli PyTorch engine scaffold"
-)]
+#[command(name = "rocm-engine-pytorch", about = "rocm-cli PyTorch engine")]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -300,7 +297,7 @@ fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
         }),
         other => EngineResponseEnvelope::failure(
             "unimplemented_method",
-            format!("method {other:?} is not implemented in this scaffold"),
+            format!("method {other:?} is not implemented by the PyTorch engine"),
         ),
     }
 }

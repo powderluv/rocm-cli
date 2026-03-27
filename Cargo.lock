@@ -869,6 +869,7 @@ dependencies = [
  "clap",
  "rocm-core",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
