@@ -1,7 +1,8 @@
 use crate::{
-    render_chat_text, render_config_text, render_daemon_text, render_doctor_text,
-    render_engine_inventory_text, render_freeform_plan, render_logs_text, render_services_text,
-    render_sidebar_text, render_uninstall_dry_run, render_update_text, tui_help_text,
+    render_automations_text, render_chat_text, render_config_text, render_daemon_text,
+    render_doctor_text, render_engine_inventory_text, render_freeform_plan, render_logs_text,
+    render_services_text, render_sidebar_text, render_uninstall_dry_run, render_update_text,
+    tui_help_text,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -78,7 +79,7 @@ impl App {
         app.push_block(
             "Welcome",
             &format!(
-                "ROCm AI Command Center CLI\nprovider: {}\n\nRead-only commands execute inline. Mutating flows still render plans or redirect to the CLI.",
+                "ROCm AI Command Center CLI\nprovider: {}\n\nMost inspection and setup commands execute inline. Foreground serving and uninstall apply still redirect to the CLI.",
                 app.provider
             ),
         );
@@ -214,7 +215,7 @@ impl App {
         let plan = render_freeform_plan(&input, &self.paths, &self.config);
         self.push_block("Plan", &plan);
         self.status =
-            "Plan rendered. Read-only commands execute inline; mutating flows still require the CLI."
+            "Plan rendered. Inline execution covers inspection plus selected setup commands; serve and uninstall apply still require the CLI."
                 .to_owned();
     }
 
@@ -269,6 +270,28 @@ impl App {
                 }
                 true
             }
+            "automations" => {
+                if args.is_empty() || args == ["list"] {
+                    self.refresh_config();
+                    match render_automations_text(&self.paths, &self.config) {
+                        Ok(text) => {
+                            self.push_block("Automations", &text);
+                            self.status = "Automation watcher state loaded.".to_owned();
+                        }
+                        Err(error) => {
+                            self.push_block("Error", &error.to_string());
+                            self.status = "Automation watcher load failed.".to_owned();
+                        }
+                    }
+                } else {
+                    self.status = "Running automations command...".to_owned();
+                    let mut cli_args = vec!["automations".to_owned()];
+                    cli_args.extend(args.iter().map(|value| (*value).to_owned()));
+                    self.run_cli_command("Automations", &cli_args);
+                    self.refresh_config();
+                }
+                true
+            }
             "install" => {
                 self.status = "Running install command...".to_owned();
                 let mut cli_args = vec!["install".to_owned()];
@@ -295,12 +318,21 @@ impl App {
                 true
             }
             "update" => {
-                self.push_block("Update", &render_update_text());
-                self.status = "Update policy shown.".to_owned();
+                match render_update_text(&self.paths) {
+                    Ok(text) => {
+                        self.push_block("Update", &text);
+                        self.status = "Update state refreshed.".to_owned();
+                    }
+                    Err(error) => {
+                        self.push_block("Error", &error.to_string());
+                        self.status = "Update inspection failed.".to_owned();
+                    }
+                }
                 true
             }
             "daemon" => {
-                self.push_block("Daemon", &render_daemon_text());
+                self.refresh_config();
+                self.push_block("Daemon", &render_daemon_text(&self.paths, &self.config));
                 self.status = "Daemon policy shown.".to_owned();
                 true
             }

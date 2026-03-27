@@ -11,3 +11,4 @@ anyhow.workspace = true
 clap.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 serde_json.workspace = true
+tokio.workspace = true
