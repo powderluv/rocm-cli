@@ -1535,3 +1535,16 @@ impl From<DevicePolicyArg> for DevicePolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1103"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+}

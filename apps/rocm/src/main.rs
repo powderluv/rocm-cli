@@ -1414,9 +1414,15 @@ fn remove_path(path: &Path) -> Result<()> {
 
 fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
-        ("pytorch", "default Windows local serving engine"),
+        (
+            "pytorch",
+            "default local serving engine when vllm is not installed",
+        ),
         ("llama.cpp", "CPU and quantized fallback engine"),
-        ("vllm", "default Linux ROCm GPU serving engine"),
+        (
+            "vllm",
+            "preferred Linux ROCm GPU serving engine when installed",
+        ),
         ("sglang", "deferred advanced serving engine"),
         ("atom", "deferred AMD-optimized serving engine"),
     ]
