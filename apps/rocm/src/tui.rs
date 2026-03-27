@@ -18,9 +18,16 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use rocm_core::{AppPaths, RocmCliConfig};
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{self, Stdout};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const GPU_MONITOR_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const GPU_STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const GPU_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run(initial_provider: Option<String>) -> Result<()> {
     let paths = AppPaths::discover()?;
@@ -46,6 +53,7 @@ struct App {
     paths: AppPaths,
     config: RocmCliConfig,
     provider: String,
+    gpu_telemetry: GpuTelemetry,
     transcript: Vec<String>,
     transcript_scroll: u16,
     input: String,
@@ -60,6 +68,378 @@ struct CommandOutput {
     rendered: String,
 }
 
+#[derive(Default)]
+struct GpuTelemetry {
+    static_cards: BTreeMap<u32, GpuStaticCard>,
+    monitor_cards: BTreeMap<u32, GpuMonitorCard>,
+    last_static_refresh: Option<Instant>,
+    last_monitor_refresh: Option<Instant>,
+    last_error: Option<String>,
+    last_error_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct GpuStaticCard {
+    market_name: Option<String>,
+    gfx_target: Option<String>,
+    compute_units: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct GpuMonitorCard {
+    power_watts: Option<f64>,
+    max_power_watts: Option<f64>,
+    hotspot_celsius: Option<f64>,
+    memory_celsius: Option<f64>,
+    gfx_mhz: Option<f64>,
+    gfx_percent: Option<f64>,
+    mem_percent: Option<f64>,
+    mem_mhz: Option<f64>,
+    vram_used_mb: Option<f64>,
+    vram_total_mb: Option<f64>,
+    vram_percent: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmdSmiStaticResponse {
+    #[serde(default)]
+    gpu_data: Vec<AmdSmiStaticEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmdSmiStaticEntry {
+    gpu: u32,
+    #[serde(default)]
+    asic: Option<AmdSmiAsic>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmdSmiAsic {
+    #[serde(default)]
+    market_name: Option<String>,
+    #[serde(default)]
+    num_compute_units: Option<u32>,
+    #[serde(default)]
+    target_graphics_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmdSmiMetricValue {
+    #[serde(default)]
+    value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmdSmiMonitorEntry {
+    gpu: u32,
+    #[serde(default)]
+    power_usage: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    max_power: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    hotspot_temperature: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    memory_temperature: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    gfx_clk: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    gfx: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    mem: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    mem_clock: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    vram_used: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    vram_total: Option<AmdSmiMetricValue>,
+    #[serde(default)]
+    vram_percent: Option<AmdSmiMetricValue>,
+}
+
+impl AmdSmiMetricValue {
+    fn as_f64(&self) -> Option<f64> {
+        match &self.value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl GpuTelemetry {
+    fn maybe_refresh(&mut self) {
+        let now = Instant::now();
+        if let Some(last_error_at) = self.last_error_at
+            && now.duration_since(last_error_at) < GPU_ERROR_RETRY_INTERVAL
+        {
+            return;
+        }
+
+        let static_due = self.static_cards.is_empty()
+            || self
+                .last_static_refresh
+                .is_none_or(|last| now.duration_since(last) >= GPU_STATIC_REFRESH_INTERVAL);
+        if static_due {
+            match load_gpu_static_cards() {
+                Ok(cards) => {
+                    self.static_cards = cards;
+                    self.last_static_refresh = Some(now);
+                    self.clear_error();
+                }
+                Err(error) => self.record_error(format!("static: {error}")),
+            }
+        }
+
+        let monitor_due = self.monitor_cards.is_empty()
+            || self
+                .last_monitor_refresh
+                .is_none_or(|last| now.duration_since(last) >= GPU_MONITOR_REFRESH_INTERVAL);
+        if monitor_due {
+            match load_gpu_monitor_cards() {
+                Ok(cards) => {
+                    self.monitor_cards = cards;
+                    self.last_monitor_refresh = Some(now);
+                    self.clear_error();
+                }
+                Err(error) => self.record_error(format!("monitor: {error}")),
+            }
+        }
+    }
+
+    fn force_refresh(&mut self) {
+        self.last_static_refresh = None;
+        self.last_monitor_refresh = None;
+        self.last_error_at = None;
+        self.maybe_refresh();
+    }
+
+    fn sidebar_text(&self) -> String {
+        let mut output = String::new();
+        use std::fmt::Write as _;
+
+        let _ = writeln!(output, "gpu telemetry:");
+        if self.static_cards.is_empty() && self.monitor_cards.is_empty() {
+            let _ = writeln!(output, "  status: probing amd-smi");
+            if let Some(error) = &self.last_error {
+                let _ = writeln!(output, "  last error: {error}");
+            }
+            return output.trim_end().to_owned();
+        }
+
+        let _ = writeln!(
+            output,
+            "  gpus: {}",
+            self.monitor_cards.len().max(self.static_cards.len())
+        );
+        if let Some(model) = self.primary_model_name() {
+            let _ = writeln!(output, "  model: {model}");
+        }
+        if let Some(gfx) = self.primary_gfx_target() {
+            let _ = writeln!(output, "  gfx: {gfx}");
+        }
+        if let Some(age) = self.last_monitor_refresh.map(|value| value.elapsed()) {
+            let _ = writeln!(output, "  updated: {}", format_elapsed(age));
+        }
+        if let Some(summary) = self.aggregate_line() {
+            let _ = writeln!(output, "  {summary}");
+        }
+        for line in self.per_gpu_lines() {
+            let _ = writeln!(output, "  {line}");
+        }
+        if let Some(error) = &self.last_error {
+            let _ = writeln!(output, "  note: {error}");
+        }
+        output.trim_end().to_owned()
+    }
+
+    fn detail_text(&self) -> String {
+        let mut output = String::new();
+        use std::fmt::Write as _;
+
+        let _ = writeln!(output, "amd-smi telemetry");
+        if self.static_cards.is_empty() && self.monitor_cards.is_empty() {
+            let _ = writeln!(output, "  status: no telemetry yet");
+            if let Some(error) = &self.last_error {
+                let _ = writeln!(output, "  last error: {error}");
+            }
+            return output;
+        }
+
+        if let Some(age) = self.last_monitor_refresh.map(|value| value.elapsed()) {
+            let _ = writeln!(output, "  updated: {}", format_elapsed(age));
+        }
+        if let Some(summary) = self.aggregate_line() {
+            let _ = writeln!(output, "  summary: {summary}");
+        }
+        for gpu in self.all_gpu_ids() {
+            let static_card = self.static_cards.get(&gpu);
+            let monitor_card = self.monitor_cards.get(&gpu);
+            let _ = writeln!(
+                output,
+                "  gpu {} model={} gfx={} cu={} gfx_util={} mem_util={} power={} hot={} mem_temp={} gfx_clk={} mem_clk={} vram={}",
+                gpu,
+                static_card
+                    .and_then(|card| card.market_name.as_deref())
+                    .unwrap_or("<unknown>"),
+                static_card
+                    .and_then(|card| card.gfx_target.as_deref())
+                    .unwrap_or("<unknown>"),
+                static_card
+                    .and_then(|card| card.compute_units)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_owned()),
+                format_optional_percent(monitor_card.and_then(|card| card.gfx_percent)),
+                format_optional_percent(monitor_card.and_then(|card| card.mem_percent)),
+                format_optional_watts(monitor_card.and_then(|card| card.power_watts)),
+                format_optional_celsius(monitor_card.and_then(|card| card.hotspot_celsius)),
+                format_optional_celsius(monitor_card.and_then(|card| card.memory_celsius)),
+                format_optional_mhz(monitor_card.and_then(|card| card.gfx_mhz)),
+                format_optional_mhz(monitor_card.and_then(|card| card.mem_mhz)),
+                format_vram_line(monitor_card),
+            );
+        }
+        if let Some(error) = &self.last_error {
+            let _ = writeln!(output, "  note: {error}");
+        }
+        output
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
+        self.last_error_at = None;
+    }
+
+    fn record_error(&mut self, message: String) {
+        self.last_error = Some(message);
+        self.last_error_at = Some(Instant::now());
+    }
+
+    fn primary_model_name(&self) -> Option<&str> {
+        let first = self
+            .static_cards
+            .values()
+            .find_map(|card| card.market_name.as_deref())?;
+        if self
+            .static_cards
+            .values()
+            .all(|card| card.market_name.as_deref() == Some(first))
+        {
+            Some(first)
+        } else {
+            Some("mixed")
+        }
+    }
+
+    fn primary_gfx_target(&self) -> Option<&str> {
+        let first = self
+            .static_cards
+            .values()
+            .find_map(|card| card.gfx_target.as_deref())?;
+        if self
+            .static_cards
+            .values()
+            .all(|card| card.gfx_target.as_deref() == Some(first))
+        {
+            Some(first)
+        } else {
+            Some("mixed")
+        }
+    }
+
+    fn aggregate_line(&self) -> Option<String> {
+        if self.monitor_cards.is_empty() {
+            return None;
+        }
+
+        let avg_gfx = average(
+            self.monitor_cards
+                .values()
+                .filter_map(|card| card.gfx_percent),
+        );
+        let avg_mem = average(
+            self.monitor_cards
+                .values()
+                .filter_map(|card| card.mem_percent),
+        );
+        let avg_hot = average(
+            self.monitor_cards
+                .values()
+                .filter_map(|card| card.hotspot_celsius),
+        );
+        let total_power = self
+            .monitor_cards
+            .values()
+            .filter_map(|card| card.power_watts)
+            .sum::<f64>();
+        let total_max_power = self
+            .monitor_cards
+            .values()
+            .filter_map(|card| card.max_power_watts)
+            .sum::<f64>();
+        let total_vram_used = self
+            .monitor_cards
+            .values()
+            .filter_map(|card| card.vram_used_mb)
+            .sum::<f64>();
+        let total_vram_total = self
+            .monitor_cards
+            .values()
+            .filter_map(|card| card.vram_total_mb)
+            .sum::<f64>();
+        let total_vram_percent = if total_vram_total > 0.0 {
+            Some((total_vram_used / total_vram_total) * 100.0)
+        } else {
+            None
+        };
+
+        Some(format!(
+            "avg gfx {:.0}% mem {:.0}% hot {:.0}C pwr {:.0}/{:.0}W vr {:.1}%",
+            avg_gfx.unwrap_or(0.0),
+            avg_mem.unwrap_or(0.0),
+            avg_hot.unwrap_or(0.0),
+            total_power,
+            total_max_power,
+            total_vram_percent.unwrap_or(0.0)
+        ))
+    }
+
+    fn per_gpu_lines(&self) -> Vec<String> {
+        self.all_gpu_ids()
+            .into_iter()
+            .map(|gpu| {
+                let card = self.monitor_cards.get(&gpu);
+                let gfx_target = self
+                    .static_cards
+                    .get(&gpu)
+                    .and_then(|item| item.gfx_target.as_deref())
+                    .unwrap_or("");
+                format!(
+                    "g{gpu:02} {:>4} {:>5} {:>4} {:>5}{}{}",
+                    format_optional_percent(card.and_then(|item| item.gfx_percent)),
+                    format_optional_watts(card.and_then(|item| item.power_watts)),
+                    format_optional_celsius(card.and_then(|item| item.hotspot_celsius)),
+                    format_optional_percent(card.and_then(|item| item.vram_percent)),
+                    if gfx_target.is_empty() { "" } else { " " },
+                    gfx_target,
+                )
+                .trim_end()
+                .to_owned()
+            })
+            .collect()
+    }
+
+    fn all_gpu_ids(&self) -> Vec<u32> {
+        let mut ids = self.static_cards.keys().copied().collect::<Vec<_>>();
+        for gpu in self.monitor_cards.keys().copied() {
+            if !ids.contains(&gpu) {
+                ids.push(gpu);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+}
+
 impl App {
     fn new(paths: AppPaths, initial_provider: Option<String>) -> Self {
         let config = RocmCliConfig::load(&paths).unwrap_or_default();
@@ -68,6 +448,7 @@ impl App {
             paths,
             config,
             provider,
+            gpu_telemetry: GpuTelemetry::default(),
             transcript: Vec::new(),
             transcript_scroll: 0,
             input: String::new(),
@@ -79,7 +460,7 @@ impl App {
         app.push_block(
             "Welcome",
             &format!(
-                "ROCm AI Command Center CLI\nprovider: {}\n\nMost inspection and setup commands execute inline. Foreground serving and uninstall apply still redirect to the CLI.",
+                "ROCm AI Command Center CLI\nprovider: {}\n\nThe status pane actively polls amd-smi for live GPU telemetry when available. Most inspection and setup commands execute inline. Foreground serving and uninstall apply still redirect to the CLI.",
                 app.provider
             ),
         );
@@ -92,6 +473,33 @@ impl App {
 
     fn refresh_config(&mut self) {
         self.config = RocmCliConfig::load(&self.paths).unwrap_or_default();
+    }
+
+    fn refresh_sidebar_state(&mut self) {
+        self.refresh_config();
+        self.gpu_telemetry.maybe_refresh();
+    }
+
+    fn sidebar_text(&self) -> String {
+        let mut output = render_sidebar_text(&self.paths, &self.config, &self.provider);
+        let gpu_text = self.gpu_telemetry.sidebar_text();
+        if !gpu_text.is_empty() {
+            output.push_str("\n\n");
+            output.push_str(&gpu_text);
+        }
+        output
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for ch in normalized.chars() {
+            if ch == '\n' {
+                self.submit();
+            } else {
+                self.input.push(ch);
+                self.history_index = None;
+            }
+        }
     }
 
     fn push_user_input(&mut self, input: &str) {
@@ -317,6 +725,17 @@ impl App {
                 self.status = "Log directories refreshed.".to_owned();
                 true
             }
+            "gpu" => {
+                if args.first() == Some(&"refresh") {
+                    self.gpu_telemetry.force_refresh();
+                    self.status = "GPU telemetry refreshed.".to_owned();
+                } else {
+                    self.gpu_telemetry.maybe_refresh();
+                    self.status = "GPU telemetry snapshot loaded.".to_owned();
+                }
+                self.push_block("GPU", &self.gpu_telemetry.detail_text());
+                true
+            }
             "update" => {
                 match render_update_text(&self.paths) {
                     Ok(text) => {
@@ -433,7 +852,7 @@ impl App {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     while !app.should_quit {
-        app.refresh_config();
+        app.refresh_sidebar_state();
         terminal
             .draw(|frame| draw(frame, app))
             .context("failed to render rocm TUI")?;
@@ -442,16 +861,17 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
             continue;
         }
 
-        let Event::Key(key) = event::read().context("failed to read terminal event")? else {
-            continue;
-        };
-        handle_key(app, key);
+        match event::read().context("failed to read terminal event")? {
+            Event::Key(key) => handle_key(app, key),
+            Event::Paste(text) => app.paste_text(&text),
+            _ => {}
+        }
     }
     Ok(())
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return;
     }
 
@@ -464,7 +884,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.history_index = None;
             app.status = "Input cleared.".to_owned();
         }
-        (_, KeyCode::Enter) => app.submit(),
+        (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
+        | (_, KeyCode::Char('\n' | '\r'))
+        | (_, KeyCode::Enter) => app.submit(),
         (_, KeyCode::Backspace) => {
             app.input.pop();
             app.history_index = None;
@@ -496,7 +918,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.scroll_to_bottom();
             app.status = "Transcript moved to bottom.".to_owned();
         }
-        (_, KeyCode::Char(ch)) => {
+        (modifiers, KeyCode::Char(ch))
+            if !modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
             app.input.push(ch);
             app.history_index = None;
         }
@@ -524,7 +949,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .scroll((app.transcript_scroll, 0));
     frame.render_widget(transcript, body[0]);
 
-    let sidebar = Paragraph::new(render_sidebar_text(&app.paths, &app.config, &app.provider))
+    let sidebar = Paragraph::new(app.sidebar_text())
         .block(Block::default().borders(Borders::ALL).title("Status"))
         .wrap(Wrap { trim: false });
     frame.render_widget(sidebar, body[1]);
@@ -627,4 +1052,282 @@ fn format_command_for_display(binary: &str, args: &[String]) -> String {
         }
     }
     rendered
+}
+
+fn load_gpu_static_cards() -> Result<BTreeMap<u32, GpuStaticCard>> {
+    let output = run_amd_smi_json(&["static", "-a", "-g", "all", "--json"])?;
+    load_gpu_static_cards_from_json(&output)
+}
+
+fn load_gpu_static_cards_from_json(output: &str) -> Result<BTreeMap<u32, GpuStaticCard>> {
+    let payload = serde_json::from_str::<AmdSmiStaticResponse>(output)
+        .context("failed to parse amd-smi static JSON")?;
+    let mut cards = BTreeMap::new();
+    for entry in payload.gpu_data {
+        cards.insert(
+            entry.gpu,
+            GpuStaticCard {
+                market_name: entry
+                    .asic
+                    .as_ref()
+                    .and_then(|asic| asic.market_name.clone()),
+                gfx_target: entry
+                    .asic
+                    .as_ref()
+                    .and_then(|asic| asic.target_graphics_version.clone()),
+                compute_units: entry.asic.as_ref().and_then(|asic| asic.num_compute_units),
+            },
+        );
+    }
+    Ok(cards)
+}
+
+fn load_gpu_monitor_cards() -> Result<BTreeMap<u32, GpuMonitorCard>> {
+    let output = run_amd_smi_json(&[
+        "monitor", "-p", "-t", "-u", "-m", "-v", "-g", "all", "--json",
+    ])?;
+    load_gpu_monitor_cards_from_json(&output)
+}
+
+fn load_gpu_monitor_cards_from_json(output: &str) -> Result<BTreeMap<u32, GpuMonitorCard>> {
+    let payload = serde_json::from_str::<Vec<AmdSmiMonitorEntry>>(output)
+        .context("failed to parse amd-smi monitor JSON")?;
+    let mut cards = BTreeMap::new();
+    for entry in payload {
+        cards.insert(
+            entry.gpu,
+            GpuMonitorCard {
+                power_watts: entry
+                    .power_usage
+                    .as_ref()
+                    .and_then(AmdSmiMetricValue::as_f64),
+                max_power_watts: entry.max_power.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                hotspot_celsius: entry
+                    .hotspot_temperature
+                    .as_ref()
+                    .and_then(AmdSmiMetricValue::as_f64),
+                memory_celsius: entry
+                    .memory_temperature
+                    .as_ref()
+                    .and_then(AmdSmiMetricValue::as_f64),
+                gfx_mhz: entry.gfx_clk.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                gfx_percent: entry.gfx.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                mem_percent: entry.mem.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                mem_mhz: entry.mem_clock.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                vram_used_mb: entry.vram_used.as_ref().and_then(AmdSmiMetricValue::as_f64),
+                vram_total_mb: entry
+                    .vram_total
+                    .as_ref()
+                    .and_then(AmdSmiMetricValue::as_f64),
+                vram_percent: entry
+                    .vram_percent
+                    .as_ref()
+                    .and_then(AmdSmiMetricValue::as_f64),
+            },
+        );
+    }
+    Ok(cards)
+}
+
+fn run_amd_smi_json(args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new("amd-smi")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to launch amd-smi")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        };
+        anyhow::bail!("amd-smi {} failed: {}", args.join(" "), detail);
+    }
+    String::from_utf8(output.stdout).context("amd-smi output was not valid utf-8")
+}
+
+fn average<I>(values: I) -> Option<f64>
+where
+    I: Iterator<Item = f64>,
+{
+    let mut sum = 0.0;
+    let mut count = 0_u32;
+    for value in values {
+        sum += value;
+        count += 1;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(sum / count as f64)
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    if duration.as_secs() >= 60 {
+        format!(
+            "{}m {}s ago",
+            duration.as_secs() / 60,
+            duration.as_secs() % 60
+        )
+    } else if duration.as_secs() > 0 {
+        format!("{}s ago", duration.as_secs())
+    } else {
+        format!("{}ms ago", duration.as_millis())
+    }
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn format_optional_watts(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}W"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn format_optional_celsius(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}C"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn format_optional_mhz(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}MHz"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn format_vram_line(card: Option<&GpuMonitorCard>) -> String {
+    let Some(card) = card else {
+        return "<unknown>".to_owned();
+    };
+    match (card.vram_used_mb, card.vram_total_mb, card.vram_percent) {
+        (Some(used), Some(total), Some(percent)) => {
+            format!("{used:.0}/{total:.0}MB ({percent:.1}%)")
+        }
+        _ => "<unknown>".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        App, handle_key, load_gpu_monitor_cards_from_json, load_gpu_static_cards_from_json,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use rocm_core::{AppPaths, RocmCliConfig};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_amd_smi_static_json() {
+        let payload = r#"{
+          "gpu_data": [
+            {
+              "gpu": 0,
+              "asic": {
+                "market_name": "Radeon RX",
+                "num_compute_units": 40,
+                "target_graphics_version": "gfx1103"
+              }
+            }
+          ]
+        }"#;
+        let cards = load_gpu_static_cards_from_json(payload).expect("static json should parse");
+        let card = cards.get(&0).expect("gpu 0 should exist");
+        assert_eq!(card.market_name.as_deref(), Some("Radeon RX"));
+        assert_eq!(card.gfx_target.as_deref(), Some("gfx1103"));
+        assert_eq!(card.compute_units, Some(40));
+    }
+
+    #[test]
+    fn parses_amd_smi_monitor_json() {
+        let payload = r#"[
+          {
+            "gpu": 0,
+            "power_usage": { "value": 245, "unit": "W" },
+            "hotspot_temperature": { "value": 63, "unit": "C" },
+            "gfx": { "value": 98, "unit": "%" },
+            "vram_total": { "value": 16384, "unit": "MB" },
+            "vram_used": { "value": 8192, "unit": "MB" },
+            "vram_percent": { "value": 50.0, "unit": "%" }
+          }
+        ]"#;
+        let cards = load_gpu_monitor_cards_from_json(payload).expect("monitor json should parse");
+        let card = cards.get(&0).expect("gpu 0 should exist");
+        assert_eq!(card.power_watts, Some(245.0));
+        assert_eq!(card.hotspot_celsius, Some(63.0));
+        assert_eq!(card.gfx_percent, Some(98.0));
+        assert_eq!(card.vram_percent, Some(50.0));
+    }
+
+    #[test]
+    fn ctrl_j_submits_prompt() {
+        let mut app = test_app();
+        app.input = "/quit".to_owned();
+        handle_key(
+            &mut app,
+            key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn enter_submits_prompt() {
+        let mut app = test_app();
+        app.input = "/quit".to_owned();
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn paste_with_newline_submits_prompt() {
+        let mut app = test_app();
+        app.paste_text("/quit\n");
+        assert!(app.should_quit);
+    }
+
+    fn test_app() -> App {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rocm-cli-tui-test-{unique}"));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        App {
+            paths,
+            config: RocmCliConfig::default(),
+            provider: "local".to_owned(),
+            gpu_telemetry: Default::default(),
+            transcript: Vec::new(),
+            transcript_scroll: 0,
+            input: String::new(),
+            history: Vec::new(),
+            history_index: None,
+            status: String::new(),
+            should_quit: false,
+        }
+    }
+
+    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
 }

@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, detect_host_therock_family, normalize_therock_family, unix_time_millis};
+use rocm_core::{
+    AppPaths, detect_host_therock_family, interactive_terminal, normalize_therock_family,
+    unix_time_millis,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
@@ -250,6 +253,8 @@ fn install_pip_runtime(
             "--retries".to_owned(),
             pip_retries().to_string(),
             "--disable-pip-version-check".to_owned(),
+            "--progress-bar".to_owned(),
+            "on".to_owned(),
             "--index-url".to_owned(),
             resolution.index_url.clone(),
             "--upgrade-strategy".to_owned(),
@@ -294,6 +299,8 @@ fn install_pip_runtime(
         "--retries".to_owned(),
         pip_retries().to_string(),
         "--disable-pip-version-check".to_owned(),
+        "--progress-bar".to_owned(),
+        "on".to_owned(),
         "--index-url".to_owned(),
         resolution.index_url.clone(),
         "--upgrade-strategy".to_owned(),
@@ -303,7 +310,7 @@ fn install_pip_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.insert(4, "--pre".to_owned());
     }
-    run_command(
+    run_progress_command(
         &env_python,
         install_args
             .iter()
@@ -561,9 +568,15 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    run_command(
+    run_progress_command(
         Path::new("curl"),
-        &["-fsSL", "-o", destination.to_string_lossy().as_ref(), url],
+        &[
+            "-fL",
+            "--progress-bar",
+            "-o",
+            destination.to_string_lossy().as_ref(),
+            url,
+        ],
         "download TheRock tarball artifact",
     )
 }
@@ -629,6 +642,23 @@ fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> 
         context_text,
         String::from_utf8_lossy(&output.stderr).trim()
     )
+}
+
+fn run_progress_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
+    if interactive_terminal() {
+        let status = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to launch {}", program.display()))?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("{context_text}: command exited with status {status}");
+    }
+    run_command(program, args, context_text)
 }
 
 fn pip_timeout_secs() -> u64 {

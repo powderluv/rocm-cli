@@ -40,6 +40,7 @@ trap cleanup EXIT INT TERM
 DIST_NAME="rocm-cli-linux-amd64"
 DIST_DIR="${TMP_ROOT}/dist"
 INSTALL_DIR="${TMP_ROOT}/install/bin"
+HOME_DIR="${TMP_ROOT}/home"
 XDG_CONFIG_HOME="${TMP_ROOT}/xdg/config"
 XDG_DATA_HOME="${TMP_ROOT}/xdg/data"
 XDG_CACHE_HOME="${TMP_ROOT}/xdg/cache"
@@ -49,6 +50,7 @@ INSTALL_LOG_1="${TMP_ROOT}/install-1.log"
 INSTALL_LOG_2="${TMP_ROOT}/install-2.log"
 UNINSTALL_LOG="${TMP_ROOT}/uninstall.log"
 CONFIG_FILE="${XDG_CONFIG_HOME}/rocm-cli/config.json"
+BASHRC_FILE="${HOME_DIR}/.bashrc"
 
 echo "acceptance: build release binaries"
 (cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch)
@@ -59,6 +61,8 @@ echo "acceptance: package local release bundle"
 run_installer() {
   (
     cd "${REPO_ROOT}"
+    HOME="${HOME_DIR}" \
+    SHELL="/bin/bash" \
     ROCM_CLI_DOWNLOAD_BASE="${DOWNLOAD_BASE}" \
     ROCM_CLI_INSTALL_DIR="${INSTALL_DIR}" \
     sh ./install.sh release
@@ -71,6 +75,9 @@ assert_file "${INSTALL_DIR}/rocm"
 assert_file "${INSTALL_DIR}/rocmd"
 assert_file "${INSTALL_DIR}/rocm-engine-pytorch"
 assert_file "${INSTALL_DIR}/.rocm-cli-manifest"
+assert_file "${BASHRC_FILE}"
+grep -F "${INSTALL_DIR}" "${BASHRC_FILE}" >/dev/null \
+  || fail "installer did not add install dir to the shell profile"
 
 echo "acceptance: simulate stale prior install entry and reinstall"
 echo "stale" > "${INSTALL_DIR}/rocm-engine-stale"
@@ -80,6 +87,8 @@ assert_missing "${INSTALL_DIR}/rocm-engine-stale"
 assert_file "${INSTALL_DIR}/.rocm-cli-manifest"
 grep -q "removing previous rocm-cli install" "${INSTALL_LOG_2}" \
   || fail "installer did not report removal of previous install"
+MARKER_COUNT="$(grep -c '# >>> rocm-cli path >>>' "${BASHRC_FILE}")"
+[[ "${MARKER_COUNT}" -eq 1 ]] || fail "installer duplicated the shell PATH snippet"
 
 echo "acceptance: drive the TUI through a pseudo-terminal"
 (

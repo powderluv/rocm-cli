@@ -8,6 +8,8 @@ Install on Linux x86_64:
 curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh | sh
 ```
 
+The installer updates your shell profile to add the install directory to `PATH` when needed.
+
 Re-running the installer replaces the previous `rocm-cli` binaries from the same install directory.
 
 Install the latest nightly on Linux x86_64:

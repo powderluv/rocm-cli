@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, detect_host_therock_family, extract_first_gfx_token,
-    normalize_therock_family, require_nonempty,
+    interactive_terminal, normalize_therock_family, require_nonempty,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, EndpointResponse, EngineCapabilities,
@@ -570,7 +570,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     let python_executable = venv_python_path(&env_path);
     let python_executable_string = python_executable.to_string_lossy().to_string();
     ensure_pip_available(&python_executable_string)?;
-    run_command(
+    run_progress_command(
         &python_executable_string,
         std::iter::once("-m")
             .chain(std::iter::once("pip"))
@@ -595,12 +595,12 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
             args.push(extra_index.to_owned());
         }
         args.push(torch_spec.to_owned());
-        run_command(
+        run_progress_command(
             &python_executable_string,
             args.iter().map(String::as_str),
             "install torch package into managed pytorch env",
         )?;
-        run_command(
+        run_progress_command(
             &python_executable_string,
             std::iter::once("-m")
                 .chain(std::iter::once("pip"))
@@ -616,7 +616,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         match therock_resolution {
             Some(resolution) => {
                 install_therock_torch_packages(&python_executable_string, &resolution)?;
-                run_command(
+                run_progress_command(
                     &python_executable_string,
                     std::iter::once("-m")
                         .chain(std::iter::once("pip"))
@@ -1251,6 +1251,8 @@ fn install_therock_torch_packages(
         "--retries".to_owned(),
         pip_retries().to_string(),
         "--disable-pip-version-check".to_owned(),
+        "--progress-bar".to_owned(),
+        "on".to_owned(),
         "--index-url".to_owned(),
         resolution.index_url.clone(),
         "--upgrade-strategy".to_owned(),
@@ -1260,7 +1262,7 @@ fn install_therock_torch_packages(
         args.push("--pre".to_owned());
     }
     args.extend(resolution.packages.iter().cloned());
-    run_command(
+    run_progress_command(
         python_executable,
         args.iter().map(String::as_str),
         "install TheRock torch packages into managed pytorch env",
@@ -1328,6 +1330,8 @@ fn pip_install_network_args() -> Vec<String> {
         "--retries".to_owned(),
         pip_retries().to_string(),
         "--disable-pip-version-check".to_owned(),
+        "--progress-bar".to_owned(),
+        "on".to_owned(),
     ]
 }
 
@@ -1467,6 +1471,27 @@ where
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+fn run_progress_command<'a, I>(program: &str, args: I, context_label: &str) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
+    if interactive_terminal() {
+        let status = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to start {context_label}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("{context_label} failed (status {status})");
+    }
+    run_command(program, args.iter().map(String::as_str), context_label)
 }
 
 fn capture_command<'a, I>(program: &str, args: I, context_label: &str) -> Result<String>
