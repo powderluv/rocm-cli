@@ -10,6 +10,8 @@ const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
 const THEROCK_ROCM_PACKAGE_SPEC: &str = "rocm[libraries,devel]";
+const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_PIP_RETRIES: u32 = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -242,20 +244,29 @@ fn install_pip_runtime(
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
     let _ = writeln!(output, "  python_launcher: {python_launcher}");
     if dry_run {
+        let mut install_args = vec![
+            "--timeout".to_owned(),
+            pip_timeout_secs().to_string(),
+            "--retries".to_owned(),
+            pip_retries().to_string(),
+            "--disable-pip-version-check".to_owned(),
+            "--index-url".to_owned(),
+            resolution.index_url.clone(),
+            "--upgrade-strategy".to_owned(),
+            "only-if-needed".to_owned(),
+        ];
+        if matches!(channel, TheRockChannel::Nightly) {
+            install_args.push("--pre".to_owned());
+        }
+        install_args.push(THEROCK_ROCM_PACKAGE_SPEC.to_owned());
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(
             output,
-            "  command: {} -m venv {} && {}/python -m pip install --index-url {} {}{}",
+            "  command: {} -m venv {} && {}/python -m pip install {}",
             python_launcher,
             install_root.display(),
             venv_bin_dir(&install_root).display(),
-            resolution.index_url,
-            if matches!(channel, TheRockChannel::Nightly) {
-                "--pre "
-            } else {
-                ""
-            },
-            THEROCK_ROCM_PACKAGE_SPEC
+            install_args.join(" ")
         );
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
         return Ok(output);
@@ -278,6 +289,11 @@ fn install_pip_runtime(
         "-m".to_owned(),
         "pip".to_owned(),
         "install".to_owned(),
+        "--timeout".to_owned(),
+        pip_timeout_secs().to_string(),
+        "--retries".to_owned(),
+        pip_retries().to_string(),
+        "--disable-pip-version-check".to_owned(),
         "--index-url".to_owned(),
         resolution.index_url.clone(),
         "--upgrade-strategy".to_owned(),
@@ -613,6 +629,21 @@ fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> 
         context_text,
         String::from_utf8_lossy(&output.stderr).trim()
     )
+}
+
+fn pip_timeout_secs() -> u64 {
+    std::env::var("ROCM_CLI_PIP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PIP_TIMEOUT_SECS)
+}
+
+fn pip_retries() -> u32 {
+    std::env::var("ROCM_CLI_PIP_RETRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_PIP_RETRIES)
 }
 
 fn resolve_python_launcher() -> Result<String> {

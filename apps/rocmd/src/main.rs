@@ -18,7 +18,7 @@ const SERVER_RECOVER_BACKOFF_MS: u128 = 30_000;
 const THEROCK_UPDATE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1000;
 
 #[derive(Parser, Debug)]
-#[command(name = "rocmd", about = "rocm-cli local supervisor")]
+#[command(name = "rocmd", about = "rocm-cli local supervisor", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

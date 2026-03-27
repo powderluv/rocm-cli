@@ -27,7 +27,7 @@ use std::time::Duration;
 const DEFAULT_RUNTIME_ID: &str = "therock-release";
 
 #[derive(Parser, Debug)]
-#[command(name = "rocm", about = "ROCm AI Command Center CLI")]
+#[command(name = "rocm", about = "ROCm AI Command Center CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -36,6 +36,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Doctor,
+    Version,
     Chat {
         #[arg(long)]
         provider: Option<Provider>,
@@ -213,6 +214,10 @@ fn run_freeform(request: String) -> Result<()> {
 fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Doctor) => doctor(),
+        Some(Command::Version) => {
+            print!("rocm {}\n", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some(Command::Chat { provider }) => {
             if interactive_terminal() {
                 return tui::run(provider.map(provider_name).map(str::to_owned));

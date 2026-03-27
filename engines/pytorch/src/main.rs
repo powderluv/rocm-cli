@@ -23,6 +23,8 @@ const ENGINE_NAME: &str = "pytorch";
 const DEFAULT_RUNTIME_ID: &str = "therock-release";
 const THEROCK_SIMPLE_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const PYTHON_WORKER_SOURCE: &str = include_str!("python_worker.py");
+const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_PIP_RETRIES: u32 = 8;
 const ENGINE_DEPENDENCIES: &[&str] = &[
     "fastapi",
     "uvicorn",
@@ -44,7 +46,11 @@ const KNOWN_THEROCK_FAMILIES: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "rocm-engine-pytorch", about = "rocm-cli PyTorch engine")]
+#[command(
+    name = "rocm-engine-pytorch",
+    about = "rocm-cli PyTorch engine",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -569,6 +575,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         std::iter::once("-m")
             .chain(std::iter::once("pip"))
             .chain(std::iter::once("install"))
+            .chain(pip_install_network_args().iter().map(String::as_str))
             .chain(ENGINE_DEPENDENCIES.iter().copied()),
         "install managed pytorch engine dependencies",
     )?;
@@ -582,6 +589,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
     let maybe_extra_index = std::env::var("ROCM_CLI_PYTORCH_EXTRA_INDEX_URL").ok();
     if let Some(torch_spec) = maybe_torch_spec.as_deref() {
         let mut args = vec!["-m".to_owned(), "pip".to_owned(), "install".to_owned()];
+        args.extend(pip_install_network_args());
         if let Some(extra_index) = maybe_extra_index.as_deref() {
             args.push("--extra-index-url".to_owned());
             args.push(extra_index.to_owned());
@@ -597,6 +605,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
             std::iter::once("-m")
                 .chain(std::iter::once("pip"))
                 .chain(std::iter::once("install"))
+                .chain(pip_install_network_args().iter().map(String::as_str))
                 .chain(TORCH_STACK_DEPENDENCIES.iter().copied()),
             "install pytorch engine runtime dependencies",
         )?;
@@ -612,6 +621,7 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
                     std::iter::once("-m")
                         .chain(std::iter::once("pip"))
                         .chain(std::iter::once("install"))
+                        .chain(pip_install_network_args().iter().map(String::as_str))
                         .chain(TORCH_STACK_DEPENDENCIES.iter().copied()),
                     "install pytorch engine runtime dependencies",
                 )?;
@@ -1236,6 +1246,11 @@ fn install_therock_torch_packages(
         "-m".to_owned(),
         "pip".to_owned(),
         "install".to_owned(),
+        "--timeout".to_owned(),
+        pip_timeout_secs().to_string(),
+        "--retries".to_owned(),
+        pip_retries().to_string(),
+        "--disable-pip-version-check".to_owned(),
         "--index-url".to_owned(),
         resolution.index_url.clone(),
         "--upgrade-strategy".to_owned(),
@@ -1289,6 +1304,31 @@ fn ensure_pip_available(python_executable: &str) -> Result<()> {
         ["-m", "pip", "--version"],
         "verify pip in managed pytorch env",
     )
+}
+
+fn pip_timeout_secs() -> u64 {
+    std::env::var("ROCM_CLI_PIP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PIP_TIMEOUT_SECS)
+}
+
+fn pip_retries() -> u32 {
+    std::env::var("ROCM_CLI_PIP_RETRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_PIP_RETRIES)
+}
+
+fn pip_install_network_args() -> Vec<String> {
+    vec![
+        "--timeout".to_owned(),
+        pip_timeout_secs().to_string(),
+        "--retries".to_owned(),
+        pip_retries().to_string(),
+        "--disable-pip-version-check".to_owned(),
+    ]
 }
 
 fn command_succeeds<'a, I>(program: &str, args: I) -> Result<bool>
