@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rocm_core::{AppPaths, DEFAULT_LOCAL_PORT, require_nonempty};
+use rocm_core::{
+    AppPaths, DEFAULT_LOCAL_PORT, detect_host_therock_family, extract_first_gfx_token,
+    normalize_therock_family, require_nonempty,
+};
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, EndpointResponse, EngineCapabilities,
     EngineDeviceAvailability, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,
@@ -323,7 +326,7 @@ where
 fn detect_response() -> DetectResponse {
     let manifest = latest_env_manifest().ok().flatten();
     let installed = manifest.is_some();
-    let detected_family = detect_host_therock_family().ok().flatten();
+    let detected_family = detect_host_therock_family();
     let env_id = manifest.as_ref().map(|value| value.env_id.clone());
     let python_version = manifest
         .as_ref()
@@ -1209,7 +1212,7 @@ fn resolve_therock_torch_resolution(runtime_id: &str) -> Result<Option<TheRockTo
         }
     }
 
-    if let Some(family) = detect_host_therock_family()? {
+    if let Some(family) = detect_host_therock_family() {
         return Ok(Some(TheRockTorchResolution {
             channel: runtime_request.channel,
             family: family.clone(),
@@ -1247,70 +1250,6 @@ fn install_therock_torch_packages(
         args.iter().map(String::as_str),
         "install TheRock torch packages into managed pytorch env",
     )
-}
-
-fn detect_host_therock_family() -> Result<Option<String>> {
-    Ok(detect_host_gfx_target().and_then(|target| normalize_therock_family(&target)))
-}
-
-fn detect_host_gfx_target() -> Option<String> {
-    capture_optional_command("rocm_agent_enumerator", &[])
-        .and_then(|output| extract_first_gfx_token(&output))
-        .or_else(|| {
-            capture_optional_command("rocminfo", &[])
-                .and_then(|output| extract_first_gfx_token(&output))
-        })
-}
-
-fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
-fn extract_first_gfx_token(text: &str) -> Option<String> {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .find_map(|token| {
-            let normalized = token.to_ascii_lowercase();
-            if normalized.starts_with("gfx") {
-                Some(normalized)
-            } else {
-                None
-            }
-        })
-}
-
-fn normalize_therock_family(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    for family in KNOWN_THEROCK_FAMILIES {
-        if normalized == family.to_ascii_lowercase() {
-            return Some((*family).to_owned());
-        }
-    }
-
-    let target = extract_first_gfx_token(&normalized).unwrap_or(normalized);
-    match target.as_str() {
-        value if value.starts_with("gfx950") => Some("gfx950-dcgpu".to_owned()),
-        value
-            if value.starts_with("gfx942")
-                || value.starts_with("gfx94")
-                || value.starts_with("gfx9-4") =>
-        {
-            Some("gfx94X-dcgpu".to_owned())
-        }
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" => Some("gfx110X-all".to_owned()),
-        value if value.starts_with("gfx1151") => Some("gfx1151".to_owned()),
-        "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
-        _ => None,
-    }
 }
 
 fn therock_index_url(family: &str) -> String {
@@ -1544,6 +1483,14 @@ mod tests {
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
         assert_eq!(
             normalize_therock_family("gfx1103"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1101"),
             Some("gfx110X-all".to_owned())
         );
     }

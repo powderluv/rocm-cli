@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{IsTerminal, stdin, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
@@ -110,6 +111,8 @@ pub struct DoctorSummary {
     pub arch: String,
     pub interactive_terminal: bool,
     pub default_engine: &'static str,
+    pub detected_gfx_target: Option<String>,
+    pub detected_therock_family: Option<String>,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -123,6 +126,8 @@ impl DoctorSummary {
             arch: std::env::consts::ARCH.to_owned(),
             interactive_terminal: interactive_terminal(),
             default_engine: default_engine_for_platform(),
+            detected_gfx_target: detect_host_gfx_target(),
+            detected_therock_family: detect_host_therock_family(),
             config_dir: paths.config_dir,
             data_dir: paths.data_dir,
             cache_dir: paths.cache_dir,
@@ -131,11 +136,15 @@ impl DoctorSummary {
 
     pub fn render_text(&self) -> String {
         format!(
-            "rocm doctor\n  os: {}\n  arch: {}\n  interactive_terminal: {}\n  default_engine: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm doctor\n  os: {}\n  arch: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  detected_therock_family: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.interactive_terminal,
             self.default_engine,
+            self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
+            self.detected_therock_family
+                .as_deref()
+                .unwrap_or("<unknown>"),
             self.config_dir.display(),
             self.data_dir.display(),
             self.cache_dir.display(),
@@ -164,6 +173,206 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
         bail!("{field_name} must not be empty");
     }
     Ok(())
+}
+
+pub fn detect_host_therock_family() -> Option<String> {
+    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
+}
+
+pub fn detect_host_gfx_target() -> Option<String> {
+    capture_optional_command("rocm_agent_enumerator", &[])
+        .and_then(|output| extract_first_gfx_token(&output))
+        .or_else(|| {
+            capture_optional_command("rocminfo", &[])
+                .and_then(|output| extract_first_gfx_token(&output))
+        })
+        .or_else(detect_linux_sysfs_gfx_target)
+}
+
+pub fn extract_first_gfx_token(text: &str) -> Option<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .find_map(|token| {
+            let normalized = token.to_ascii_lowercase();
+            if normalized.starts_with("gfx") {
+                Some(normalized)
+            } else {
+                None
+            }
+        })
+}
+
+pub fn normalize_therock_family(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let target = extract_first_gfx_token(&normalized).unwrap_or(normalized);
+    match target.as_str() {
+        value if value.starts_with("gfx101") => Some("gfx101X-dgpu".to_owned()),
+        value if value.starts_with("gfx103") => Some("gfx103X-dgpu".to_owned()),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" => Some("gfx110X-all".to_owned()),
+        value if value.starts_with("gfx1150") => Some("gfx1150".to_owned()),
+        value if value.starts_with("gfx1151") => Some("gfx1151".to_owned()),
+        value if value.starts_with("gfx1152") => Some("gfx1152".to_owned()),
+        value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
+        "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
+        value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
+        value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
+        value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
+        value if value.starts_with("gfx90a") => Some("gfx90a".to_owned()),
+        value if value.starts_with("gfx950") => Some("gfx950-dcgpu".to_owned()),
+        value
+            if value.starts_with("gfx942")
+                || value.starts_with("gfx94")
+                || value.starts_with("gfx9-4") =>
+        {
+            Some("gfx94X-dcgpu".to_owned())
+        }
+        value if value.starts_with("gfx90") => Some("gfx90X-dcgpu".to_owned()),
+        _ => None,
+    }
+}
+
+fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_sysfs_gfx_target() -> Option<String> {
+    detect_linux_kfd_gfx_target().or_else(detect_linux_drm_ip_discovery_gfx_target)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_linux_sysfs_gfx_target() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_kfd_gfx_target() -> Option<String> {
+    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    let entries = fs::read_dir(nodes_dir).ok()?;
+    for entry in entries.flatten() {
+        let Some(value) = fs::read_to_string(entry.path().join("gfx_target_version")).ok() else {
+            continue;
+        };
+        let Some(token) = parse_linux_kfd_gfx_target(value.trim()) else {
+            continue;
+        };
+        return Some(token);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
+    if let Some(token) = extract_first_gfx_token(value) {
+        return Some(token);
+    }
+    let digits = value.trim();
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    match digits.len() {
+        3 | 4 => Some(format!("gfx{digits}")),
+        5 | 6 => {
+            let raw: u32 = digits.parse().ok()?;
+            let major = raw / 10_000;
+            let minor = (raw / 100) % 100;
+            let revision = raw % 100;
+            if let Some(token) = gfx_target_from_gc_version(major, minor, revision) {
+                return Some(token);
+            }
+            Some(format!("gfx{digits}"))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
+    let drm_dir = Path::new("/sys/class/drm");
+    let entries = fs::read_dir(drm_dir).ok()?;
+    for entry in entries.flatten() {
+        let card_path = entry.path();
+        let Some(card_name) = card_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !card_name.starts_with("card") || card_name.contains('-') {
+            continue;
+        }
+        let device_dir = card_path.join("device");
+        if !is_amdgpu_device(&device_dir) {
+            continue;
+        }
+        let gc_root = device_dir.join("ip_discovery");
+        let token = detect_ip_discovery_gc_target(&gc_root);
+        if token.is_some() {
+            return token;
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn is_amdgpu_device(device_dir: &Path) -> bool {
+    if let Ok(vendor) = fs::read_to_string(device_dir.join("vendor"))
+        && vendor.trim().eq_ignore_ascii_case("0x1002")
+    {
+        return true;
+    }
+    if let Ok(uevent) = fs::read_to_string(device_dir.join("uevent")) {
+        return uevent.lines().any(|line| line.trim() == "DRIVER=amdgpu");
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn detect_ip_discovery_gc_target(ip_discovery_dir: &Path) -> Option<String> {
+    let die_entries = fs::read_dir(ip_discovery_dir.join("die")).ok()?;
+    for die in die_entries.flatten() {
+        let Some(gc_entries) = fs::read_dir(die.path().join("GC")).ok() else {
+            continue;
+        };
+        for gc in gc_entries.flatten() {
+            let block = gc.path();
+            let Some(major) = fs::read_to_string(block.join("major"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some(minor) = fs::read_to_string(block.join("minor"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some(revision) = fs::read_to_string(block.join("revision"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(token) = gfx_target_from_gc_version(major, minor, revision) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) -> Option<String> {
+    if major == 0 {
+        return None;
+    }
+    Some(format!("gfx{major}{minor}{revision}"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -609,5 +818,33 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(default_engine_for_platform(), "pytorch");
         }
+    }
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1101"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1103"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn gc_version_converts_to_gfx_target() {
+        assert_eq!(
+            gfx_target_from_gc_version(11, 0, 1),
+            Some("gfx1101".to_owned())
+        );
+        assert_eq!(
+            gfx_target_from_gc_version(11, 0, 3),
+            Some("gfx1103".to_owned())
+        );
     }
 }

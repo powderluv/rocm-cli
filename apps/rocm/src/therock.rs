@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, unix_time_millis};
+use rocm_core::{AppPaths, detect_host_therock_family, normalize_therock_family, unix_time_millis};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
@@ -10,24 +10,6 @@ const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
 const THEROCK_ROCM_PACKAGE_SPEC: &str = "rocm[libraries,devel]";
-const KNOWN_THEROCK_FAMILIES: &[&str] = &[
-    "gfx101X-dgpu",
-    "gfx103X-dgpu",
-    "gfx110X-all",
-    "gfx1150",
-    "gfx1151",
-    "gfx1152",
-    "gfx1153",
-    "gfx120X-all",
-    "gfx900",
-    "gfx906",
-    "gfx908",
-    "gfx90X-dcgpu",
-    "gfx90a",
-    "gfx94X-dcgpu",
-    "gfx950-dcgpu",
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -490,7 +472,7 @@ fn resolve_family(family_override: Option<&str>) -> Result<FamilyResolution> {
         });
     }
 
-    if let Some(family) = detect_host_therock_family()? {
+    if let Some(family) = detect_host_therock_family() {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
@@ -716,80 +698,6 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn detect_host_therock_family() -> Result<Option<String>> {
-    Ok(detect_host_gfx_target().and_then(|target| normalize_therock_family(&target)))
-}
-
-fn detect_host_gfx_target() -> Option<String> {
-    capture_optional_command("rocm_agent_enumerator", &[])
-        .and_then(|output| extract_first_gfx_token(&output))
-        .or_else(|| {
-            capture_optional_command("rocminfo", &[])
-                .and_then(|output| extract_first_gfx_token(&output))
-        })
-}
-
-fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
-fn extract_first_gfx_token(text: &str) -> Option<String> {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .find_map(|token| {
-            let normalized = token.to_ascii_lowercase();
-            if normalized.starts_with("gfx") {
-                Some(normalized)
-            } else {
-                None
-            }
-        })
-}
-
-fn normalize_therock_family(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    for family in KNOWN_THEROCK_FAMILIES {
-        if normalized == family.to_ascii_lowercase() {
-            return Some((*family).to_owned());
-        }
-    }
-
-    let target = extract_first_gfx_token(&normalized).unwrap_or(normalized);
-    match target.as_str() {
-        value if value.starts_with("gfx101") => Some("gfx101X-dgpu".to_owned()),
-        value if value.starts_with("gfx103") => Some("gfx103X-dgpu".to_owned()),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" => Some("gfx110X-all".to_owned()),
-        value if value.starts_with("gfx1150") => Some("gfx1150".to_owned()),
-        value if value.starts_with("gfx1151") => Some("gfx1151".to_owned()),
-        value if value.starts_with("gfx1152") => Some("gfx1152".to_owned()),
-        value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
-        "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
-        value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
-        value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
-        value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
-        value if value.starts_with("gfx90a") => Some("gfx90a".to_owned()),
-        value if value.starts_with("gfx950") => Some("gfx950-dcgpu".to_owned()),
-        value
-            if value.starts_with("gfx942")
-                || value.starts_with("gfx94")
-                || value.starts_with("gfx9-4") =>
-        {
-            Some("gfx94X-dcgpu".to_owned())
-        }
-        value if value.starts_with("gfx90") => Some("gfx90X-dcgpu".to_owned()),
-        _ => None,
-    }
-}
-
 fn therock_index_url(family: &str) -> String {
     format!("{THEROCK_PIP_INDEX_BASE}/{family}")
 }
@@ -917,6 +825,14 @@ mod tests {
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
         assert_eq!(
             normalize_therock_family("gfx1103"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1101"),
             Some("gfx110X-all".to_owned())
         );
     }
