@@ -149,9 +149,13 @@ pub fn interactive_terminal() -> bool {
 
 pub fn default_engine_for_platform() -> &'static str {
     if cfg!(target_os = "windows") {
-        "pytorch"
-    } else {
+        return "pytorch";
+    }
+
+    if sibling_binary_exists("rocm-engine-vllm") {
         "vllm"
+    } else {
+        "pytorch"
     }
 }
 
@@ -529,6 +533,16 @@ pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {
     }
 }
 
+pub fn sibling_binary_exists(binary_name: &str) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(binary_dir) = current_exe.parent() else {
+        return false;
+    };
+    binary_dir.join(platform_binary_name(binary_name)).is_file()
+}
+
 pub fn engine_binary_path(engine: &str) -> Result<PathBuf> {
     sibling_binary_path(&format!("rocm-engine-{engine}"))
 }
@@ -574,4 +588,26 @@ pub fn unix_time_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_binary_name_adds_windows_suffix_only_on_windows() {
+        let name = platform_binary_name("rocm");
+        if cfg!(windows) {
+            assert_eq!(name, "rocm.exe");
+        } else {
+            assert_eq!(name, "rocm");
+        }
+    }
+
+    #[test]
+    fn default_engine_is_always_usable_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_platform(), "pytorch");
+        }
+    }
 }

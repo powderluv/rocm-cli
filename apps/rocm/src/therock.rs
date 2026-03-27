@@ -908,3 +908,29 @@ fn slugify(value: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
+        assert_eq!(
+            normalize_therock_family("gfx1103"),
+            Some("gfx110X-all".to_owned())
+        );
+    }
+
+    #[test]
+    fn release_channel_prefers_stable_versions() {
+        let versions = vec![
+            "7.11.0".to_owned(),
+            "7.12.0".to_owned(),
+            "7.13.0a20260326".to_owned(),
+        ];
+        assert_eq!(
+            select_latest_version(&versions, TheRockChannel::Release),
+            Some("7.12.0".to_owned())
+        );
+    }
+}
