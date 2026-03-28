@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, AutomationEventRecord, AutomationRuntimeState, DEFAULT_LOCAL_HOST,
+    AppPaths, AutomationEventRecord, AutomationRuntimeState, DEFAULT_LOCAL_HOST, DoctorSummary,
     ManagedServiceRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
-    append_automation_event, builtin_watchers, daemon_binary_path, engine_binary_path,
-    unix_time_millis,
+    append_automation_event, builtin_watchers, daemon_binary_path, default_engine_for_platform,
+    engine_binary_path, load_recent_automation_events, unix_time_millis,
 };
+use serde::Serialize;
+use serde_json::Value;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -50,6 +52,44 @@ enum Command {
         device_policy: String,
     },
     Status,
+    BridgeSnapshot {
+        #[arg(long)]
+        pretty: bool,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct CodexBridgeSnapshot {
+    protocol: &'static str,
+    generated_at_unix_ms: u128,
+    doctor: DoctorSummary,
+    gpu: CodexBridgeGpuSnapshot,
+    config: RocmCliConfig,
+    automation_runtime: Option<AutomationRuntimeState>,
+    recent_automation_events: Vec<AutomationEventRecord>,
+    engines: Vec<CodexBridgeEngine>,
+    services: Vec<ManagedServiceRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexBridgeGpuSnapshot {
+    amd_smi_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    static_snapshot: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor_snapshot: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexBridgeEngine {
+    id: &'static str,
+    summary: &'static str,
+    default_for_platform: bool,
+    installed_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_path: Option<String>,
 }
 
 #[tokio::main]
@@ -86,9 +126,138 @@ async fn main() -> Result<()> {
         Command::Status => {
             print_status(&paths)?;
         }
+        Command::BridgeSnapshot { pretty } => {
+            print_bridge_snapshot(&paths, pretty)?;
+        }
     }
 
     Ok(())
+}
+
+fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
+    let snapshot = CodexBridgeSnapshot {
+        protocol: "rocmd-codex-bridge-v0",
+        generated_at_unix_ms: unix_time_millis(),
+        doctor: DoctorSummary::gather()?,
+        gpu: gather_gpu_snapshot(),
+        config: RocmCliConfig::load(paths).unwrap_or_default(),
+        automation_runtime: AutomationRuntimeState::load(paths)?,
+        recent_automation_events: load_recent_automation_events(paths, 32)?,
+        engines: bridge_engine_inventory(),
+        services: load_managed_services(paths)?,
+    };
+
+    if pretty {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot)
+                .context("failed to serialize bridge snapshot")?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string(&snapshot).context("failed to serialize bridge snapshot")?
+        );
+    }
+
+    Ok(())
+}
+
+fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
+    let static_snapshot = match capture_amd_smi_json(&["static", "-a", "-g", "all", "--json"]) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            return CodexBridgeGpuSnapshot {
+                amd_smi_available: false,
+                static_snapshot: None,
+                monitor_snapshot: None,
+                note: Some(error.to_string()),
+            };
+        }
+    };
+
+    let monitor_snapshot = match capture_amd_smi_json(&[
+        "monitor", "-p", "-t", "-u", "-m", "-v", "-g", "all", "--json",
+    ]) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            return CodexBridgeGpuSnapshot {
+                amd_smi_available: true,
+                static_snapshot,
+                monitor_snapshot: None,
+                note: Some(error.to_string()),
+            };
+        }
+    };
+
+    CodexBridgeGpuSnapshot {
+        amd_smi_available: true,
+        static_snapshot,
+        monitor_snapshot,
+        note: None,
+    }
+}
+
+fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
+    let output = ProcessCommand::new("amd-smi")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        anyhow::bail!(
+            "amd-smi {} failed: {}",
+            args.join(" "),
+            if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit status {}", output.status)
+            }
+        );
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
+}
+
+fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
+    let default_engine = default_engine_for_platform();
+    rocmd_engine_inventory()
+        .iter()
+        .map(|(id, summary)| {
+            let binary_path = engine_binary_path(id).ok();
+            CodexBridgeEngine {
+                id,
+                summary,
+                default_for_platform: *id == default_engine,
+                installed_binary: binary_path.is_some(),
+                binary_path: binary_path.map(|path| path.display().to_string()),
+            }
+        })
+        .collect()
+}
+
+fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "pytorch",
+            "default local serving engine when vllm is not installed",
+        ),
+        ("llama.cpp", "CPU and quantized fallback engine"),
+        (
+            "vllm",
+            "preferred Linux ROCm GPU serving engine when installed",
+        ),
+        ("sglang", "deferred advanced serving engine"),
+        ("atom", "deferred AMD-optimized serving engine"),
+    ]
 }
 
 async fn run_daemon(paths: &AppPaths, automations_enabled: bool) -> Result<()> {

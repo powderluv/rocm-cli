@@ -228,9 +228,9 @@ fn dispatch(cli: Cli) -> Result<()> {
     if cli.experimental_codex_tui {
         return match cli.command {
             None | Some(Command::Chat { .. }) => launch_experimental_codex_tui(),
-            Some(_) => bail!(
-                "`--experimental-codex-tui` is only supported for interactive chat launch"
-            ),
+            Some(_) => {
+                bail!("`--experimental-codex-tui` is only supported for interactive chat launch")
+            }
         };
     }
 
@@ -363,8 +363,8 @@ fn launch_experimental_codex_tui() -> Result<()> {
 }
 
 fn vendored_codex_workspace() -> Result<PathBuf> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../third_party/openai-codex/codex-rs");
+    let workspace =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/openai-codex/codex-rs");
     if workspace.join("Cargo.toml").is_file() {
         Ok(workspace)
     } else {
