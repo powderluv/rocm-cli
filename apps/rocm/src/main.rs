@@ -30,6 +30,9 @@ const DEFAULT_RUNTIME_ID: &str = "therock-release";
 #[derive(Parser, Debug)]
 #[command(name = "rocm", about = "ROCm AI Command Center CLI", version)]
 struct Cli {
+    #[arg(long, global = true, hide = true)]
+    experimental_codex_tui: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -222,6 +225,15 @@ fn run_freeform(request: String) -> Result<()> {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    if cli.experimental_codex_tui {
+        return match cli.command {
+            None | Some(Command::Chat { .. }) => launch_experimental_codex_tui(),
+            Some(_) => bail!(
+                "`--experimental-codex-tui` is only supported for interactive chat launch"
+            ),
+        };
+    }
+
     match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Version) => {
@@ -290,6 +302,93 @@ fn dispatch(cli: Cli) -> Result<()> {
         }),
         None => launch_default(),
     }
+}
+
+fn launch_experimental_codex_tui() -> Result<()> {
+    if !interactive_terminal() {
+        bail!("`rocm --experimental-codex-tui` requires an interactive terminal");
+    }
+
+    let workspace = vendored_codex_workspace()?;
+    let manifest_path = workspace.join("Cargo.toml");
+    let binary_path = vendored_codex_binary(&workspace);
+    let mut command = if let Some(binary_path) = &binary_path {
+        let mut process = ProcessCommand::new(binary_path);
+        process.arg("chat");
+        process
+    } else {
+        let mut process = ProcessCommand::new("cargo");
+        process.args([
+            "run",
+            "--manifest-path",
+            manifest_path
+                .to_str()
+                .context("vendored Codex manifest path was not valid UTF-8")?,
+            "-p",
+            "codex-cli",
+            "--bin",
+            "codex",
+            "--",
+            "chat",
+        ]);
+        process
+    };
+
+    println!("experimental Codex TUI launch");
+    println!("  source: {}", workspace.display());
+    if let Some(binary_path) = &binary_path {
+        println!("  mode: prebuilt binary");
+        println!("  binary: {}", binary_path.display());
+    } else {
+        println!("  mode: cargo run");
+        println!("  manifest: {}", manifest_path.display());
+        println!("  note: this will compile the vendored Codex workspace on first launch");
+    }
+    println!(
+        "  provider policy: vendored Codex auth flow remains intact; ChatGPT sign-in stays available as the no-key default path"
+    );
+
+    let status = command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to launch vendored Codex TUI")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("vendored Codex TUI exited with status {status}");
+    }
+}
+
+fn vendored_codex_workspace() -> Result<PathBuf> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/openai-codex/codex-rs");
+    if workspace.join("Cargo.toml").is_file() {
+        Ok(workspace)
+    } else {
+        bail!(
+            "vendored Codex workspace not found at {}",
+            workspace.display()
+        );
+    }
+}
+
+fn vendored_codex_binary(workspace: &Path) -> Option<PathBuf> {
+    let candidates = if cfg!(windows) {
+        vec![
+            workspace.join("target").join("release").join("codex.exe"),
+            workspace.join("target").join("debug").join("codex.exe"),
+        ]
+    } else {
+        vec![
+            workspace.join("target").join("release").join("codex"),
+            workspace.join("target").join("debug").join("codex"),
+        ]
+    };
+
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn doctor() -> Result<()> {
