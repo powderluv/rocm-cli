@@ -10,5 +10,6 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
