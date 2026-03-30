@@ -4,10 +4,10 @@ mod tui;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord,
-    RocmCliConfig, WatcherMode, builtin_watcher, builtin_watchers, daemon_binary_path,
-    default_engine_for_platform, engine_binary_path, generate_service_id, interactive_terminal,
-    load_recent_automation_events,
+    AppPaths, AutomationRuntimeState, CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, DoctorSummary,
+    ManagedServiceRecord, RocmCliConfig, WatcherMode, builtin_watcher, builtin_watchers,
+    daemon_binary_path, default_engine_for_platform, engine_binary_path, generate_service_id,
+    interactive_terminal, load_recent_automation_events, sibling_binary_path,
 };
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, InstallRequest,
@@ -26,6 +26,7 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_RUNTIME_ID: &str = "therock-release";
+const ROCM_CODEX_DEVELOPER_INSTRUCTIONS: &str = "You are operating inside ROCm AI Command Center. Prefer `rocm` and `rocmd` commands for ROCm, runtime, engine, service, and automation actions. Preserve the vendored Codex login flow: if no provider or API key is configured, keep ChatGPT sign-in as the default path.";
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm", about = "ROCm AI Command Center CLI", version)]
@@ -227,7 +228,13 @@ fn run_freeform(request: String) -> Result<()> {
 fn dispatch(cli: Cli) -> Result<()> {
     if cli.experimental_codex_tui {
         return match cli.command {
-            None | Some(Command::Chat { .. }) => launch_experimental_codex_tui(),
+            None | Some(Command::Chat { provider: None }) => launch_experimental_codex_tui(),
+            Some(Command::Chat {
+                provider: Some(provider),
+            }) => bail!(
+                "`--experimental-codex-tui` currently uses vendored Codex provider selection; omit `--provider` (requested `{}`)",
+                provider_name(provider)
+            ),
             Some(_) => {
                 bail!("`--experimental-codex-tui` is only supported for interactive chat launch")
             }
@@ -309,41 +316,72 @@ fn launch_experimental_codex_tui() -> Result<()> {
         bail!("`rocm --experimental-codex-tui` requires an interactive terminal");
     }
 
+    let paths = AppPaths::discover()?;
+    let bridge = prepare_codex_bridge(&paths)?;
     let workspace = vendored_codex_workspace()?;
-    let manifest_path = workspace.join("Cargo.toml");
-    let binary_path = vendored_codex_binary(&workspace);
-    let mut command = if let Some(binary_path) = &binary_path {
-        let mut process = ProcessCommand::new(binary_path);
-        process.arg("chat");
-        process
-    } else {
-        let mut process = ProcessCommand::new("cargo");
-        process.args([
-            "run",
-            "--manifest-path",
-            manifest_path
-                .to_str()
-                .context("vendored Codex manifest path was not valid UTF-8")?,
-            "-p",
-            "codex-cli",
-            "--bin",
-            "codex",
-            "--",
-            "chat",
-        ]);
-        process
-    };
+    let rocmd_binary = daemon_binary_path()?;
+    let binary_path = installed_codex_binary()
+        .or_else(|| vendored_codex_binary(&workspace))
+        .with_context(|| {
+        format!(
+            "vendored Codex TUI is not available.\n\n\
+Expected an installed `rocm-codex` sibling binary or a locally prebuilt vendored Codex binary under {}.\n\
+Build and package `rocm-cli` so the `rocm-codex` binary ships with the install bundle.",
+            workspace.join("target").display()
+        )
+    })?;
+    let mut command = ProcessCommand::new(&binary_path);
+    command.arg("chat");
+    command
+        .arg("-c")
+        .arg(config_string_override(
+            "model_instructions_file",
+            &bridge.instructions_path.display().to_string(),
+        )?)
+        .arg("-c")
+        .arg(config_string_override(
+            "developer_instructions",
+            ROCM_CODEX_DEVELOPER_INSTRUCTIONS,
+        )?)
+        .arg("-c")
+        .arg(config_string_override(
+            "mcp_servers.rocm.command",
+            &rocmd_binary.display().to_string(),
+        )?)
+        .arg("-c")
+        .arg(config_raw_override(
+            "mcp_servers.rocm.args",
+            "[\"mcp-server\"]",
+        ))
+        .arg("-c")
+        .arg(config_raw_override(
+            "mcp_servers.rocm.startup_timeout_sec",
+            "10.0",
+        ))
+        .arg("-c")
+        .arg(config_raw_override(
+            "mcp_servers.rocm.tool_timeout_sec",
+            "60.0",
+        ))
+        .arg("--add-dir")
+        .arg(&bridge.cache_dir);
+    if let Ok(current_dir) = std::env::current_dir() {
+        command.arg("--cd").arg(current_dir);
+    }
+    command
+        .env("ROCM_CODEX_BRIDGE_SNAPSHOT", &bridge.snapshot_path)
+        .env("ROCM_CODEX_BRIDGE_INSTRUCTIONS", &bridge.instructions_path);
 
     println!("experimental Codex TUI launch");
     println!("  source: {}", workspace.display());
-    if let Some(binary_path) = &binary_path {
-        println!("  mode: prebuilt binary");
-        println!("  binary: {}", binary_path.display());
-    } else {
-        println!("  mode: cargo run");
-        println!("  manifest: {}", manifest_path.display());
-        println!("  note: this will compile the vendored Codex workspace on first launch");
-    }
+    println!("  mode: prebuilt binary");
+    println!("  binary: {}", binary_path.display());
+    println!("  mcp server: {}", rocmd_binary.display());
+    println!("  bridge snapshot: {}", bridge.snapshot_path.display());
+    println!(
+        "  bridge instructions: {}",
+        bridge.instructions_path.display()
+    );
     println!(
         "  provider policy: vendored Codex auth flow remains intact; ChatGPT sign-in stays available as the no-key default path"
     );
@@ -375,6 +413,10 @@ fn vendored_codex_workspace() -> Result<PathBuf> {
     }
 }
 
+fn installed_codex_binary() -> Option<PathBuf> {
+    sibling_binary_path("rocm-codex").ok()
+}
+
 fn vendored_codex_binary(workspace: &Path) -> Option<PathBuf> {
     let candidates = if cfg!(windows) {
         vec![
@@ -389,6 +431,359 @@ fn vendored_codex_binary(workspace: &Path) -> Option<PathBuf> {
     };
 
     candidates.into_iter().find(|path| path.is_file())
+}
+
+#[derive(Debug)]
+struct PreparedCodexBridge {
+    cache_dir: PathBuf,
+    snapshot_path: PathBuf,
+    instructions_path: PathBuf,
+}
+
+fn prepare_codex_bridge(paths: &AppPaths) -> Result<PreparedCodexBridge> {
+    let snapshot = capture_codex_bridge_snapshot()?;
+    let cache_dir = paths.cache_dir.join("codex-bridge");
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+
+    let snapshot_path = cache_dir.join("snapshot.json");
+    let instructions_path = cache_dir.join("instructions.md");
+    fs::write(
+        &snapshot_path,
+        serde_json::to_vec_pretty(&snapshot)
+            .context("failed to serialize Codex bridge snapshot")?,
+    )
+    .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
+    fs::write(
+        &instructions_path,
+        render_codex_bridge_instructions(&snapshot, &snapshot_path),
+    )
+    .with_context(|| format!("failed to write {}", instructions_path.display()))?;
+
+    Ok(PreparedCodexBridge {
+        cache_dir,
+        snapshot_path,
+        instructions_path,
+    })
+}
+
+fn capture_codex_bridge_snapshot() -> Result<CodexBridgeSnapshot> {
+    let rocmd_binary = daemon_binary_path()?;
+    let output = ProcessCommand::new(&rocmd_binary)
+        .arg("bridge-snapshot")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch {}", rocmd_binary.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        bail!(
+            "rocmd bridge-snapshot failed: {}",
+            if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit status {}", output.status)
+            }
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("failed to parse rocmd bridge-snapshot output")
+}
+
+fn config_string_override(key: &str, value: &str) -> Result<String> {
+    Ok(format!(
+        "{key}={}",
+        serde_json::to_string(value).context("failed to encode config override")?
+    ))
+}
+
+fn config_raw_override(key: &str, value: &str) -> String {
+    format!("{key}={value}")
+}
+
+fn render_codex_bridge_instructions(
+    snapshot: &CodexBridgeSnapshot,
+    snapshot_path: &Path,
+) -> String {
+    let mut text = String::new();
+    writeln!(&mut text, "# ROCm AI Command Center").ok();
+    writeln!(&mut text).ok();
+    writeln!(
+        &mut text,
+        "You are running inside the ROCm AI Command Center CLI on this machine."
+    )
+    .ok();
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Operating Rules").ok();
+    writeln!(
+        &mut text,
+        "- Prefer `rocm` and `rocmd` commands for ROCm installs, updates, engines, services, and automations."
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Use the machine snapshot below as the source of truth for current host state."
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Preserve vendored Codex auth behavior. If no provider or API key is configured, keep ChatGPT sign-in as the default path."
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- A local MCP server named `rocm` is configured automatically. Prefer its structured tools for ROCm state queries, dry-run planning, and explicit engine/service/watcher actions."
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Ask before privileged or disruptive actions such as driver installs, uninstall, release/nightly channel switches, or binding public ports."
+    )
+    .ok();
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Bridge Files").ok();
+    writeln!(&mut text, "- Snapshot JSON: `{}`", snapshot_path.display()).ok();
+    writeln!(
+        &mut text,
+        "- Refresh command: `rocmd bridge-snapshot --pretty`"
+    )
+    .ok();
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Current Host").ok();
+    writeln!(
+        &mut text,
+        "- OS/arch: `{}` / `{}`",
+        snapshot.doctor.os, snapshot.doctor.arch
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Default engine: `{}`",
+        snapshot.doctor.default_engine
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Detected gfx target: `{}`",
+        snapshot
+            .doctor
+            .detected_gfx_target
+            .as_deref()
+            .unwrap_or("<unknown>")
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Detected TheRock family: `{}`",
+        snapshot
+            .doctor
+            .detected_therock_family
+            .as_deref()
+            .unwrap_or("<unknown>")
+    )
+    .ok();
+    writeln!(
+        &mut text,
+        "- Config/data/cache: `{}` | `{}` | `{}`",
+        snapshot.doctor.config_dir.display(),
+        snapshot.doctor.data_dir.display(),
+        snapshot.doctor.cache_dir.display()
+    )
+    .ok();
+    for line in codex_bridge_gpu_summary(snapshot) {
+        writeln!(&mut text, "- {line}").ok();
+    }
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Engines").ok();
+    if snapshot.engines.is_empty() {
+        writeln!(&mut text, "- No engine inventory available.").ok();
+    } else {
+        for engine in &snapshot.engines {
+            let default_marker = if engine.default_for_platform {
+                " default"
+            } else {
+                ""
+            };
+            let installed = if engine.installed_binary {
+                "installed"
+            } else {
+                "not installed"
+            };
+            writeln!(
+                &mut text,
+                "- `{}`: {} ({installed}{default_marker})",
+                engine.id, engine.summary
+            )
+            .ok();
+        }
+    }
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Managed Services").ok();
+    if snapshot.services.is_empty() {
+        writeln!(&mut text, "- No managed services are currently recorded.").ok();
+    } else {
+        for service in &snapshot.services {
+            writeln!(
+                &mut text,
+                "- `{}`: engine=`{}` model=`{}` status=`{}` endpoint=`{}`",
+                service.service_id,
+                service.engine,
+                service.canonical_model_id,
+                service.status,
+                service.endpoint_url
+            )
+            .ok();
+        }
+    }
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Automations").ok();
+    match snapshot.automation_runtime.as_ref() {
+        Some(runtime) => {
+            writeln!(
+                &mut text,
+                "- Daemon running: `{}` (pid `{}`)",
+                runtime.running, runtime.daemon_pid
+            )
+            .ok();
+            if runtime.active_watchers.is_empty() {
+                writeln!(&mut text, "- No active watchers.").ok();
+            } else {
+                for watcher in &runtime.active_watchers {
+                    writeln!(
+                        &mut text,
+                        "- `{}`: enabled=`{}` mode=`{}` summary=`{}`",
+                        watcher.id,
+                        watcher.enabled,
+                        watcher.mode.as_str(),
+                        watcher.summary
+                    )
+                    .ok();
+                }
+            }
+        }
+        None => {
+            writeln!(&mut text, "- No automation runtime is currently active.").ok();
+        }
+    }
+    if !snapshot.recent_automation_events.is_empty() {
+        writeln!(&mut text, "- Recent automation events:").ok();
+        for event in snapshot.recent_automation_events.iter().rev().take(5).rev() {
+            writeln!(
+                &mut text,
+                "  - {} [{}] {}",
+                event.watcher_id, event.level, event.message
+            )
+            .ok();
+        }
+    }
+    writeln!(&mut text).ok();
+    writeln!(&mut text, "## Common Commands").ok();
+    writeln!(&mut text, "- `rocm doctor`").ok();
+    writeln!(
+        &mut text,
+        "- `rocm install sdk --channel release|nightly [--format pip|tarball]`"
+    )
+    .ok();
+    writeln!(&mut text, "- `rocm update`").ok();
+    writeln!(&mut text, "- `rocm engines list`").ok();
+    writeln!(&mut text, "- `rocm engines install pytorch`").ok();
+    writeln!(
+        &mut text,
+        "- `rocm serve <model> [--engine pytorch|vllm] [--foreground|--managed]`"
+    )
+    .ok();
+    writeln!(&mut text, "- `rocm automations list|enable|disable`").ok();
+    writeln!(&mut text, "- `rocmd status`").ok();
+    writeln!(&mut text, "- `rocmd bridge-snapshot --pretty`").ok();
+
+    text
+}
+
+fn codex_bridge_gpu_summary(snapshot: &CodexBridgeSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !snapshot.gpu.amd_smi_available {
+        lines.push(format!(
+            "amd-smi unavailable: {}",
+            snapshot.gpu.note.as_deref().unwrap_or("no details")
+        ));
+        return lines;
+    }
+
+    let Some(static_snapshot) = snapshot.gpu.static_snapshot.as_ref() else {
+        lines.push("amd-smi static snapshot unavailable".to_owned());
+        return lines;
+    };
+    let Some(gpu_data) = static_snapshot
+        .get("gpu_data")
+        .and_then(serde_json::Value::as_array)
+    else {
+        lines.push("amd-smi static snapshot did not include `gpu_data`".to_owned());
+        return lines;
+    };
+
+    let mut model_counts = std::collections::BTreeMap::<String, usize>::new();
+    for gpu in gpu_data {
+        let model = gpu
+            .get("asic")
+            .and_then(|value| value.get("market_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("AMD GPU");
+        *model_counts.entry(model.to_owned()).or_default() += 1;
+    }
+    if !model_counts.is_empty() {
+        let models = model_counts
+            .into_iter()
+            .map(|(model, count)| format!("{count}x {model}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("GPUs: {models}"));
+    }
+
+    if let Some(monitor) = snapshot
+        .gpu
+        .monitor_snapshot
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+    {
+        for entry in monitor.iter().take(8) {
+            let gpu_id = entry
+                .get("gpu")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let gfx = nested_json_u64(entry, &["gfx", "value"]);
+            let power = nested_json_u64(entry, &["power_usage", "value"]);
+            let vram_used = nested_json_u64(entry, &["vram_used", "value"]);
+            let vram_total = nested_json_u64(entry, &["vram_total", "value"]);
+            lines.push(format!(
+                "GPU {gpu_id}: gfx={}%, power={}W, vram={}/{} MB",
+                gfx.map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+                power
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+                vram_used
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+                vram_total
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+            ));
+        }
+    }
+
+    lines
+}
+
+fn nested_json_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_u64()
 }
 
 fn doctor() -> Result<()> {
@@ -2015,4 +2410,69 @@ fn treat_as_natural_language(args: &[String]) -> bool {
     ];
 
     !args.is_empty() && !args[0].starts_with('-') && !STRUCTURED.contains(&args[0].as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocm_core::{CodexBridgeEngine, CodexBridgeGpuSnapshot};
+    use serde_json::json;
+
+    #[test]
+    fn render_codex_bridge_instructions_includes_rocm_summary() {
+        let snapshot = CodexBridgeSnapshot {
+            protocol: "rocmd-codex-bridge-v0".to_owned(),
+            generated_at_unix_ms: 1,
+            doctor: DoctorSummary {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                interactive_terminal: false,
+                default_engine: "pytorch".to_owned(),
+                detected_gfx_target: Some("gfx1103".to_owned()),
+                detected_therock_family: Some("gfx110X-all".to_owned()),
+                config_dir: PathBuf::from("/tmp/config"),
+                data_dir: PathBuf::from("/tmp/data"),
+                cache_dir: PathBuf::from("/tmp/cache"),
+            },
+            gpu: CodexBridgeGpuSnapshot {
+                amd_smi_available: true,
+                static_snapshot: Some(json!({
+                    "gpu_data": [
+                        {"gpu": 0, "asic": {"market_name": "AMD Radeon 780M", "target_graphics_version": "gfx1103"}}
+                    ]
+                })),
+                monitor_snapshot: Some(json!([
+                    {
+                        "gpu": 0,
+                        "gfx": {"value": 5},
+                        "power_usage": {"value": 30},
+                        "vram_used": {"value": 512},
+                        "vram_total": {"value": 16384}
+                    }
+                ])),
+                note: None,
+            },
+            config: RocmCliConfig::default(),
+            automation_runtime: None,
+            recent_automation_events: Vec::new(),
+            engines: vec![CodexBridgeEngine {
+                id: "pytorch".to_owned(),
+                summary: "default local engine".to_owned(),
+                default_for_platform: true,
+                installed_binary: true,
+                binary_path: None,
+            }],
+            services: Vec::new(),
+        };
+
+        let rendered = render_codex_bridge_instructions(
+            &snapshot,
+            Path::new("/tmp/cache/codex-bridge/snapshot.json"),
+        );
+        assert!(rendered.contains("ROCm AI Command Center"));
+        assert!(rendered.contains("ChatGPT sign-in as the default path"));
+        assert!(rendered.contains("gfx1103"));
+        assert!(rendered.contains("1x AMD Radeon 780M"));
+        assert!(rendered.contains("rocmd bridge-snapshot --pretty"));
+    }
 }
