@@ -227,6 +227,7 @@ bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -f "${bundle_dir}/bin/rocm" ] || fail "bundle did not contain bin/rocm"
 [ -f "${bundle_dir}/bin/rocmd" ] || fail "bundle did not contain bin/rocmd"
 [ -f "${bundle_dir}/bin/rocm-engine-pytorch" ] || fail "bundle did not contain bin/rocm-engine-pytorch"
+[ -f "${bundle_dir}/bin/rocm-codex" ] || fail "bundle did not contain bin/rocm-codex"
 
 mkdir -p "$INSTALL_DIR"
 

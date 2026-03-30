@@ -105,12 +105,12 @@ impl AppPaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorSummary {
     pub os: String,
     pub arch: String,
     pub interactive_terminal: bool,
-    pub default_engine: &'static str,
+    pub default_engine: String,
     pub detected_gfx_target: Option<String>,
     pub detected_therock_family: Option<String>,
     pub config_dir: PathBuf,
@@ -125,7 +125,7 @@ impl DoctorSummary {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             interactive_terminal: interactive_terminal(),
-            default_engine: default_engine_for_platform(),
+            default_engine: default_engine_for_platform().to_owned(),
             detected_gfx_target: detect_host_gfx_target(),
             detected_therock_family: detect_host_therock_family(),
             config_dir: paths.config_dir,
@@ -722,6 +722,44 @@ impl ManagedServiceRecord {
         .with_context(|| format!("failed to write {}", self.manifest_path.display()))?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexBridgeSnapshot {
+    pub protocol: String,
+    pub generated_at_unix_ms: u128,
+    pub doctor: DoctorSummary,
+    pub gpu: CodexBridgeGpuSnapshot,
+    pub config: RocmCliConfig,
+    #[serde(default)]
+    pub automation_runtime: Option<AutomationRuntimeState>,
+    #[serde(default)]
+    pub recent_automation_events: Vec<AutomationEventRecord>,
+    #[serde(default)]
+    pub engines: Vec<CodexBridgeEngine>,
+    #[serde(default)]
+    pub services: Vec<ManagedServiceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexBridgeGpuSnapshot {
+    pub amd_smi_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_snapshot: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_snapshot: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexBridgeEngine {
+    pub id: String,
+    pub summary: String,
+    pub default_for_platform: bool,
+    pub installed_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
 }
 
 pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {

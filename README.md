@@ -23,6 +23,7 @@ Current repository status:
 - `rocmd` supervisor with managed service supervision and persisted automation/watcher runtime state
 - first-party `pytorch` engine with managed venv installs, TheRock PyTorch wheel resolution, and OpenAI-compatible local serving
 - TheRock SDK resolver for `pip` and tarball installs, plus managed runtime update checks
+- vendored Codex TUI scaffold with a packaged `rocm-codex` binary for experimental interactive launch
 
 Planned product shape:
 - `rocm` chat-first TUI with deeper inline tool execution and approvals
