@@ -224,10 +224,21 @@ tar -xzf "$archive_path" -C "$extract_dir"
 bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -n "$bundle_dir" ] || fail "unable to locate extracted bundle directory"
 
-[ -f "${bundle_dir}/bin/rocm" ] || fail "bundle did not contain bin/rocm"
-[ -f "${bundle_dir}/bin/rocmd" ] || fail "bundle did not contain bin/rocmd"
-[ -f "${bundle_dir}/bin/rocm-engine-pytorch" ] || fail "bundle did not contain bin/rocm-engine-pytorch"
-[ -f "${bundle_dir}/bin/rocm-codex" ] || fail "bundle did not contain bin/rocm-codex"
+# Required binaries — the CLI cannot function without these.
+REQUIRED_BINS="rocm rocmd"
+# Optional binaries — desirable but not load-bearing. Missing ones produce a
+# warning so the install succeeds with reduced functionality rather than
+# failing entirely (e.g. a release bundle missing rocm-codex should still
+# install the working CLI).
+OPTIONAL_BINS="rocm-engine-pytorch rocm-codex"
+
+for bin_name in $REQUIRED_BINS; do
+  [ -f "${bundle_dir}/bin/${bin_name}" ] || fail "bundle did not contain required binary bin/${bin_name}"
+done
+
+for bin_name in $OPTIONAL_BINS; do
+  [ -f "${bundle_dir}/bin/${bin_name}" ] || echo "rocm-cli installer: warning: bundle missing optional binary bin/${bin_name}" >&2
+done
 
 mkdir -p "$INSTALL_DIR"
 
