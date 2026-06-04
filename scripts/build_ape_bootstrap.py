@@ -216,6 +216,26 @@ def create_expanded_payload(manifest: dict[str, Any], *, base_dir: Path, output:
     validate_expanded_payload(output, manifest)
 
 
+def create_universal_payload(*, windows_release: Path, linux_release: Path, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as payload:
+        add_zip_release_tree(payload, windows_release, "windows-amd64")
+        add_tar_release_tree(payload, linux_release, "linux-amd64")
+    validate_universal_payload(output)
+
+
+def validate_universal_payload(payload: Path) -> None:
+    seen = ape_contract.validate_zip_payload(payload)
+    expected = {
+        f"{PLATFORM_ROOT}/windows-amd64/bin/rocm.exe",
+        f"{PLATFORM_ROOT}/windows-amd64/bin/rocmd.exe",
+        f"{PLATFORM_ROOT}/linux-amd64/bin/rocm",
+        f"{PLATFORM_ROOT}/linux-amd64/bin/rocmd",
+    }
+    missing = sorted(expected - set(seen))
+    expect(not missing, f"universal payload is missing required entries: {missing}")
+
+
 def validate_expanded_payload(payload: Path, manifest: dict[str, Any]) -> list[str]:
     seen = ape_contract.validate_zip_payload(payload)
     expected = {MANIFEST_PAYLOAD_PATH, manifest["bootstrap_model"]["payload_path"]}
@@ -350,6 +370,31 @@ def compile_launcher(
         output.chmod(output.stat().st_mode | stat.S_IXUSR)
 
 
+def compile_universal_launcher(
+    *,
+    compiler: str,
+    source: Path,
+    output: Path,
+    version: str,
+    extra_flags: list[str],
+) -> None:
+    args = [
+        compiler,
+        "-O2",
+        "-D_CRT_SECURE_NO_WARNINGS",
+        f"-DROCM_CLI_APE_VERSION=\"{version}\"",
+        *extra_flags,
+        "-o",
+        str(output),
+        str(source),
+    ]
+    completed = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    if completed.returncode != 0:
+        raise ApeBuildError(f"compiler failed with exit {completed.returncode}:\n{completed.stdout}")
+    if os.name != "nt":
+        output.chmod(output.stat().st_mode | stat.S_IXUSR)
+
+
 def compile_fake_rocm(*, compiler: str, source: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     args = [compiler, "-O2", "-D_CRT_SECURE_NO_WARNINGS", "-o", str(output), str(source)]
@@ -420,11 +465,43 @@ def build_launcher(
     return output
 
 
+def build_universal_launcher(
+    *,
+    windows_release: Path,
+    linux_release: Path,
+    output: Path,
+    compiler: str,
+    source: Path,
+    work_dir: Path,
+    version: str,
+    extra_flags: list[str],
+) -> Path:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    payload = work_dir / "rocm-universal-payload-expanded.zip"
+    compiled = work_dir / ("rocm-universal-launcher-compiled.exe" if os.name == "nt" else "rocm-universal-launcher-compiled")
+    create_universal_payload(
+        windows_release=windows_release,
+        linux_release=linux_release,
+        output=payload,
+    )
+    compile_universal_launcher(
+        compiler=compiler,
+        source=source,
+        output=compiled,
+        version=version,
+        extra_flags=extra_flags,
+    )
+    append_payload(launcher=compiled, payload=payload, output=output)
+    create_extensionless_wsl_alias(output)
+    return output
+
+
 def create_fake_windows_release(path: Path, fake_rocm: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rocm_bytes = fake_rocm.read_bytes() if fake_rocm is not None else b"fake windows rocm\n"
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as package:
         package.writestr(zip_info_for_payload("rocm-cli-test-windows-amd64/bin/rocm.exe", executable=True), rocm_bytes)
+        package.writestr(zip_info_for_payload("rocm-cli-test-windows-amd64/bin/rocmd.exe", executable=True), rocm_bytes)
         package.writestr("rocm-cli-test-windows-amd64/README.md", "fake readme\n")
 
 
@@ -440,7 +517,11 @@ def create_fake_linux_release(path: Path) -> None:
     script = b"""#!/bin/sh
 set -eu
 log="${ROCM_CLI_APE_FAKE_LOG:?missing ROCM_CLI_APE_FAKE_LOG}"
-printf '%s\n' "$@" >> "$log"
+if [ "$#" -gt 0 ]; then
+  printf '%s\n' "$@" >> "$log"
+else
+  : > "$log"
+fi
 exit 0
 """
     with tarfile.open(path, "w:gz") as package:
@@ -450,6 +531,7 @@ exit 0
         root_info.mode = 0o755
         package.addfile(root_info)
         add_tar_member(package, f"{root}/bin/rocm", script, mode=0o755)
+        add_tar_member(package, f"{root}/bin/rocmd", script, mode=0o755)
         add_tar_member(package, f"{root}/README.md", b"fake readme\n")
 
 
@@ -594,18 +676,46 @@ def run_self_test(
             f"default bootstrap did not show startup UI:\n{completed.stdout}",
         )
         expect(
-            "Starting the embedded Qwen assistant" in completed.stdout,
-            f"default bootstrap did not show assistant startup status:\n{completed.stdout}",
+            "Starting ROCm CLI setup." in completed.stdout,
+            f"default launch did not show setup startup status:\n{completed.stdout}",
         )
         lines = fake_log.read_text(encoding="utf-8").splitlines()
-        expect(lines[:3] == ["bootstrap", "assistant", "--llamafile"], "bootstrap argv prefix drifted")
-        expect(
-            Path(lines[3]) == extract_root / manifest["bootstrap_model"]["payload_path"],
-            "bootstrap llamafile path drifted",
-        )
-        expect("--device" in lines and "gpu_required" in lines, "bootstrap argv did not require GPU")
-        print("APE bootstrap builder self-test: default bootstrap argv accepted")
+        expect(lines == [], f"default launch should delegate to rocm with no extra args, got: {lines}")
+        print("APE bootstrap builder self-test: default rocm launch accepted")
 
+        universal_output = root / ("rocm-universal-ape-test.exe" if os.name == "nt" or is_cosmopolitan_compiler(cc) else "rocm-universal-ape-test")
+        build_universal_launcher(
+            windows_release=windows_release,
+            linux_release=linux_release,
+            output=universal_output,
+            compiler=cc,
+            source=DEFAULT_LAUNCHER_SOURCE,
+            work_dir=root / "build-universal",
+            version="0.0.0-test-universal",
+            extra_flags=[],
+        )
+        fake_log.unlink()
+        env["ROCM_CLI_APE_ROOT"] = str(root / "extract-universal-root")
+        completed = subprocess.run(
+            [*run_prefix, str(universal_output), "--", "version", "--json"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        expect(completed.returncode == 0, f"universal delegated rocm args failed:\n{completed.stdout}")
+        expect(
+            fake_log.read_text(encoding="utf-8").splitlines() == ["version", "--json"],
+            "universal delegated rocm argv did not match",
+        )
+        expect(
+            (Path(env["ROCM_CLI_APE_ROOT"]) / "payload" / "platform" / ("windows-amd64" if os.name == "nt" else "linux-amd64") / "bin" / ("rocm.exe" if os.name == "nt" else "rocm")).is_file(),
+            "universal platform rocm binary was not extracted",
+        )
+        print("APE bootstrap builder self-test: universal launcher delegated argv accepted")
+
+        env["ROCM_CLI_APE_ROOT"] = str(extract_root)
         completed = subprocess.run(
             [*run_prefix, str(output), "--ape-extract-only"],
             env=env,
@@ -653,6 +763,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Allow a non-cosmocc compiler for local launcher extraction tests only.",
     )
 
+    universal = subparsers.add_parser("build-universal", help="Build the current universal rocm launcher without bootstrap model payloads.")
+    universal.add_argument("--windows-release", type=Path, required=True)
+    universal.add_argument("--linux-release", type=Path, required=True)
+    universal.add_argument("--output", type=Path, required=True)
+    universal.add_argument("--compiler", help="C compiler path. Use cosmocc for production APE builds.")
+    universal.add_argument("--source", type=Path, default=DEFAULT_LAUNCHER_SOURCE)
+    universal.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-builder")
+    universal.add_argument("--version", default="0.2.0-universal")
+    universal.add_argument("--cflag", action="append", default=[], help="Extra C compiler flag. Repeat as needed.")
+    universal.add_argument(
+        "--allow-local-compiler",
+        action="store_true",
+        help="Allow a non-cosmocc compiler for local launcher extraction tests only.",
+    )
+
     stage = subparsers.add_parser("stage-expanded", help="Stage the expanded uncompressed payload ZIP only.")
     stage.add_argument("--manifest", type=Path, required=True)
     stage.add_argument("--output", type=Path, required=True)
@@ -689,6 +814,25 @@ def main(argv: list[str] | None = None) -> int:
             compiler,
             allow_local_compiler=args.allow_local_compiler,
         )
+        if args.command == "build-universal":
+            output = build_universal_launcher(
+                windows_release=args.windows_release.resolve(),
+                linux_release=args.linux_release.resolve(),
+                output=args.output.resolve(),
+                compiler=compiler,
+                source=args.source.resolve(),
+                work_dir=args.work_dir.resolve(),
+                version=args.version,
+                extra_flags=args.cflag,
+            )
+            print(f"APE bootstrap builder: wrote universal launcher {output}")
+            alias = extensionless_wsl_alias_path(output)
+            if alias is not None and alias.exists():
+                print(f"APE bootstrap builder: wrote WSL alias {alias}")
+            print(f"APE bootstrap builder: sha256 {sha256_file(output)}")
+            for message in compiler_messages:
+                print(f"APE bootstrap builder: {message}")
+            return 0
         output = build_launcher(
             manifest_path=args.manifest,
             output=args.output,

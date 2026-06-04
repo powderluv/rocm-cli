@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Build rocm-cli release artifacts.
 
-The active single-file release is the rocm-cli binary itself. It does not embed
-or self-extract a bootstrap assistant, model, runtime sidecar, or vendored Codex
-binary. Running `rocm` with no arguments opens the first-time setup wizard when
-setup has not been completed yet.
-
-The older platform archive and APE helper subcommands remain for historical
-validation work, but they are not the current standalone release path.
+The active single-file release is a universal APE launcher named `rocm.exe`.
+It embeds the Windows and Linux rocm-cli payloads and delegates to the matching
+platform binary at runtime. It does not embed a bootstrap assistant, model,
+runtime sidecar, or vendored Codex binary. Running it with no arguments opens
+the first-time setup wizard when setup has not been completed yet.
 """
 
 from __future__ import annotations
@@ -397,6 +395,51 @@ def build_ape(args: argparse.Namespace) -> Path:
     return output
 
 
+def archive_path_for(output_dir: Path, *, version: str, platform: str) -> Path:
+    suffix = ".zip" if platform == "windows-amd64" else ".tar.gz"
+    return output_dir / f"rocm-cli-v{version}-{platform}{suffix}"
+
+
+def build_universal(args: argparse.Namespace) -> Path:
+    archive_dir = args.archive_dir.resolve()
+    windows_release = (args.windows_release or archive_path_for(archive_dir, version=args.version, platform="windows-amd64")).resolve()
+    linux_release = (args.linux_release or archive_path_for(archive_dir, version=args.version, platform="linux-amd64")).resolve()
+    if not windows_release.is_file():
+        raise ReleaseBuildError(
+            f"missing Windows release archive: {windows_release}; "
+            "run stage-platform on Windows first or pass --windows-release"
+        )
+    if not linux_release.is_file():
+        raise ReleaseBuildError(
+            f"missing Linux release archive: {linux_release}; "
+            "run stage-platform on Linux/WSL first or pass --linux-release"
+        )
+    output = (args.output or (args.output_dir / "rocm.exe")).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "build_ape_bootstrap.py"),
+        "build-universal",
+        "--windows-release",
+        str(windows_release),
+        "--linux-release",
+        str(linux_release),
+        "--output",
+        str(output),
+        "--compiler",
+        str(args.compiler),
+        "--work-dir",
+        str(args.work_dir.resolve()),
+        "--version",
+        args.universal_version,
+    ]
+    run(command, cwd=REPO_ROOT)
+    write_sha256(output)
+    print(f"wrote {output}")
+    print(f"sha256 {sha256_file(output)}")
+    return output
+
+
 def run_self_test(root: Path) -> None:
     if root.exists():
         shutil.rmtree(root)
@@ -483,6 +526,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ape.add_argument("--compiler", required=True)
     ape.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release" / "builder")
 
+    universal = subparsers.add_parser("universal", help="Build the universal single-exe rocm launcher from staged platform archives.")
+    universal.add_argument("--version", default="0.2.0", help="Release archive version to consume.")
+    universal.add_argument("--universal-version", default="0.2.0-universal", help="Version key used by the launcher extraction cache.")
+    universal.add_argument("--archive-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release")
+    universal.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "standalone-release")
+    universal.add_argument("--output", type=Path)
+    universal.add_argument("--windows-release", type=Path)
+    universal.add_argument("--linux-release", type=Path)
+    universal.add_argument("--compiler", required=True)
+    universal.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "universal-release" / "builder")
+
     self_test = subparsers.add_parser("self-test", help="Run offline archive policy tests.")
     self_test.add_argument(
         "--root",
@@ -529,6 +583,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "build-ape":
             build_ape(args)
+            return 0
+        if args.command == "universal":
+            build_universal(args)
             return 0
         if args.command == "self-test":
             run_self_test(args.root.resolve())

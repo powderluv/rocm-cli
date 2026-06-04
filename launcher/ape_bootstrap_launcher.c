@@ -1056,11 +1056,9 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (arg_start >= argc) {
-    startup_ui_status("Starting the embedded Qwen assistant on your AMD GPU.");
-    result = run_bootstrap(rocm, root);
-  } else {
-    result = run_rocm(rocm, argc, argv, arg_start);
+    startup_ui_status("Starting ROCm CLI setup.");
   }
+  result = run_rocm(rocm, argc, argv, arg_start);
   free(rocm);
   free(root);
   return result;
