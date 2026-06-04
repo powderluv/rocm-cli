@@ -17,7 +17,7 @@
 
 - upstream Rust workspace vendored into `rocm-cli`
 - no source-level modifications inside the vendored tree yet
-- the project build/package flow prebuilds the vendored `codex` binary as `rocm-codex`
+- the Linux and Windows build/package flows prebuild the vendored `codex` binary as `rocm-codex`
 - `rocm --experimental-codex-tui` launches only the prebuilt shipped binary
 
 Current internal build command:
@@ -25,6 +25,14 @@ Current internal build command:
 ```bash
 ./scripts/build-vendored-codex.sh release
 ```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\package-windows-release.ps1 rocm-cli-dev-windows-amd64
+```
+
+The Windows package script builds vendored Codex with `CARGO_TARGET_DIR` under `CARGO_HOME` so the upstream V8 crate source and build output stay on the same drive. This avoids V8's Windows cross-drive GN symlink path when the repo checkout is on a different drive from the Cargo registry.
 
 This preserves the upstream ChatGPT sign-in flow, including the no-key onboarding path, while avoiding runtime compilation during interactive launch.
 

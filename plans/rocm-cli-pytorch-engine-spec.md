@@ -1,5 +1,13 @@
 # rocm-cli PyTorch Engine Spec
 
+## Current Scope Note
+
+The early spec text below mentions CPU fallback. That is no longer an
+implementation target for the current rocm-cli pass. The current product policy
+is GPU-required local serving with no implicit CPU fallback: PyTorch must use a
+managed TheRock ROCm runtime for serving, and `cpu_only` requests fail loudly
+instead of becoming a fallback path.
+
 ## Summary
 - Build a first-party `pytorch` serving engine for `rocm-cli`.
 - Make it the default native local serving backend on Windows.
@@ -10,7 +18,8 @@
 ## Goals
 - Provide a native Windows local model-serving path that uses TheRock PyTorch wheels plus an installed AMD driver.
 - Keep the install flow reproducible and isolated from the user’s global Python environment.
-- Support both GPU-preferred and CPU-fallback execution through one engine.
+- Require ROCm GPU execution for local serving; `gpu_preferred` is normalized to
+  `gpu_required`, and `cpu_only` is rejected instead of used as a fallback.
 - Integrate cleanly with:
   - `rocm install sdk`
   - `rocm engines install pytorch`
@@ -29,12 +38,15 @@
 ## Position in the Product
 - On Windows:
   - default local engine: `pytorch`
-  - fallback local engine: `llama.cpp`
+  - alternate local GPU engine: `llama.cpp` when a HIP-enabled llama-server and
+    managed TheRock runtime are available
   - deferred engines: `vllm`, `sglang`, `atom`
 - On Linux:
   - default ROCm GPU engine: `vllm`
-  - default CPU fallback: `llama.cpp`
-  - `pytorch` is available as a compatibility engine for simple single-model serving, but it is not the default Linux GPU path.
+  - alternate local GPU engines: `llama.cpp`, `pytorch`, `sglang`, `atom`
+    where their upstream ROCm support and managed TheRock runtime are present
+  - `pytorch` is available as a compatibility engine for simple single-model
+    serving, but it is not the default Linux GPU path.
 
 ## Engine Ownership
 - This is a first-party engine owned by `rocm-cli`, not a thin wrapper around a third-party server.
@@ -150,7 +162,10 @@ This lets the engine rebuild deterministically and reuse envs safely.
 
 ### Engine Dependency Set
 - Mandatory V1 dependencies:
+  - `rocm[libraries,devel]`
   - `torch`
+  - `torchvision`
+  - `torchaudio`
   - `transformers`
   - `accelerate`
   - `safetensors`
@@ -168,7 +183,14 @@ This lets the engine rebuild deterministically and reuse envs safely.
   - model-specific acceleration packages not broadly supported on Windows
 
 ### Install Policy
+- Resolve TheRock runtime and PyTorch packages from the same TheRock package
+  index. The install request must include `rocm[libraries,devel]`, `torch`,
+  `torchvision`, and `torchaudio` together so the index can supply the matching
+  ROCm dependencies instead of rocm-cli inventing fallback dependency sets.
 - Use pinned versions from a generated lockfile, not loose `pip install latest`.
+  When TheRock versions include build dates, match the `rocm[libraries,devel]`
+  and PyTorch-family wheels by compatible dated version strings before writing
+  the lockfile.
 - Prefer wheel-only installs.
 - Fail closed if the resolved dependency set requires building native extensions in V1.
 
@@ -209,7 +231,7 @@ Output:
 
 #### `capabilities`
 Output:
-- `cpu: true`
+- `cpu: false`
 - `rocm_gpu: true` when framework path is usable
 - `openai_compatible: true`
 - `tool_calling: false` in V1 unless a recipe explicitly enables it
@@ -311,16 +333,17 @@ Output:
 ### Device Policy
 - Supported policies:
   - `gpu_required`
-  - `gpu_preferred`
-  - `cpu_only`
+  - `gpu_preferred` as an alias that resolves to GPU-required execution
+  - `cpu_only` is recognized only to reject it with a no-fallback error
 - Windows default:
-  - `gpu_preferred`
+  - `gpu_required`
 - CPU-only hosts:
-  - force `cpu_only`
+  - fail before serving; CPU mode is not a fallback path in rocm-cli
 
 ### Device Selection Rules
 - If `gpu_required` and no usable GPU is visible, fail before launch.
-- If `gpu_preferred` and GPU is unavailable, fall back to CPU only if the recipe allows it.
+- If `gpu_preferred` is requested, treat it as `gpu_required`.
+- If `cpu_only` is requested, reject the request with a no-fallback error.
 - If GPU memory preflight fails, do not silently OOM. Return:
   - estimated required memory
   - detected memory
@@ -359,7 +382,7 @@ Output:
 - `generation_defaults`
 - `stop_sequences`
 - `windows_overrides`
-- `cpu_fallback_policy`
+- `unsupported_combinations`
 
 ### Windows Recipe Overrides
 - Allow per-model overrides for:
@@ -451,17 +474,17 @@ Output:
 ### Expected Commands
 - `rocm engines install pytorch`
 - `rocm engines list`
-- `rocm serve qwen3.5 --engine pytorch`
+- `rocm serve qwen --engine pytorch --device gpu_required`
 - `rocm serve local/path/to/model --engine pytorch --device gpu`
 - `rocm logs --service <id>`
 
 ### Expected TUI Plan
-For `serve Qwen3.5 on Windows`:
+For `serve qwen on Windows`:
 1. detect Windows driver and TheRock runtime
 2. resolve `pytorch` as the default engine
 3. validate or create the engine env
 4. resolve model recipe and expected memory use
-5. load the model using GPU-preferred policy
+5. load `Qwen/Qwen2.5-1.5B-Instruct` using GPU-required policy
 6. expose a local OpenAI-compatible endpoint
 
 ## Configuration
@@ -477,7 +500,7 @@ endpoint_mode = "openai"
 host = "127.0.0.1"
 startup_timeout_sec = 180
 request_timeout_sec = 900
-allow_cpu_fallback = true
+allow_cpu_fallback = false
 max_loaded_models = 1
 
 [engines.pytorch.model_cache]
@@ -485,7 +508,7 @@ backend = "huggingface"
 path = "~/.local/share/rocm-cli/models/hf"
 
 [engines.pytorch.windows]
-device_policy = "gpu_preferred"
+device_policy = "gpu_required"
 dtype = "auto"
 compile = "off"
 ```
@@ -494,15 +517,15 @@ compile = "off"
 
 ```json
 {
-  "service_id": "svc_qwen35_primary",
+  "service_id": "svc_qwen25_primary",
   "engine": "pytorch",
   "runtime_id": "therock-release-7.11.0-py311-gfx1151-win64",
   "env_id": "win64-py311-therock7110-pytorch-a1b2c3",
   "model": {
-    "canonical_id": "Qwen/Qwen3.5-4B",
+    "canonical_id": "Qwen/Qwen2.5-1.5B-Instruct",
     "revision": "main"
   },
-  "device_policy": "gpu_preferred",
+  "device_policy": "gpu_required",
   "endpoint": {
     "host": "127.0.0.1",
     "port": 11435,
@@ -533,7 +556,7 @@ compile = "off"
 ### TUI Surface
 - Sidebar status should show:
   - engine: `pytorch`
-  - device: GPU or CPU
+  - device: ROCm GPU
   - runtime id
   - model id
   - endpoint URL
@@ -571,14 +594,14 @@ compile = "off"
 - Serve one supported chat model locally.
 - Complete one non-streaming and one streaming request successfully.
 
-### Windows CPU Fallback
-- Start the same engine with `cpu_only` policy.
-- Complete basic chat requests.
-- Surface that CPU mode is active.
+### Windows No-Fallback Enforcement
+- `cpu_only` requests fail before serving with a clear no-fallback error.
+- Missing or unusable ROCm GPU state fails before serving instead of launching a
+  CPU endpoint.
 
 ### Linux Compatibility
 - Install `pytorch` engine on Linux.
-- Serve one simple model on CPU.
+- Serve one simple model on a managed TheRock ROCm GPU runtime.
 - Prove the same normalized endpoint contract works.
 
 ### Product Integration
@@ -588,18 +611,21 @@ compile = "off"
 
 ## Deferred Work
 - embeddings
-- tool-calling-aware serving
+- engine-native structured tool-calling beyond the rocm-cli local-assistant
+  tool bridge
 - advanced batching and scheduler work
 - multi-model routing
 - native distributed serving
 - Windows-native `vllm`, `sglang`, or `atom` integration
 - aggressive quantization and third-party acceleration plugins
 
-## Recommended Next Steps
-- Define the engine lockfile generation workflow.
-- Define the exact OpenAI-compatible response schema subset for V1.
-- Pick the initial model allowlist for Windows:
-  - at least one small Qwen variant
-  - at least one Llama-family variant
-  - one known CPU-safe fallback model
-- Write the plugin protocol schema as JSON examples next.
+## V1 Local Status
+
+- Engine lockfile generation is implemented in the managed PyTorch engine path.
+- The V1 local serving response shape is implemented through the normalized
+  engine protocol and OpenAI-compatible local API surface.
+- The initial Windows recipe path is implemented with verified PyTorch Qwen
+  routing and GGUF alternatives routed to GPU-capable llama.cpp/llama-server
+  when a managed TheRock runtime is available.
+- Future changes should update the protocol/schema examples and recipe tests
+  when the V1 serving contract changes.

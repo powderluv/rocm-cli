@@ -1,24 +1,74 @@
 use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, detect_host_therock_family, interactive_terminal, normalize_therock_family,
-    unix_time_millis,
+    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_therock_family,
+    detect_managed_therock_family, normalize_therock_family, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
-const THEROCK_ROCM_PACKAGE_SPEC: &str = "rocm[libraries,devel]";
+const PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL: &str =
+    "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20250409";
+const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12.10";
 const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PIP_RETRIES: u32 = 8;
+const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
+const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
     Nightly,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum RuntimeVersionSelector {
+    Version(String),
+    BuildDate(String),
+}
+
+impl RuntimeVersionSelector {
+    pub(crate) fn version(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("TheRock version cannot be empty");
+        }
+        if trimmed
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            bail!("TheRock version must be a single version string");
+        }
+        Ok(Self::Version(trimmed.to_owned()))
+    }
+
+    pub(crate) fn build_date(value: impl AsRef<str>) -> Result<Self> {
+        Ok(Self::BuildDate(normalize_requested_build_date(
+            value.as_ref(),
+        )?))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Version(version) => format!("version {version}"),
+            Self::BuildDate(date) => format!("build date {date}"),
+        }
+    }
+
+    fn matches_version(&self, version: &str) -> bool {
+        match self {
+            Self::Version(requested) => version == requested,
+            Self::BuildDate(date) => runtime_version_build_date(version).as_deref() == Some(date),
+        }
+    }
 }
 
 impl TheRockChannel {
@@ -57,6 +107,22 @@ struct PipRuntimeResolution {
     family_source: String,
     index_url: String,
     latest_version: String,
+    package_versions: TheRockPipPackageVersions,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TheRockPipPackageVersions {
+    rocm: String,
+    torch: String,
+    torchvision: String,
+    torchaudio: String,
+    compatibility_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct WheelCompatibility {
+    python_tag: String,
+    platform_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +132,97 @@ struct TarballArtifact {
     file_name: String,
     version: String,
     url: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedHttpText {
+    text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CachedHttpMetadata {
+    url: String,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    last_modified: Option<String>,
+    #[serde(default)]
+    signature: Option<CachedHttpSignatureMetadata>,
+    fetched_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedHttpSignatureMetadata {
+    url: String,
+    verified_at_unix_ms: u128,
+    public_key_source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetadataSignaturePolicy {
+    required: bool,
+    public_key_path: Option<PathBuf>,
+    public_key_pem: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PythonLauncher {
+    executable: PathBuf,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedPythonManifest {
+    executable: PathBuf,
+    source_url: String,
+    release_tag: String,
+    asset_name: String,
+    version: String,
+    installed_at_unix_ms: u128,
+}
+
+#[derive(Debug, Deserialize)]
+struct PythonStandaloneRelease {
+    tag_name: String,
+    assets: Vec<PythonStandaloneAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PythonStandaloneAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug)]
+struct HttpResponseBody {
+    status: u16,
+    headers: String,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StartupUpdateCheckRecord {
+    pub runtime_key: String,
+    pub runtime_id: String,
+    pub channel: String,
+    pub format: String,
+    pub family: String,
+    pub installed_version: String,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub checked_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeUpdatePlan {
+    pub latest_version: String,
+    pub latest_source: String,
+    pub format: String,
+    pub status: String,
+    pub update_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +244,63 @@ pub(crate) struct InstalledRuntimeManifest {
     pub python_launcher: Option<String>,
     #[serde(default)]
     pub python_executable: Option<String>,
+    #[serde(default)]
+    pub pip_cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub rocm_sdk: Option<RocmSdkPythonProbe>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub imported_from: Option<PathBuf>,
     pub installed_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct RocmSdkPythonProbe {
+    #[serde(default)]
+    pub import_ok: bool,
+    #[serde(default)]
+    pub rocm_sdk_version: Option<String>,
+    #[serde(default)]
+    pub site_packages: Option<PathBuf>,
+    #[serde(default)]
+    pub root_path: Option<PathBuf>,
+    #[serde(default)]
+    pub bin_path: Option<PathBuf>,
+    #[serde(default)]
+    pub cmake_path: Option<PathBuf>,
+    #[serde(default)]
+    pub runtime_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub bin_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub library_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub default_target_family: Option<String>,
+    #[serde(default)]
+    pub available_target_families: Vec<String>,
+    #[serde(default)]
+    pub resolved_target_family: Option<String>,
+    #[serde(default)]
+    pub packages: Vec<RocmSdkPackageProbe>,
+    #[serde(default)]
+    pub library_shortnames: Vec<String>,
+    #[serde(default)]
+    pub resolved_libraries: Vec<RocmSdkLibraryProbe>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RocmSdkPackageProbe {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RocmSdkLibraryProbe {
+    pub shortname: String,
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,14 +330,34 @@ pub(crate) fn install_sdk(
     channel: &str,
     format: &str,
     prefix: Option<PathBuf>,
+    version_selector: Option<RuntimeVersionSelector>,
     dry_run: bool,
 ) -> Result<String> {
     let channel = TheRockChannel::parse(channel)?;
+    ensure_install_format_supported(format)?;
     match format {
-        "pip" => install_pip_runtime(paths, channel, prefix, dry_run),
-        "tarball" => install_tarball_runtime(paths, channel, prefix, dry_run),
+        "pip" => install_pip_runtime(paths, channel, prefix, version_selector.as_ref(), dry_run),
+        "tarball" => {
+            if version_selector.is_some() {
+                bail!("specific TheRock version selection is only supported for pip wheel installs")
+            }
+            install_tarball_runtime(paths, channel, prefix, dry_run)
+        }
         other => bail!("unsupported install format: {other}"),
     }
+}
+
+fn ensure_install_format_supported(format: &str) -> Result<()> {
+    ensure_install_format_supported_for_platform(format, cfg!(windows))
+}
+
+fn ensure_install_format_supported_for_platform(format: &str, windows: bool) -> Result<()> {
+    if windows && format == "tarball" {
+        bail!(
+            "TheRock tarball installs are not supported on Windows V1; use `rocm install sdk --format pip` for a managed pip virtual environment"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
@@ -134,8 +367,15 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     let _ = writeln!(output, "update");
     let _ = writeln!(
         output,
-        "  policy: check every run, prompt before mutating state."
+        "  policy: bounded startup check, cached metadata, prompt before mutating state."
     );
+    if let Some(record) = load_startup_update_check(paths)? {
+        let _ = writeln!(
+            output,
+            "  startup_check: runtime={} status={} checked_at_unix_ms={}",
+            record.runtime_key, record.status, record.checked_at_unix_ms
+        );
+    }
 
     if manifests.is_empty() {
         let _ = writeln!(output, "  managed runtimes: none");
@@ -147,74 +387,47 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     for manifest in manifests {
-        let channel = TheRockChannel::parse(&manifest.channel)?;
-        let latest = match manifest.format.as_str() {
-            "pip" => match resolve_pip_runtime(channel, Some(manifest.family.as_str())) {
-                Ok(resolution) => Some((
-                    resolution.latest_version,
-                    resolution.index_url,
-                    "pip".to_owned(),
-                )),
-                Err(error) => {
-                    let _ = writeln!(
-                        output,
-                        "  runtime {} format=pip status=error message={}",
-                        manifest.runtime_key, error
-                    );
-                    None
-                }
-            },
-            "tarball" => match resolve_tarball_artifact(channel, Some(manifest.family.as_str())) {
-                Ok(artifact) => Some((artifact.version, artifact.url, "tarball".to_owned())),
-                Err(error) => {
-                    let _ = writeln!(
-                        output,
-                        "  runtime {} format=tarball status=error message={}",
-                        manifest.runtime_key, error
-                    );
-                    None
-                }
-            },
-            other => {
+        let plan = match runtime_update_plan(paths, &manifest) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
                 let _ = writeln!(
                     output,
-                    "  runtime {} format={} status=error message=unknown manifest format",
-                    manifest.runtime_key, other
+                    "  runtime {} format={} status=error message={}",
+                    manifest.runtime_key, manifest.format, error
                 );
                 None
             }
         };
 
-        let Some((latest_version, latest_source, kind)) = latest else {
+        let Some(plan) = plan else {
             continue;
-        };
-        let status = match compare_version_strings(&manifest.version, &latest_version) {
-            Ordering::Less => "update_available",
-            Ordering::Equal => "up_to_date",
-            Ordering::Greater => "ahead_of_index",
         };
         let _ = writeln!(
             output,
             "  runtime {} format={} channel={} family={} installed={} latest={} status={}",
             manifest.runtime_key,
-            kind,
+            plan.format,
             manifest.channel,
             manifest.family,
-            manifest.version,
-            latest_version,
-            status
+            runtime_version_display(&manifest.version),
+            runtime_version_display(&plan.latest_version),
+            plan.status
         );
         let _ = writeln!(
             output,
             "    install_root: {}",
             manifest.install_root.display()
         );
-        let _ = writeln!(output, "    source: {latest_source}");
-        if status == "update_available" {
+        let _ = writeln!(output, "    source: {}", plan.latest_source);
+        if plan.update_available {
             let _ = writeln!(
                 output,
-                "    next step: rerun `rocm install sdk --channel {} --format {}` to install the newer runtime",
-                manifest.channel, manifest.format
+                "    next step: run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
+                manifest.runtime_key
+            );
+            let _ = writeln!(
+                output,
+                "    activate: add `--activate` to make the newly installed runtime the default after install"
             );
         }
     }
@@ -222,56 +435,327 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
+pub(crate) fn runtime_update_plan(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+) -> Result<RuntimeUpdatePlan> {
+    let (latest_version, latest_source, format) =
+        resolve_latest_for_manifest(paths, manifest, None)?;
+    let status = match compare_version_strings(&manifest.version, &latest_version) {
+        Ordering::Less => "update_available",
+        Ordering::Equal => "up_to_date",
+        Ordering::Greater => "ahead_of_index",
+    };
+    Ok(RuntimeUpdatePlan {
+        latest_version,
+        latest_source,
+        format,
+        status: status.to_owned(),
+        update_available: status == "update_available",
+    })
+}
+
+fn resolve_latest_for_manifest(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+    download_timeout_secs: Option<u64>,
+) -> Result<(String, String, String)> {
+    let channel = TheRockChannel::parse(&manifest.channel)?;
+    match manifest.format.as_str() {
+        "pip" => {
+            let manifest_python = manifest
+                .python_executable
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+                .map(|executable| PythonLauncher {
+                    executable,
+                    source: "manifest",
+                });
+            let python_executable = match manifest_python {
+                Some(python) => python,
+                None => resolve_python_launcher(paths)?,
+            };
+            let wheel_compatibility =
+                wheel_compatibility_for_python(&python_executable.executable)?;
+            let resolution = resolve_pip_runtime_with_timeout(
+                paths,
+                channel,
+                Some(manifest.family.as_str()),
+                &wheel_compatibility,
+                None,
+                download_timeout_secs,
+            )?;
+            Ok((
+                resolution.latest_version,
+                resolution.index_url,
+                "pip".to_owned(),
+            ))
+        }
+        "tarball" => {
+            let artifact = resolve_tarball_artifact_with_timeout(
+                paths,
+                channel,
+                Some(manifest.family.as_str()),
+                download_timeout_secs,
+            )?;
+            Ok((artifact.version, artifact.url, "tarball".to_owned()))
+        }
+        other => bail!("unknown manifest format `{other}`"),
+    }
+}
+
+pub(crate) fn maybe_refresh_startup_update_check(
+    paths: &AppPaths,
+    active_runtime_key: Option<&str>,
+) -> Result<Option<StartupUpdateCheckRecord>> {
+    maybe_refresh_startup_update_check_at(paths, active_runtime_key, unix_time_millis())
+}
+
+fn maybe_refresh_startup_update_check_at(
+    paths: &AppPaths,
+    active_runtime_key: Option<&str>,
+    now_unix_ms: u128,
+) -> Result<Option<StartupUpdateCheckRecord>> {
+    if startup_update_check_disabled() {
+        return Ok(None);
+    }
+
+    let manifests = load_runtime_manifests(paths)?;
+    let Some(manifest) = select_startup_update_manifest(&manifests, active_runtime_key) else {
+        return Ok(None);
+    };
+
+    if let Some(previous) = load_startup_update_check(paths)?
+        && previous.runtime_key == manifest.runtime_key
+        && !startup_update_check_due(previous.checked_at_unix_ms, now_unix_ms)
+    {
+        return Ok(Some(previous));
+    }
+
+    let record = build_startup_update_check_record(
+        paths,
+        manifest,
+        now_unix_ms,
+        Some(STARTUP_UPDATE_CHECK_TIMEOUT_SECS),
+    );
+    save_startup_update_check(paths, &record)?;
+    Ok(Some(record))
+}
+
+fn startup_update_check_disabled() -> bool {
+    std::env::var_os("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK").is_some()
+}
+
+fn startup_update_check_due(previous_unix_ms: u128, now_unix_ms: u128) -> bool {
+    now_unix_ms.saturating_sub(previous_unix_ms) >= STARTUP_UPDATE_CHECK_INTERVAL_MS
+}
+
+fn select_startup_update_manifest<'a>(
+    manifests: &'a [InstalledRuntimeManifest],
+    active_runtime_key: Option<&str>,
+) -> Option<&'a InstalledRuntimeManifest> {
+    active_runtime_key
+        .and_then(|key| {
+            manifests
+                .iter()
+                .find(|manifest| manifest.runtime_key == key)
+        })
+        .or_else(|| manifests.first())
+}
+
+fn build_startup_update_check_record(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+    now_unix_ms: u128,
+    download_timeout_secs: Option<u64>,
+) -> StartupUpdateCheckRecord {
+    match resolve_latest_for_manifest(paths, manifest, download_timeout_secs) {
+        Ok((latest_version, _latest_source, kind)) => {
+            let status = match compare_version_strings(&manifest.version, &latest_version) {
+                Ordering::Less => "update_available",
+                Ordering::Equal => "up_to_date",
+                Ordering::Greater => "ahead_of_index",
+            };
+            StartupUpdateCheckRecord {
+                runtime_key: manifest.runtime_key.clone(),
+                runtime_id: manifest.runtime_id.clone(),
+                channel: manifest.channel.clone(),
+                format: kind,
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: Some(latest_version),
+                status: status.to_owned(),
+                message: None,
+                checked_at_unix_ms: now_unix_ms,
+            }
+        }
+        Err(error) => StartupUpdateCheckRecord {
+            runtime_key: manifest.runtime_key.clone(),
+            runtime_id: manifest.runtime_id.clone(),
+            channel: manifest.channel.clone(),
+            format: manifest.format.clone(),
+            family: manifest.family.clone(),
+            installed_version: manifest.version.clone(),
+            latest_version: None,
+            status: "error".to_owned(),
+            message: Some(error.to_string()),
+            checked_at_unix_ms: now_unix_ms,
+        },
+    }
+}
+
+fn startup_update_check_path(paths: &AppPaths) -> PathBuf {
+    paths
+        .cache_dir
+        .join("therock")
+        .join("startup-update-check.json")
+}
+
+fn load_startup_update_check(paths: &AppPaths) -> Result<Option<StartupUpdateCheckRecord>> {
+    let path = startup_update_check_path(paths);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let record = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(record))
+}
+
+fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord) -> Result<()> {
+    let path = startup_update_check_path(paths);
+    let parent = path
+        .parent()
+        .context("startup update check path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(record)
+            .context("failed to serialize startup update check record")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn install_pip_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
+    version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
 ) -> Result<String> {
-    let resolution = resolve_pip_runtime(channel, None)?;
-    let runtime_key = runtime_key(channel, "pip", &resolution.family);
+    progress_line(format!(
+        "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
+        managed_python_version()
+    ));
+    let python_launcher = resolve_python_launcher(paths)?;
+    progress_line(format!(
+        "Using Python from {}.",
+        python_launcher.executable.display()
+    ));
+    let wheel_compatibility = wheel_compatibility_for_python(&python_launcher.executable)?;
+    progress_line(format!(
+        "Checking TheRock {} packages for this AMD GPU...",
+        channel.as_str()
+    ));
+    let resolution =
+        resolve_pip_runtime(paths, channel, None, &wheel_compatibility, version_selector)?;
+    progress_line(format!(
+        "Found TheRock package family {} version {} with a matching PyTorch stack.",
+        resolution.family, resolution.latest_version
+    ));
+    let runtime_key = runtime_key(
+        channel,
+        "pip",
+        &resolution.family,
+        Some(&resolution.latest_version),
+    );
     let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "pip", &runtime_key));
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
-    let python_launcher = resolve_python_launcher()?;
+    let pip_cache_dir = pip_cache_dir(paths, "therock", install_root.as_path());
 
     let mut output = String::new();
     use std::fmt::Write as _;
     let _ = writeln!(output, "sdk install");
+    let _ = writeln!(
+        output,
+        "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
+    );
     let _ = writeln!(output, "  channel: {}", channel.as_str());
     let _ = writeln!(output, "  format: pip");
+    if let Some(selector) = version_selector {
+        let _ = writeln!(output, "  requested: {}", selector.describe());
+    }
     let _ = writeln!(output, "  family: {}", resolution.family);
     let _ = writeln!(output, "  family_source: {}", resolution.family_source);
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
-    let _ = writeln!(output, "  latest_version: {}", resolution.latest_version);
+    let _ = writeln!(
+        output,
+        "  latest_compatible_version: {}",
+        runtime_version_display(&resolution.latest_version)
+    );
+    let _ = writeln!(
+        output,
+        "  compatibility_key: {}",
+        runtime_version_display(&resolution.package_versions.compatibility_key)
+    );
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
-    let _ = writeln!(output, "  python_launcher: {python_launcher}");
+    let _ = writeln!(
+        output,
+        "  python_launcher: {}",
+        python_launcher.executable.display()
+    );
+    let _ = writeln!(output, "  python_source: {}", python_launcher.source);
+    let _ = writeln!(
+        output,
+        "  python_wheel_tag: {}",
+        wheel_compatibility.python_tag
+    );
+    let _ = writeln!(
+        output,
+        "  platform_wheel_tags: {}",
+        wheel_compatibility.platform_tags.join(",")
+    );
+    let _ = writeln!(output, "  pip_cache_dir: {}", pip_cache_dir.display());
+    let _ = writeln!(
+        output,
+        "  package_specs: {}",
+        therock_pip_package_specs(&resolution.package_versions).join(" ")
+    );
+    let _ = writeln!(
+        output,
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one pip transaction"
+    );
     if dry_run {
-        let mut install_args = vec![
-            "--timeout".to_owned(),
-            pip_timeout_secs().to_string(),
-            "--retries".to_owned(),
-            pip_retries().to_string(),
-            "--disable-pip-version-check".to_owned(),
-            "--progress-bar".to_owned(),
-            "on".to_owned(),
-            "--index-url".to_owned(),
-            resolution.index_url.clone(),
-            "--upgrade-strategy".to_owned(),
-            "only-if-needed".to_owned(),
-        ];
+        let mut install_args = pip_install_options(&resolution.index_url, &pip_cache_dir);
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.push("--pre".to_owned());
         }
-        install_args.push(THEROCK_ROCM_PACKAGE_SPEC.to_owned());
+        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+        let venv_args_display = python_venv_args(&install_root)
+            .iter()
+            .map(|arg| quote_display_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let install_args_display = install_args
+            .iter()
+            .map(|arg| quote_display_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(
             output,
-            "  command: {} -m venv {} && {}/python -m pip install {}",
-            python_launcher,
-            install_root.display(),
-            venv_bin_dir(&install_root).display(),
-            install_args.join(" ")
+            "  command: {} {} && {} -m pip install {}",
+            quote_display_arg(&python_launcher.executable.display().to_string()),
+            venv_args_display,
+            quote_display_arg(&venv_python_path(&install_root).display().to_string()),
+            install_args_display
+        );
+        let _ = writeln!(
+            output,
+            "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
         );
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
         return Ok(output);
@@ -282,34 +766,32 @@ fn install_pip_runtime(
             .parent()
             .context("runtime install root has no parent directory")?,
     )?;
-    ensure_python_venv(&python_launcher, &install_root)?;
+    progress_line(format!(
+        "Creating Python environment at {}.",
+        install_root.display()
+    ));
+    ensure_python_venv(&python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
+    progress_line(format!("Using pip cache {}.", pip_cache_dir.display()));
+    progress_line("Installing pip in the Python environment...");
     run_command(
         &env_python,
         &["-m", "ensurepip", "--upgrade"],
         "bootstrap pip in managed TheRock runtime",
     )?;
+    progress_line("Pip is ready.");
 
-    let mut install_args = vec![
-        "-m".to_owned(),
-        "pip".to_owned(),
-        "install".to_owned(),
-        "--timeout".to_owned(),
-        pip_timeout_secs().to_string(),
-        "--retries".to_owned(),
-        pip_retries().to_string(),
-        "--disable-pip-version-check".to_owned(),
-        "--progress-bar".to_owned(),
-        "on".to_owned(),
-        "--index-url".to_owned(),
-        resolution.index_url.clone(),
-        "--upgrade-strategy".to_owned(),
-        "only-if-needed".to_owned(),
-        THEROCK_ROCM_PACKAGE_SPEC.to_owned(),
-    ];
+    progress_line(format!(
+        "Installing {} from {}",
+        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        resolution.index_url
+    ));
+    let mut install_args = vec!["-m".to_owned(), "pip".to_owned(), "install".to_owned()];
+    install_args.extend(pip_install_options(&resolution.index_url, &pip_cache_dir));
     if matches!(channel, TheRockChannel::Nightly) {
-        install_args.insert(4, "--pre".to_owned());
+        install_args.push("--pre".to_owned());
     }
+    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
     run_progress_command(
         &env_python,
         install_args
@@ -317,10 +799,16 @@ fn install_pip_runtime(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        "install TheRock ROCm runtime packages",
+        "install TheRock devel SDK, torch stack, and resolved dependencies",
     )?;
 
-    let installed_version = resolve_installed_rocm_version(&env_python)?
+    progress_line("Checking the installed ROCm SDK...");
+    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
+        .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
+    validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
+    let installed_version = rocm_sdk_probe
+        .rocm_sdk_version
+        .clone()
         .unwrap_or_else(|| resolution.latest_version.clone());
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -334,16 +822,82 @@ fn install_pip_runtime(
         selected_artifact_url: resolution.index_url.clone(),
         index_url: Some(resolution.index_url.clone()),
         tarball_file_name: None,
-        python_launcher: Some(python_launcher),
+        python_launcher: Some(python_launcher.executable.display().to_string()),
         python_executable: Some(env_python.display().to_string()),
+        pip_cache_dir: Some(pip_cache_dir.clone()),
+        rocm_sdk: Some(rocm_sdk_probe.clone()),
+        read_only: false,
+        imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
 
-    let _ = writeln!(output, "  installed_version: {installed_version}");
+    let _ = writeln!(
+        output,
+        "  installed_version: {}",
+        runtime_version_display(&installed_version)
+    );
     let _ = writeln!(output, "  python_executable: {}", env_python.display());
+    if let Some(site_packages) = rocm_sdk_probe.site_packages.as_ref() {
+        let _ = writeln!(output, "  site_packages: {}", site_packages.display());
+    }
+    if let Some(root_path) = rocm_sdk_probe.root_path.as_ref() {
+        let _ = writeln!(output, "  rocm_sdk_root: {}", root_path.display());
+    }
+    if let Some(bin_path) = rocm_sdk_probe.bin_path.as_ref() {
+        let _ = writeln!(output, "  rocm_sdk_bin: {}", bin_path.display());
+    }
+    if let Some(version) = rocm_sdk_probe.rocm_sdk_version.as_deref() {
+        let _ = writeln!(
+            output,
+            "  rocm_sdk_version: {}",
+            runtime_version_display(version)
+        );
+    }
+    if let Some(target_family) = rocm_sdk_probe.resolved_target_family.as_deref() {
+        let _ = writeln!(output, "  rocm_sdk_target_family: {target_family}");
+    }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(output)
+}
+
+fn pip_install_options(index_url: &str, pip_cache_dir: &Path) -> Vec<String> {
+    vec![
+        "--timeout".to_owned(),
+        pip_timeout_secs().to_string(),
+        "--retries".to_owned(),
+        pip_retries().to_string(),
+        "--cache-dir".to_owned(),
+        pip_cache_dir.display().to_string(),
+        "--disable-pip-version-check".to_owned(),
+        "--progress-bar".to_owned(),
+        "on".to_owned(),
+        "--index-url".to_owned(),
+        index_url.to_owned(),
+        "--upgrade-strategy".to_owned(),
+        "only-if-needed".to_owned(),
+    ]
+}
+
+fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+    vec![
+        format!("rocm[libraries,devel]=={}", package_versions.rocm),
+        format!("torch=={}", package_versions.torch),
+        format!("torchvision=={}", package_versions.torchvision),
+        format!("torchaudio=={}", package_versions.torchaudio),
+    ]
+}
+
+fn quote_display_arg(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')' | '&' | ';' | '|'))
+    {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 fn install_tarball_runtime(
@@ -352,8 +906,13 @@ fn install_tarball_runtime(
     prefix: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<String> {
-    let artifact = resolve_tarball_artifact(channel, None)?;
-    let runtime_key = runtime_key(channel, "tarball", &artifact.family);
+    let artifact = resolve_tarball_artifact(paths, channel, None)?;
+    let runtime_key = runtime_key(
+        channel,
+        "tarball",
+        &artifact.family,
+        Some(&artifact.version),
+    );
     let install_root =
         prefix.unwrap_or_else(|| managed_runtime_root(paths, "tarball", &runtime_key));
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
@@ -368,7 +927,11 @@ fn install_tarball_runtime(
     let _ = writeln!(output, "  family_source: {}", artifact.family_source);
     let _ = writeln!(output, "  tarball: {}", artifact.file_name);
     let _ = writeln!(output, "  tarball_url: {}", artifact.url);
-    let _ = writeln!(output, "  latest_version: {}", artifact.version);
+    let _ = writeln!(
+        output,
+        "  latest_version: {}",
+        runtime_version_display(&artifact.version)
+    );
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  cache_path: {}", cache_path.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
@@ -404,6 +967,10 @@ fn install_tarball_runtime(
         tarball_file_name: Some(artifact.file_name.clone()),
         python_launcher: None,
         python_executable: None,
+        pip_cache_dir: None,
+        rocm_sdk: None,
+        read_only: false,
+        imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -414,28 +981,103 @@ fn install_tarball_runtime(
 }
 
 fn resolve_pip_runtime(
+    paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    wheel_compatibility: &WheelCompatibility,
+    version_selector: Option<&RuntimeVersionSelector>,
 ) -> Result<PipRuntimeResolution> {
-    let family_resolution = resolve_family(family_override)?;
+    resolve_pip_runtime_with_timeout(
+        paths,
+        channel,
+        family_override,
+        wheel_compatibility,
+        version_selector,
+        None,
+    )
+}
+
+fn resolve_pip_runtime_with_timeout(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family_override: Option<&str>,
+    wheel_compatibility: &WheelCompatibility,
+    version_selector: Option<&RuntimeVersionSelector>,
+    download_timeout_secs: Option<u64>,
+) -> Result<PipRuntimeResolution> {
+    let family_resolution = resolve_family(paths, family_override)?;
     let index_url = therock_index_url(&family_resolution.family);
-    let versions = load_simple_index_versions(&index_url, "rocm")?;
-    let latest_version = select_latest_version(&versions, channel)
-        .context("no TheRock ROCm wheel versions were discovered in the package index")?;
+    let rocm_versions =
+        load_simple_index_versions(paths, &index_url, "rocm", None, download_timeout_secs)?;
+    let torch_versions = load_simple_index_versions(
+        paths,
+        &index_url,
+        "torch",
+        Some(wheel_compatibility),
+        download_timeout_secs,
+    )?;
+    let torchvision_versions = load_simple_index_versions(
+        paths,
+        &index_url,
+        "torchvision",
+        Some(wheel_compatibility),
+        download_timeout_secs,
+    )?;
+    let torchaudio_versions = load_simple_index_versions(
+        paths,
+        &index_url,
+        "torchaudio",
+        Some(wheel_compatibility),
+        download_timeout_secs,
+    )?;
+    let package_versions = select_matching_pip_package_versions(
+        channel,
+        &rocm_versions,
+        &torch_versions,
+        &torchvision_versions,
+        &torchaudio_versions,
+        version_selector,
+    )
+    .with_context(|| {
+        let requested = version_selector
+            .map(RuntimeVersionSelector::describe)
+            .unwrap_or_else(|| "latest compatible version".to_owned());
+        format!(
+            "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+        )
+    })?;
+    let latest_version = package_versions.rocm.clone();
     Ok(PipRuntimeResolution {
         family: family_resolution.family,
         family_source: family_resolution.source,
         index_url,
         latest_version,
+        package_versions,
     })
 }
 
 fn resolve_tarball_artifact(
+    paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
 ) -> Result<TarballArtifact> {
-    let family_resolution = resolve_family(family_override)?;
-    let html = download_text(channel.tarball_base_url())?;
+    resolve_tarball_artifact_with_timeout(paths, channel, family_override, None)
+}
+
+fn resolve_tarball_artifact_with_timeout(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family_override: Option<&str>,
+    download_timeout_secs: Option<u64>,
+) -> Result<TarballArtifact> {
+    let family_resolution = resolve_family(paths, family_override)?;
+    let html = download_text_cached(
+        paths,
+        &format!("tarball-index-{}", channel.as_str()),
+        channel.tarball_base_url(),
+        download_timeout_secs,
+    )?
+    .text;
     let files = parse_tarball_index_html(&html)?;
     let prefix = format!(
         "therock-dist-{}-{}-",
@@ -476,7 +1118,7 @@ fn resolve_tarball_artifact(
     })
 }
 
-fn resolve_family(family_override: Option<&str>) -> Result<FamilyResolution> {
+fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
     if let Some(value) = family_override
         && let Some(family) = normalize_therock_family(value)
     {
@@ -495,6 +1137,13 @@ fn resolve_family(family_override: Option<&str>) -> Result<FamilyResolution> {
         });
     }
 
+    if let Some(family) = detect_managed_therock_family(paths) {
+        return Ok(FamilyResolution {
+            family,
+            source: "managed-runtime".to_owned(),
+        });
+    }
+
     if let Some(family) = detect_host_therock_family() {
         return Ok(FamilyResolution {
             family,
@@ -505,29 +1154,403 @@ fn resolve_family(family_override: Option<&str>) -> Result<FamilyResolution> {
     bail!("unable to resolve a supported TheRock GPU family for this host")
 }
 
-fn load_simple_index_versions(index_url: &str, package_name: &str) -> Result<Vec<String>> {
+fn select_matching_pip_package_versions(
+    channel: TheRockChannel,
+    rocm_versions: &[String],
+    torch_versions: &[String],
+    torchvision_versions: &[String],
+    torchaudio_versions: &[String],
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Option<TheRockPipPackageVersions> {
+    let mut rocm_candidates = if version_selector.is_some() {
+        rocm_versions.to_vec()
+    } else {
+        channel_rocm_candidates(rocm_versions, channel)
+    };
+    if let Some(selector) = version_selector {
+        rocm_candidates.retain(|version| selector.matches_version(version));
+    }
+    rocm_candidates.sort_by(|left, right| compare_version_strings(left, right));
+
+    for rocm_version in rocm_candidates.into_iter().rev() {
+        let mut torch_candidates = package_versions_matching_rocm(torch_versions, &rocm_version);
+        torch_candidates.sort_by(|left, right| compare_version_strings(left, right));
+
+        for torch_version in torch_candidates.into_iter().rev() {
+            let Some(torch_base) = parse_package_base_version(&torch_version) else {
+                continue;
+            };
+            let torchaudio_version =
+                select_latest_stack_package(torchaudio_versions, &rocm_version, |base| {
+                    pytorch_audio_matches_torch(&torch_base, base)
+                });
+            let torchvision_version =
+                select_latest_stack_package(torchvision_versions, &rocm_version, |base| {
+                    pytorch_vision_matches_torch(&torch_base, base)
+                });
+            if let (Some(torchaudio), Some(torchvision)) = (torchaudio_version, torchvision_version)
+            {
+                return Some(TheRockPipPackageVersions {
+                    compatibility_key: rocm_version.clone(),
+                    rocm: rocm_version,
+                    torch: torch_version,
+                    torchvision,
+                    torchaudio,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn channel_rocm_candidates(versions: &[String], channel: TheRockChannel) -> Vec<String> {
+    let mut all = versions.to_vec();
+    all.sort_by(|left, right| compare_version_strings(left, right));
+    if matches!(channel, TheRockChannel::Release) {
+        let stable = all
+            .iter()
+            .filter(|version| {
+                parse_version(version)
+                    .map(|parsed| parsed.stage == VersionStage::Stable)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !stable.is_empty() {
+            return stable;
+        }
+    }
+    all
+}
+
+fn select_latest_stack_package(
+    versions: &[String],
+    rocm_version: &str,
+    matches_stack: impl Fn(&ParsedVersion) -> bool,
+) -> Option<String> {
+    let mut candidates = package_versions_matching_rocm(versions, rocm_version)
+        .into_iter()
+        .filter(|version| {
+            parse_package_base_version(version)
+                .map(|base| matches_stack(&base))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| compare_version_strings(left, right));
+    candidates.pop()
+}
+
+fn package_versions_matching_rocm(versions: &[String], rocm_version: &str) -> Vec<String> {
+    versions
+        .iter()
+        .filter(|version| package_rocm_suffix(version).as_deref() == Some(rocm_version))
+        .cloned()
+        .collect()
+}
+
+fn pytorch_audio_matches_torch(torch_base: &ParsedVersion, audio_base: &ParsedVersion) -> bool {
+    audio_base.major == torch_base.major
+        && audio_base.minor == torch_base.minor
+        && audio_base.stage == torch_base.stage
+}
+
+fn pytorch_vision_matches_torch(torch_base: &ParsedVersion, vision_base: &ParsedVersion) -> bool {
+    let Some(expected_minor) = torch_base.minor.checked_add(15) else {
+        return false;
+    };
+    vision_base.major == 0
+        && vision_base.minor == expected_minor
+        && vision_base.stage == torch_base.stage
+}
+
+fn parse_package_base_version(version: &str) -> Option<ParsedVersion> {
+    parse_version(version.split('+').next().unwrap_or(version))
+}
+
+fn package_rocm_suffix(version: &str) -> Option<String> {
+    let decoded = decode_simple_index_version(version);
+    let lower = decoded.to_ascii_lowercase();
+    let marker = "+rocm";
+    let start = lower.rfind(marker)? + marker.len();
+    decoded.get(start..).map(str::to_owned)
+}
+
+fn decode_simple_index_version(version: &str) -> String {
+    version.replace("%2B", "+").replace("%2b", "+")
+}
+
+pub(crate) fn runtime_version_display(version: &str) -> String {
+    if let Some(date) = runtime_version_build_date(version) {
+        format!("{version} (build {date})")
+    } else {
+        version.to_owned()
+    }
+}
+
+pub(crate) fn runtime_version_build_date(version: &str) -> Option<String> {
+    let bytes = version.as_bytes();
+    if bytes.len() < 8 {
+        return None;
+    }
+    for window in bytes.windows(8) {
+        if !window.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let digits = std::str::from_utf8(window).ok()?;
+        let year = digits[0..4].parse::<u32>().ok()?;
+        let month = digits[4..6].parse::<u32>().ok()?;
+        let day = digits[6..8].parse::<u32>().ok()?;
+        if !(2000..=2099).contains(&year) || month == 0 || month > 12 {
+            continue;
+        }
+        let max_day = days_in_month(year, month);
+        if day == 0 || day > max_day {
+            continue;
+        }
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    None
+}
+
+fn normalize_requested_build_date(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("TheRock build date cannot be empty");
+    }
+    let digits = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.len() != 8 {
+        bail!("TheRock build date `{trimmed}` must use YYYY-MM-DD, YYYYMMDD, or MMDDYYYY");
+    }
+
+    let parsed = if digits.starts_with("20") {
+        parse_yyyy_mm_dd(&digits)
+    } else if digits[4..].starts_with("20") {
+        parse_mm_dd_yyyy(&digits)
+    } else {
+        None
+    };
+    let Some((year, month, day)) = parsed else {
+        bail!("TheRock build date `{trimmed}` must use YYYY-MM-DD, YYYYMMDD, or MMDDYYYY");
+    };
+    validate_date_components(year, month, day)
+        .with_context(|| format!("invalid TheRock build date `{trimmed}`"))?;
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn parse_yyyy_mm_dd(digits: &str) -> Option<(u32, u32, u32)> {
+    Some((
+        digits[0..4].parse().ok()?,
+        digits[4..6].parse().ok()?,
+        digits[6..8].parse().ok()?,
+    ))
+}
+
+fn parse_mm_dd_yyyy(digits: &str) -> Option<(u32, u32, u32)> {
+    Some((
+        digits[4..8].parse().ok()?,
+        digits[0..2].parse().ok()?,
+        digits[2..4].parse().ok()?,
+    ))
+}
+
+fn validate_date_components(year: u32, month: u32, day: u32) -> Result<()> {
+    if !(2000..=2099).contains(&year) {
+        bail!("year must be between 2000 and 2099");
+    }
+    if month == 0 || month > 12 {
+        bail!("month must be between 1 and 12");
+    }
+    let max_day = days_in_month(year, month);
+    if day == 0 || day > max_day {
+        bail!("day must be between 1 and {max_day}");
+    }
+    Ok(())
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn load_simple_index_versions(
+    paths: &AppPaths,
+    index_url: &str,
+    package_name: &str,
+    wheel_compatibility: Option<&WheelCompatibility>,
+    download_timeout_secs: Option<u64>,
+) -> Result<Vec<String>> {
     let url = format!("{}/{package_name}/", index_url.trim_end_matches('/'));
-    let html = download_text(&url)?;
+    let html = download_text_cached(
+        paths,
+        &format!("simple-index-{}-{}", slugify(index_url), package_name),
+        &url,
+        download_timeout_secs,
+    )?
+    .text;
+    Ok(parse_simple_index_versions(
+        &html,
+        package_name,
+        wheel_compatibility,
+    ))
+}
+
+fn parse_simple_index_versions(
+    html: &str,
+    package_name: &str,
+    wheel_compatibility: Option<&WheelCompatibility>,
+) -> Vec<String> {
     let marker = format!("{package_name}-");
     let mut versions = Vec::new();
     for line in html.lines() {
-        let Some(start) = line.find(&marker) else {
-            continue;
-        };
-        let version_start = start + marker.len();
-        let Some(rest) = line.get(version_start..) else {
-            continue;
-        };
-        let Some(version_end) = rest.find(".tar.gz").or_else(|| rest.find(".whl")) else {
-            continue;
-        };
-        versions.push(rest[..version_end].to_owned());
+        let mut rest = line;
+        while let Some(start) = rest.find(&marker) {
+            let version_start = start + marker.len();
+            let Some(candidate) = rest.get(version_start..) else {
+                break;
+            };
+            if let Some((version, consumed)) =
+                parse_simple_index_version_candidate(candidate, wheel_compatibility)
+            {
+                if let Some(version) = version {
+                    versions.push(version);
+                }
+                rest = candidate.get(consumed..).unwrap_or_default();
+            } else {
+                break;
+            }
+        }
     }
     versions.sort_by(|left, right| compare_version_strings(left, right));
     versions.dedup();
-    Ok(versions)
+    versions
 }
 
+fn parse_simple_index_version_candidate(
+    candidate: &str,
+    wheel_compatibility: Option<&WheelCompatibility>,
+) -> Option<(Option<String>, usize)> {
+    let tar_pos = candidate.find(".tar.gz");
+    let wheel_pos = candidate.find(".whl");
+    match (tar_pos, wheel_pos) {
+        (Some(tar_pos), Some(wheel_pos)) if tar_pos < wheel_pos => {
+            let version = decode_simple_index_version(candidate.get(..tar_pos)?);
+            Some((Some(version), tar_pos + ".tar.gz".len()))
+        }
+        (Some(tar_pos), None) => {
+            let version = decode_simple_index_version(candidate.get(..tar_pos)?);
+            Some((Some(version), tar_pos + ".tar.gz".len()))
+        }
+        (_, Some(wheel_pos)) => {
+            let wheel_stem = candidate.get(..wheel_pos)?;
+            if let Some(wheel_compatibility) = wheel_compatibility
+                && !wheel_stem_matches_compatibility(wheel_stem, wheel_compatibility)
+            {
+                return Some((None, wheel_pos + ".whl".len()));
+            }
+            let version = wheel_stem.split('-').next()?;
+            Some((
+                Some(decode_simple_index_version(version)),
+                wheel_pos + ".whl".len(),
+            ))
+        }
+        (None, None) => None,
+    }
+}
+
+fn wheel_compatibility_for_python(python_executable: &Path) -> Result<WheelCompatibility> {
+    let output = Command::new(python_executable)
+        .args([
+            "-c",
+            "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect Python wheel tag via {}",
+                python_executable.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect Python wheel tag: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let python_tag = String::from_utf8(output.stdout)
+        .context("failed to decode Python wheel tag")?
+        .trim()
+        .to_owned();
+    if python_tag.is_empty() {
+        bail!("Python did not report a wheel tag");
+    }
+    Ok(WheelCompatibility {
+        python_tag,
+        platform_tags: current_platform_wheel_tags()?,
+    })
+}
+
+fn current_platform_wheel_tags() -> Result<Vec<String>> {
+    let platform_tag = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "win_amd64",
+        ("linux", "x86_64") => "linux_x86_64",
+        ("linux", "aarch64") => "linux_aarch64",
+        (os, arch) => bail!("TheRock wheel filtering is not implemented for {os}/{arch}"),
+    };
+    Ok(vec![platform_tag.to_owned(), "any".to_owned()])
+}
+
+fn wheel_stem_matches_compatibility(wheel_stem: &str, compatibility: &WheelCompatibility) -> bool {
+    let mut parts = wheel_stem.rsplitn(4, '-');
+    let Some(platform_tag) = parts.next() else {
+        return false;
+    };
+    let Some(abi_tag) = parts.next() else {
+        return false;
+    };
+    let Some(python_tag) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_none() {
+        return false;
+    }
+
+    wheel_python_tag_matches(python_tag, &compatibility.python_tag)
+        && wheel_abi_tag_matches(abi_tag, &compatibility.python_tag)
+        && wheel_platform_tag_matches(platform_tag, &compatibility.platform_tags)
+}
+
+fn wheel_python_tag_matches(wheel_tag: &str, python_tag: &str) -> bool {
+    wheel_tag
+        .split('.')
+        .any(|tag| tag == python_tag || tag == "py3")
+}
+
+fn wheel_abi_tag_matches(wheel_tag: &str, python_tag: &str) -> bool {
+    wheel_tag
+        .split('.')
+        .any(|tag| tag == python_tag || tag == "abi3" || tag == "none")
+}
+
+fn wheel_platform_tag_matches(wheel_tag: &str, platform_tags: &[String]) -> bool {
+    wheel_tag
+        .split('.')
+        .any(|tag| platform_tags.iter().any(|platform| platform == tag))
+}
+
+#[cfg(test)]
 fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option<String> {
     let mut stable = Vec::new();
     let mut all = versions.to_vec();
@@ -547,20 +1570,331 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
     }
 }
 
-fn download_text(url: &str) -> Result<String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", url])
-        .output()
-        .with_context(|| format!("failed to launch curl for {url}"))?;
-    if !output.status.success() {
+impl MetadataSignaturePolicy {
+    fn from_env() -> Self {
+        Self {
+            required: truthy_env("ROCM_CLI_REQUIRE_METADATA_SIGNATURE"),
+            public_key_path: env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"),
+            public_key_pem: env_nonempty("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.required || self.public_key_path.is_some() || self.public_key_pem.is_some()
+    }
+
+    fn validate_configuration(&self) -> Result<()> {
+        if !self.active() {
+            return Ok(());
+        }
+        if let Some(public_key_path) = &self.public_key_path {
+            if !public_key_path.is_file() {
+                bail!(
+                    "metadata public key not found: {}",
+                    public_key_path.display()
+                );
+            }
+            return Ok(());
+        }
+        if self.public_key_pem.is_some() {
+            return Ok(());
+        }
         bail!(
-            "curl failed for {}: {}",
-            url,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "metadata signature verification requires ROCM_CLI_METADATA_PUBLIC_KEY_PATH or ROCM_CLI_METADATA_PUBLIC_KEY_PEM"
+        )
+    }
+}
+
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env_nonempty(name).map(PathBuf::from)
+}
+
+fn with_metadata_public_key<T>(
+    policy: &MetadataSignaturePolicy,
+    temp_key_path: &Path,
+    verify: impl FnOnce(&Path, &'static str) -> Result<T>,
+) -> Result<Option<T>> {
+    if !policy.active() {
+        return Ok(None);
+    }
+    if let Some(public_key_path) = &policy.public_key_path {
+        policy.validate_configuration()?;
+        return verify(public_key_path, "path").map(Some);
+    }
+    if let Some(public_key_pem) = &policy.public_key_pem {
+        let parent = temp_key_path
+            .parent()
+            .context("metadata public key temp path has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        fs::write(temp_key_path, public_key_pem)
+            .with_context(|| format!("failed to write {}", temp_key_path.display()))?;
+        let result = verify(temp_key_path, "env-pem");
+        let _ = fs::remove_file(temp_key_path);
+        return result.map(Some);
+    }
+    bail!(
+        "metadata signature verification requires ROCM_CLI_METADATA_PUBLIC_KEY_PATH or ROCM_CLI_METADATA_PUBLIC_KEY_PEM"
+    )
+}
+
+fn metadata_signature_url(url: &str) -> String {
+    format!("{url}.sig")
+}
+
+fn metadata_signature_path(body_path: &Path) -> PathBuf {
+    body_path.with_extension("sig")
+}
+
+fn fetch_and_verify_metadata_signature(
+    policy: &MetadataSignaturePolicy,
+    url: &str,
+    payload_path: &Path,
+    signature_path: &Path,
+    temp_key_path: &Path,
+    max_time_secs: Option<u64>,
+) -> Result<Option<CachedHttpSignatureMetadata>> {
+    if !policy.active() {
+        return Ok(None);
+    }
+    let signature_url = metadata_signature_url(url);
+    download_signature_file(&signature_url, signature_path, max_time_secs)?;
+    let public_key_source =
+        with_metadata_public_key(policy, temp_key_path, |public_key, source| {
+            verify_signature_with_openssl(payload_path, signature_path, public_key)?;
+            Ok(source.to_owned())
+        })?
+        .context("metadata signature policy was active but no public key was resolved")?;
+    Ok(Some(CachedHttpSignatureMetadata {
+        url: signature_url,
+        verified_at_unix_ms: unix_time_millis(),
+        public_key_source,
+    }))
+}
+
+fn verify_cached_metadata_signature(
+    policy: &MetadataSignaturePolicy,
+    payload_path: &Path,
+    signature_path: &Path,
+    temp_key_path: &Path,
+) -> Result<()> {
+    if !policy.active() {
+        return Ok(());
+    }
+    if !signature_path.is_file() {
+        bail!(
+            "metadata signature verification requested but cached signature is missing: {}",
+            signature_path.display()
         );
     }
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("failed to decode response from {url}"))
+    with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
+        verify_signature_with_openssl(payload_path, signature_path, public_key)
+    })?;
+    Ok(())
+}
+
+fn download_signature_file(
+    url: &str,
+    destination: &Path,
+    max_time_secs: Option<u64>,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("metadata signature destination has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let response = http_get(url, &[], max_time_secs)?;
+    if response.status != 200 {
+        let _ = fs::remove_file(destination);
+        bail!(
+            "HTTP {} while fetching metadata signature {url}",
+            response.status
+        );
+    }
+    write_file_atomically(destination, &response.body)?;
+    Ok(())
+}
+
+fn verify_signature_with_openssl(
+    payload_path: &Path,
+    signature_path: &Path,
+    public_key_path: &Path,
+) -> Result<()> {
+    let output = Command::new("openssl")
+        .args([
+            "dgst",
+            "-sha256",
+            "-verify",
+            public_key_path.to_string_lossy().as_ref(),
+            "-signature",
+            signature_path.to_string_lossy().as_ref(),
+            payload_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .context("failed to launch openssl for metadata signature verification")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "metadata signature verification failed{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn metadata_cache_can_revalidate(
+    metadata: &CachedHttpMetadata,
+    policy: &MetadataSignaturePolicy,
+    signature_path: &Path,
+) -> bool {
+    !policy.active() || (metadata.signature.is_some() && signature_path.is_file())
+}
+
+fn download_text_cached(
+    paths: &AppPaths,
+    cache_key: &str,
+    url: &str,
+    max_time_secs: Option<u64>,
+) -> Result<CachedHttpText> {
+    let (body_path, metadata_path) = metadata_cache_paths(paths, cache_key);
+    let signature_path = metadata_signature_path(&body_path);
+    let signature_policy = MetadataSignaturePolicy::from_env();
+    signature_policy.validate_configuration()?;
+    let previous_metadata = fs::read(&metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CachedHttpMetadata>(&bytes).ok())
+        .filter(|metadata| metadata.url == url);
+    let cache_dir = body_path
+        .parent()
+        .context("metadata cache path has no parent directory")?;
+    fs::create_dir_all(cache_dir)?;
+
+    let unique = unix_time_millis();
+    let tmp_body = body_path.with_extension(format!("body.tmp-{unique}"));
+    let tmp_signature = body_path.with_extension(format!("sig.tmp-{unique}"));
+    let tmp_public_key = body_path.with_extension(format!("public-key.tmp-{unique}.pem"));
+    let mut headers = Vec::new();
+    if let Some(etag) = previous_metadata
+        .as_ref()
+        .filter(|metadata| {
+            metadata_cache_can_revalidate(metadata, &signature_policy, &signature_path)
+        })
+        .and_then(|metadata| metadata.etag.as_deref())
+    {
+        headers.push(("If-None-Match", etag));
+    }
+
+    let response = http_get(url, &headers, max_time_secs)?;
+    if response.status == 304 {
+        let _ = fs::remove_file(&tmp_body);
+        verify_cached_metadata_signature(
+            &signature_policy,
+            &body_path,
+            &signature_path,
+            &tmp_public_key,
+        )?;
+        let text = fs::read_to_string(&body_path).with_context(|| {
+            format!(
+                "metadata cache returned 304 but cached body is missing: {}",
+                body_path.display()
+            )
+        })?;
+        return Ok(CachedHttpText { text });
+    }
+    if response.status != 200 {
+        let _ = fs::remove_file(&tmp_body);
+        bail!("HTTP {} while fetching {url}", response.status);
+    }
+
+    write_file_atomically(&tmp_body, &response.body)?;
+    let signature_metadata = match fetch_and_verify_metadata_signature(
+        &signature_policy,
+        url,
+        &tmp_body,
+        &tmp_signature,
+        &tmp_public_key,
+        max_time_secs,
+    ) {
+        Ok(signature_metadata) => signature_metadata,
+        Err(error) => {
+            let _ = fs::remove_file(&tmp_body);
+            let _ = fs::remove_file(&tmp_signature);
+            let _ = fs::remove_file(&tmp_public_key);
+            return Err(error);
+        }
+    };
+    let metadata = CachedHttpMetadata {
+        url: url.to_owned(),
+        etag: http_header_value(&response.headers, "etag"),
+        last_modified: http_header_value(&response.headers, "last-modified"),
+        signature: signature_metadata.clone(),
+        fetched_at_unix_ms: unix_time_millis(),
+    };
+    fs::rename(&tmp_body, &body_path).or_else(|_| {
+        let _ = fs::remove_file(&body_path);
+        fs::rename(&tmp_body, &body_path)
+    })?;
+    if signature_metadata.is_some() {
+        fs::rename(&tmp_signature, &signature_path).or_else(|_| {
+            let _ = fs::remove_file(&signature_path);
+            fs::rename(&tmp_signature, &signature_path)
+        })?;
+    } else {
+        let _ = fs::remove_file(&signature_path);
+    }
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata)
+            .context("failed to serialize metadata cache record")?,
+    )?;
+    let text = fs::read_to_string(&body_path)
+        .with_context(|| format!("failed to read cached metadata {}", body_path.display()))?;
+    Ok(CachedHttpText { text })
+}
+
+fn metadata_cache_paths(paths: &AppPaths, cache_key: &str) -> (PathBuf, PathBuf) {
+    let base = paths
+        .cache_dir
+        .join("therock")
+        .join("metadata")
+        .join(slugify(cache_key));
+    (base.with_extension("body"), base.with_extension("json"))
+}
+
+fn http_header_value(headers: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    let mut value = None;
+    for line in headers.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase().starts_with(&prefix) {
+            value = trimmed
+                .split_once(':')
+                .map(|(_, rest)| rest.trim().to_owned())
+                .filter(|rest| !rest.is_empty());
+        }
+    }
+    value
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
@@ -568,17 +1902,70 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    run_progress_command(
-        Path::new("curl"),
-        &[
-            "-fL",
-            "--progress-bar",
-            "-o",
-            destination.to_string_lossy().as_ref(),
-            url,
-        ],
-        "download TheRock tarball artifact",
-    )
+    let response = http_get(url, &[], None)?;
+    if response.status != 200 {
+        bail!("HTTP {} while fetching {url}", response.status);
+    }
+    write_file_atomically(destination, &response.body)
+}
+
+fn http_get(
+    url: &str,
+    headers: &[(&str, &str)],
+    max_time_secs: Option<u64>,
+) -> Result<HttpResponseBody> {
+    let timeout = max_time_secs
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(600));
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let mut request = agent.get(url).set("User-Agent", "rocm-cli");
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(error) => bail!("HTTP request failed for {url}: {error}"),
+    };
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| format!("{name}: {value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut reader = response.into_reader();
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .with_context(|| format!("failed to read HTTP response body for {url}"))?;
+    Ok(HttpResponseBody {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
+    {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).or_else(|_| {
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path)
+    })?;
+    Ok(())
 }
 
 fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
@@ -594,39 +1981,236 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
     )
 }
 
-fn ensure_python_venv(python_launcher: &str, install_root: &Path) -> Result<()> {
+fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
+        run_command(
+            &env_python,
+            &["--version"],
+            "verify existing managed TheRock runtime Python",
+        )?;
         return Ok(());
     }
+    let args = python_venv_args(install_root);
     run_command(
-        Path::new(python_launcher),
-        &["-m", "venv", install_root.to_string_lossy().as_ref()],
+        python_launcher,
+        args.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
         "create managed TheRock runtime virtual environment",
-    )
+    )?;
+    if !env_python.is_file() {
+        bail!(
+            "managed Python environment did not create expected executable: {}",
+            env_python.display()
+        );
+    }
+    Ok(())
 }
 
-fn resolve_installed_rocm_version(python_executable: &Path) -> Result<Option<String>> {
+fn python_venv_args(install_root: &Path) -> Vec<String> {
+    let mut args = vec!["-m".to_owned(), "venv".to_owned()];
+    if !cfg!(windows) {
+        args.push("--copies".to_owned());
+    }
+    args.push(install_root.to_string_lossy().to_string());
+    args
+}
+
+pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
     let output = Command::new(python_executable)
-        .args(["-m", "pip", "show", "rocm"])
+        .args(["-c", ROCM_SDK_PROBE_SCRIPT])
         .output()
         .with_context(|| {
             format!(
-                "failed to inspect installed ROCm version via {}",
+                "failed to launch rocm_sdk probe via {}",
                 python_executable.display()
             )
         })?;
     if !output.status.success() {
-        return Ok(None);
+        bail!(
+            "rocm_sdk probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    let text = String::from_utf8(output.stdout)
-        .context("failed to decode `pip show rocm` output for managed runtime")?;
-    for line in text.lines() {
-        if let Some(version) = line.strip_prefix("Version:") {
-            return Ok(Some(version.trim().to_owned()));
-        }
+    let text =
+        String::from_utf8(output.stdout).context("failed to decode rocm_sdk probe output")?;
+    parse_rocm_sdk_probe(&text)
+}
+
+fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
+    serde_json::from_str(output.trim()).context("failed to parse rocm_sdk probe output")
+}
+
+pub(crate) fn validate_rocm_sdk_runtime_probe(probe: &RocmSdkPythonProbe) -> Result<()> {
+    if !probe.import_ok {
+        bail!(
+            "TheRock packages did not expose a usable rocm_sdk runtime: {}",
+            probe.error.as_deref().unwrap_or("<unknown error>")
+        );
     }
-    Ok(None)
+    let Some(rocm_sdk_root) = probe.root_path.as_ref() else {
+        bail!("TheRock packages exposed rocm_sdk but did not report a runtime root path");
+    };
+    if !rocm_sdk_root.is_dir() {
+        bail!(
+            "TheRock rocm_sdk runtime root path does not exist: {}",
+            rocm_sdk_root.display()
+        );
+    }
+    let Some(rocm_sdk_bin) = probe.bin_path.as_ref() else {
+        bail!("TheRock packages exposed rocm_sdk but did not report a runtime bin path");
+    };
+    if !rocm_sdk_bin.is_dir() {
+        bail!(
+            "TheRock rocm_sdk runtime bin path does not exist: {}",
+            rocm_sdk_bin.display()
+        );
+    }
+    if !probe_has_resolved_library(probe, "amdhip64") {
+        bail!("TheRock rocm_sdk runtime did not expose amdhip64 through rocm_sdk.find_libraries");
+    }
+    if !probe_has_resolved_library(probe, "hipblas") {
+        bail!("TheRock rocm_sdk runtime did not expose hipblas through rocm_sdk.find_libraries");
+    }
+    Ok(())
+}
+
+fn probe_has_resolved_library(probe: &RocmSdkPythonProbe, shortname: &str) -> bool {
+    probe.resolved_libraries.iter().any(|library| {
+        library.shortname == shortname && library.paths.iter().any(|path| path.is_file())
+    })
+}
+
+const ROCM_SDK_PROBE_SCRIPT: &str = r#"
+import importlib
+import importlib.metadata as md
+import json
+from pathlib import Path
+import sysconfig
+
+out = {
+    "import_ok": False,
+    "rocm_sdk_version": None,
+    "site_packages": sysconfig.get_paths().get("purelib"),
+    "root_path": None,
+    "bin_path": None,
+    "cmake_path": None,
+    "runtime_roots": [],
+    "bin_paths": [],
+    "library_paths": [],
+    "default_target_family": None,
+    "available_target_families": [],
+    "resolved_target_family": None,
+    "packages": [],
+    "library_shortnames": [],
+    "resolved_libraries": [],
+    "error": None,
+}
+
+def add_path(key, path):
+    if path is None:
+        return
+    value = str(path)
+    if value not in out[key]:
+        out[key].append(value)
+
+def package_root(package, target_family=None):
+    module_name = package.get_py_package_name(target_family)
+    module = importlib.import_module(module_name)
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return None
+    return Path(module_file).parent
+
+def add_runtime_root(root):
+    if root is None:
+        return
+    add_path("runtime_roots", root)
+    for child in [root / "bin", root / "lib", root / "lib64", root / "lib" / "rocm_sysdeps" / "lib"]:
+        if child.is_dir():
+            if child.name == "bin":
+                add_path("bin_paths", child)
+            add_path("library_paths", child)
+
+try:
+    import rocm_sdk
+    from rocm_sdk import _dist_info as di
+
+    out["import_ok"] = True
+    out["rocm_sdk_version"] = getattr(rocm_sdk, "__version__", None)
+    out["default_target_family"] = getattr(di, "DEFAULT_TARGET_FAMILY", None)
+    out["available_target_families"] = list(getattr(di, "AVAILABLE_TARGET_FAMILIES", []))
+    try:
+        from rocm_sdk import _devel
+        root_path = _devel.get_devel_root()
+        out["root_path"] = str(root_path)
+        out["bin_path"] = str(root_path / "bin")
+        out["cmake_path"] = str(root_path / "lib" / "cmake")
+        add_runtime_root(root_path)
+    except Exception as exc:
+        out["root_path_error"] = type(exc).__name__ + ": " + str(exc)
+    try:
+        out["resolved_target_family"] = di.determine_target_family()
+    except Exception as exc:
+        out["resolved_target_family_error"] = type(exc).__name__ + ": " + str(exc)
+
+    target_family = out["resolved_target_family"] or out["default_target_family"]
+    for logical_name, target in [
+        ("core", None),
+        ("libraries", target_family),
+        ("device", target_family),
+        ("profiler", None),
+    ]:
+        try:
+            package = di.ALL_PACKAGES[logical_name]
+            if package.has_py_package(target):
+                add_runtime_root(package_root(package, target))
+        except Exception as exc:
+            out.setdefault("package_root_errors", {})[logical_name] = type(exc).__name__ + ": " + str(exc)
+
+    scripts_path = sysconfig.get_path("scripts")
+    if scripts_path:
+        scripts_path = Path(scripts_path)
+        if scripts_path.is_dir():
+            add_path("bin_paths", scripts_path)
+
+    if out["root_path"] is None and out["runtime_roots"]:
+        out["root_path"] = out["runtime_roots"][0]
+    if out["bin_path"] is None and out["bin_paths"]:
+        out["bin_path"] = out["bin_paths"][0]
+    if out["cmake_path"] is None and out["root_path"] is not None:
+        cmake_path = Path(out["root_path"]) / "lib" / "cmake"
+        if cmake_path.is_dir():
+            out["cmake_path"] = str(cmake_path)
+
+    out["library_shortnames"] = sorted(getattr(di, "ALL_LIBRARIES", {}).keys())
+    resolved_libraries = []
+    for shortname in out["library_shortnames"]:
+        try:
+            paths = [str(path) for path in rocm_sdk.find_libraries(shortname)]
+        except Exception:
+            paths = []
+        if paths:
+            resolved_libraries.append({"shortname": shortname, "paths": paths})
+    out["resolved_libraries"] = resolved_libraries
+
+    packages = []
+    for dist in md.distributions():
+        name = dist.metadata.get("Name")
+        if name and name.lower().startswith("rocm"):
+            packages.append({"name": name, "version": dist.version})
+    out["packages"] = sorted(packages, key=lambda item: item["name"].lower())
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ": " + str(exc)
+
+print(json.dumps(out))
+"#;
+
+fn progress_line(message: impl AsRef<str>) {
+    println!("{}", message.as_ref());
+    let _ = std::io::stdout().flush();
 }
 
 fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
@@ -637,28 +2221,30 @@ fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> 
     if output.status.success() {
         return Ok(());
     }
-    bail!(
-        "{}: {}",
-        context_text,
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("command exited with status {}", output.status)
+    };
+    bail!("{}: {}", context_text, detail)
 }
 
 fn run_progress_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
-    if interactive_terminal() {
-        let status = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("failed to launch {}", program.display()))?;
-        if status.success() {
-            return Ok(());
-        }
-        bail!("{context_text}: command exited with status {status}");
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch {}", program.display()))?;
+    if status.success() {
+        return Ok(());
     }
-    run_command(program, args, context_text)
+    bail!("{context_text}: command exited with status {status}");
 }
 
 fn pip_timeout_secs() -> u64 {
@@ -676,11 +2262,353 @@ fn pip_retries() -> u32 {
         .unwrap_or(DEFAULT_PIP_RETRIES)
 }
 
-fn resolve_python_launcher() -> Result<String> {
-    if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok()
-        && command_succeeds(&value, &["--version"])
+fn pip_cache_dir(paths: &AppPaths, component: &str, install_root: &Path) -> PathBuf {
+    pip_cache_dir_with_override(
+        paths,
+        component,
+        install_root,
+        std::env::var_os("ROCM_CLI_PIP_CACHE_DIR").map(PathBuf::from),
+    )
+}
+
+fn pip_cache_dir_with_override(
+    _paths: &AppPaths,
+    _component: &str,
+    install_root: &Path,
+    _env_override: Option<PathBuf>,
+) -> PathBuf {
+    install_root.join("pip-cache")
+}
+
+fn managed_tools_root(paths: &AppPaths) -> PathBuf {
+    paths.data_dir.join("tools")
+}
+
+fn managed_python_manifest_path(paths: &AppPaths) -> PathBuf {
+    managed_tools_root(paths)
+        .join("registry")
+        .join("python.json")
+}
+
+fn load_managed_python_manifest(paths: &AppPaths) -> Result<Option<ManagedPythonManifest>> {
+    let path = managed_python_manifest_path(paths);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManifest) -> Result<()> {
+    let path = managed_python_manifest_path(paths);
+    let parent = path
+        .parent()
+        .context("managed Python manifest path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(manifest)
+            .context("failed to serialize managed Python manifest")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
+    let mut config = RocmCliConfig::load(paths).unwrap_or_default();
+    config.tools.insert(
+        "python".to_owned(),
+        ManagedToolConfig {
+            path: Some(python.to_path_buf()),
+            managed: true,
+        },
+    );
+    config.save(paths)
+}
+
+fn managed_python_bootstrap_disabled() -> bool {
+    std::env::var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
+    progress_line(format!("Preparing Python {}...", managed_python_version()));
+    progress_line("Checking Python package metadata...");
+    let release = fetch_python_standalone_release()?;
+    let asset = select_python_standalone_asset(&release)?;
+    let platform = python_standalone_platform_triple()?;
+    let install_dir = managed_tools_root(paths)
+        .join("python")
+        .join(slugify(&format!("{}-{platform}", release.tag_name)));
+    if let Some(executable) = find_python_executable(&install_dir) {
+        progress_line(format!(
+            "Using existing Python {} at {}.",
+            managed_python_version(),
+            executable.display()
+        ));
+        let manifest = ManagedPythonManifest {
+            executable: executable.clone(),
+            source_url: asset.browser_download_url.clone(),
+            release_tag: release.tag_name.clone(),
+            asset_name: asset.name.clone(),
+            version: managed_python_version(),
+            installed_at_unix_ms: unix_time_millis(),
+        };
+        save_managed_python_manifest(paths, &manifest)?;
+        let _ = record_managed_python_config(paths, &executable);
+        return Ok(PythonLauncher {
+            executable,
+            source: "managed",
+        });
+    }
+
+    let archive_path = paths
+        .cache_dir
+        .join("tools")
+        .join("python")
+        .join(&release.tag_name)
+        .join(&asset.name);
+    if !archive_path.is_file() {
+        progress_line(format!(
+            "Downloading Python {} package {}.",
+            managed_python_version(),
+            asset.name
+        ));
+        download_file(&asset.browser_download_url, &archive_path)
+            .with_context(|| format!("failed to download managed Python {}", asset.name))?;
+    } else {
+        progress_line(format!(
+            "Using downloaded Python {} package {}.",
+            managed_python_version(),
+            archive_path.display()
+        ));
+    }
+    progress_line(format!("Installing Python {}...", managed_python_version()));
+    extract_managed_python_archive(&archive_path, &install_dir)?;
+    let executable = find_python_executable(&install_dir).with_context(|| {
+        format!(
+            "Python package did not contain a Python executable under {}",
+            install_dir.display()
+        )
+    })?;
+    progress_line(format!("Checking Python {}...", managed_python_version()));
+    if !command_succeeds(&executable, &["--version"]) {
+        bail!(
+            "Python {} did not run successfully after extraction: {}",
+            managed_python_version(),
+            executable.display()
+        );
+    }
+    let manifest = ManagedPythonManifest {
+        executable: executable.clone(),
+        source_url: asset.browser_download_url.clone(),
+        release_tag: release.tag_name.clone(),
+        asset_name: asset.name.clone(),
+        version: managed_python_version(),
+        installed_at_unix_ms: unix_time_millis(),
+    };
+    save_managed_python_manifest(paths, &manifest)?;
+    let _ = record_managed_python_config(paths, &executable);
+    progress_line(format!(
+        "Python {} is ready at {}.",
+        managed_python_version(),
+        executable.display()
+    ));
+    Ok(PythonLauncher {
+        executable,
+        source: "managed",
+    })
+}
+
+fn fetch_python_standalone_release() -> Result<PythonStandaloneRelease> {
+    let url = std::env::var("ROCM_CLI_MANAGED_PYTHON_RELEASE_JSON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL.to_owned());
+    let response = http_get(&url, &[], Some(60))?;
+    if response.status != 200 {
+        bail!(
+            "HTTP {} while fetching managed Python release metadata",
+            response.status
+        );
+    }
+    serde_json::from_slice(&response.body)
+        .context("failed to parse managed Python release metadata")
+}
+
+fn select_python_standalone_asset(
+    release: &PythonStandaloneRelease,
+) -> Result<PythonStandaloneAsset> {
+    if let Some(url) = std::env::var("ROCM_CLI_MANAGED_PYTHON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
     {
-        return Ok(value);
+        return Ok(release
+            .assets
+            .iter()
+            .find(|asset| asset.browser_download_url == url || asset.name == url)
+            .cloned()
+            .unwrap_or_else(|| PythonStandaloneAsset {
+                name: url
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("managed-python.tar.gz")
+                    .to_owned(),
+                browser_download_url: url,
+            }));
+    }
+    let platform = python_standalone_platform_triple()?;
+    let version_prefix = managed_python_asset_version_prefix();
+    let exact_suffix = "-install_only.tar.gz";
+    release
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.name.starts_with(&version_prefix)
+                && asset.name.contains(platform)
+                && asset.name.ends_with(exact_suffix)
+        })
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                asset.name.starts_with(&version_prefix)
+                    && asset.name.contains(platform)
+                    && asset.name.ends_with("-install_only_stripped.tar.gz")
+            })
+        })
+        .cloned()
+        .with_context(|| {
+            format!(
+                "no python-build-standalone asset found for CPython {} on {platform}; set ROCM_CLI_MANAGED_PYTHON_VERSION or ROCM_CLI_PYTHON",
+                managed_python_version()
+            )
+        })
+}
+
+fn managed_python_version() -> String {
+    std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MANAGED_PYTHON_VERSION.to_owned())
+}
+
+fn managed_python_asset_version_prefix() -> String {
+    let value = managed_python_version();
+    if value.matches('.').count() >= 2 {
+        format!("cpython-{value}+")
+    } else {
+        format!("cpython-{value}.")
+    }
+}
+
+fn python_standalone_platform_triple() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        (os, arch) => bail!("managed Python bootstrap is not available for {os}/{arch}"),
+    }
+}
+
+fn extract_managed_python_archive(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let parent = install_dir
+        .parent()
+        .context("managed Python install dir has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temp_dir = install_dir.with_extension(format!("tmp-{}", unix_time_millis()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir)?;
+    let archive = fs::File::open(archive_path)
+        .with_context(|| format!("failed to open {}", archive_path.display()))?;
+    let decoder = GzDecoder::new(archive);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(&temp_dir)
+        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
+    let _ = fs::remove_dir_all(install_dir);
+    fs::rename(&temp_dir, install_dir).or_else(|_| {
+        let _ = fs::remove_dir_all(install_dir);
+        fs::rename(&temp_dir, install_dir)
+    })?;
+    Ok(())
+}
+
+fn find_python_executable(root: &Path) -> Option<PathBuf> {
+    let candidates = if cfg!(windows) {
+        vec![
+            root.join("python").join("python.exe"),
+            root.join("python.exe"),
+        ]
+    } else {
+        vec![
+            root.join("python").join("bin").join("python3"),
+            root.join("python").join("bin").join("python"),
+            root.join("bin").join("python3"),
+            root.join("bin").join("python"),
+        ]
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .or_else(|| find_python_executable_recursive(root, 0))
+}
+
+fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf> {
+    if depth > 4 {
+        return None;
+    }
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| {
+                    if cfg!(windows) {
+                        name.eq_ignore_ascii_case("python.exe")
+                    } else {
+                        name == "python" || name == "python3"
+                    }
+                })
+        {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_python_executable_recursive(&path, depth + 1)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
+    if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok()
+        && command_succeeds(Path::new(&value), &["--version"])
+    {
+        return Ok(PythonLauncher {
+            executable: PathBuf::from(value),
+            source: "env",
+        });
+    }
+
+    if let Some(manifest) = load_managed_python_manifest(paths)?
+        && manifest.executable.is_file()
+        && command_succeeds(&manifest.executable, &["--version"])
+    {
+        return Ok(PythonLauncher {
+            executable: manifest.executable,
+            source: "managed",
+        });
     }
 
     let candidates: &[&str] = if cfg!(windows) {
@@ -689,14 +2617,23 @@ fn resolve_python_launcher() -> Result<String> {
         &["python3", "python"]
     };
     for candidate in candidates {
-        if command_succeeds(candidate, &["--version"]) {
-            return Ok((*candidate).to_owned());
+        if command_succeeds(Path::new(candidate), &["--version"]) {
+            return Ok(PythonLauncher {
+                executable: PathBuf::from(candidate),
+                source: "path",
+            });
         }
     }
-    bail!("unable to locate a Python launcher; set ROCM_CLI_PYTHON or install python3/python")
+
+    if managed_python_bootstrap_disabled() {
+        bail!(
+            "unable to locate Python, and managed Python bootstrap is disabled by ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"
+        );
+    }
+    ensure_managed_python(paths)
 }
 
-fn command_succeeds(program: &str, args: &[&str]) -> bool {
+fn command_succeeds(program: &Path, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
         .output()
@@ -719,12 +2656,15 @@ fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
 
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
     match (parse_version(left), parse_version(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(left_parsed), Some(right_parsed)) => {
+            left_parsed.cmp(&right_parsed).then_with(|| left.cmp(right))
+        }
         _ => left.cmp(right),
     }
 }
 
 fn parse_version(value: &str) -> Option<ParsedVersion> {
+    let value = value.split('+').next().unwrap_or(value);
     let mut parts = value.splitn(3, '.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -767,8 +2707,18 @@ fn platform_tarball_token() -> &'static str {
     if cfg!(windows) { "windows" } else { "linux" }
 }
 
-fn runtime_key(channel: TheRockChannel, format: &str, family: &str) -> String {
-    slugify(&format!("{}-{format}-{family}", channel.as_str()))
+fn runtime_key(
+    channel: TheRockChannel,
+    format: &str,
+    family: &str,
+    version: Option<&str>,
+) -> String {
+    match version {
+        Some(version) if !version.trim().is_empty() => {
+            slugify(&format!("{}-{format}-{family}-{version}", channel.as_str()))
+        }
+        _ => slugify(&format!("{}-{format}-{family}", channel.as_str())),
+    }
 }
 
 fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> PathBuf {
@@ -810,7 +2760,7 @@ fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) 
     Ok(())
 }
 
-fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
+pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
     let registry_dir = runtime_registry_dir(paths);
     if !registry_dir.is_dir() {
         return Ok(Vec::new());
@@ -831,7 +2781,7 @@ fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManife
             manifests.push(manifest);
         }
     }
-    manifests.sort_by(|left, right| right.installed_at_unix_ms.cmp(&left.installed_at_unix_ms));
+    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
     Ok(manifests)
 }
 
@@ -839,9 +2789,9 @@ fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let mut entries =
+    let entries =
         fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
@@ -857,14 +2807,6 @@ fn venv_python_path(install_root: &Path) -> PathBuf {
         install_root.join("Scripts").join("python.exe")
     } else {
         install_root.join("bin").join("python")
-    }
-}
-
-fn venv_bin_dir(install_root: &Path) -> PathBuf {
-    if cfg!(windows) {
-        install_root.join("Scripts")
-    } else {
-        install_root.join("bin")
     }
 }
 
@@ -908,6 +2850,865 @@ mod tests {
         assert_eq!(
             select_latest_version(&versions, TheRockChannel::Release),
             Some("7.12.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn pip_runtime_installs_pinned_devel_and_torch_stack_from_therock_index() {
+        let package_versions = TheRockPipPackageVersions {
+            rocm: "7.13.0a20260513".to_owned(),
+            torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            torchvision: "0.25.0+rocm7.13.0a20260513".to_owned(),
+            torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            compatibility_key: "7.13.0a20260513".to_owned(),
+        };
+        let package_specs = therock_pip_package_specs(&package_versions);
+
+        assert_eq!(
+            package_specs,
+            vec![
+                "rocm[libraries,devel]==7.13.0a20260513".to_owned(),
+                "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
+                "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
+                "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pip_runtime_selects_latest_common_rocm_suffix_not_latest_rocm_package() {
+        let rocm_versions = vec![
+            "7.13.0a20260512".to_owned(),
+            "7.13.0a20260513".to_owned(),
+            "7.14.0a20260602".to_owned(),
+        ];
+        let torch_versions = vec![
+            "2.9.1+rocm7.13.0a20260513".to_owned(),
+            "2.10.0+rocm7.13.0a20260513".to_owned(),
+        ];
+        let torchvision_versions = vec![
+            "0.24.0+rocm7.13.0a20260513".to_owned(),
+            "0.25.0+rocm7.13.0a20260513".to_owned(),
+        ];
+        let torchaudio_versions = vec![
+            "2.9.0+rocm7.13.0a20260513".to_owned(),
+            "2.10.0+rocm7.13.0a20260513".to_owned(),
+        ];
+
+        let selected = select_matching_pip_package_versions(
+            TheRockChannel::Release,
+            &rocm_versions,
+            &torch_versions,
+            &torchvision_versions,
+            &torchaudio_versions,
+            None,
+        )
+        .expect("expected compatible package set");
+
+        assert_eq!(selected.rocm, "7.13.0a20260513");
+        assert_eq!(selected.torch, "2.10.0+rocm7.13.0a20260513");
+        assert_eq!(selected.torchvision, "0.25.0+rocm7.13.0a20260513");
+        assert_eq!(selected.torchaudio, "2.10.0+rocm7.13.0a20260513");
+    }
+
+    #[test]
+    fn pip_runtime_rejects_date_only_rocm_suffix_matches() {
+        let rocm_versions = vec!["7.14.0a20260602".to_owned()];
+        let torch_versions = vec!["2.10.0+rocm7.13.0a20260602".to_owned()];
+        let torchvision_versions = vec!["0.25.0+rocm7.13.0a20260602".to_owned()];
+        let torchaudio_versions = vec!["2.10.0+rocm7.13.0a20260602".to_owned()];
+
+        assert!(
+            select_matching_pip_package_versions(
+                TheRockChannel::Release,
+                &rocm_versions,
+                &torch_versions,
+                &torchvision_versions,
+                &torchaudio_versions,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pip_runtime_selects_requested_build_date_stack() -> Result<()> {
+        let rocm_versions = vec![
+            "7.13.0a20260604".to_owned(),
+            "7.13.0a20260605".to_owned(),
+            "7.13.0a20260606".to_owned(),
+        ];
+        let torch_versions = vec![
+            "2.10.0+rocm7.13.0a20260605".to_owned(),
+            "2.10.0+rocm7.13.0a20260606".to_owned(),
+        ];
+        let torchvision_versions = vec![
+            "0.25.0+rocm7.13.0a20260605".to_owned(),
+            "0.25.0+rocm7.13.0a20260606".to_owned(),
+        ];
+        let torchaudio_versions = vec![
+            "2.10.0+rocm7.13.0a20260605".to_owned(),
+            "2.10.0+rocm7.13.0a20260606".to_owned(),
+        ];
+        let selector = RuntimeVersionSelector::build_date("06052026")?;
+
+        let selected = select_matching_pip_package_versions(
+            TheRockChannel::Release,
+            &rocm_versions,
+            &torch_versions,
+            &torchvision_versions,
+            &torchaudio_versions,
+            Some(&selector),
+        )
+        .expect("expected requested build-date package set");
+
+        assert_eq!(selected.rocm, "7.13.0a20260605");
+        assert_eq!(selected.torch, "2.10.0+rocm7.13.0a20260605");
+        assert_eq!(
+            selector,
+            RuntimeVersionSelector::BuildDate("2026-06-05".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pip_runtime_rejects_requested_build_date_without_matching_stack() -> Result<()> {
+        let rocm_versions = vec!["7.13.0a20260605".to_owned()];
+        let torch_versions = vec!["2.10.0+rocm7.13.0a20260606".to_owned()];
+        let torchvision_versions = vec!["0.25.0+rocm7.13.0a20260606".to_owned()];
+        let torchaudio_versions = vec!["2.10.0+rocm7.13.0a20260606".to_owned()];
+        let selector = RuntimeVersionSelector::build_date("2026-06-05")?;
+
+        assert!(
+            select_matching_pip_package_versions(
+                TheRockChannel::Release,
+                &rocm_versions,
+                &torch_versions,
+                &torchvision_versions,
+                &torchaudio_versions,
+                Some(&selector),
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simple_index_parser_strips_wheel_tags_decodes_plus_and_filters_platform() {
+        let compatibility = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["win_amd64".to_owned(), "any".to_owned()],
+        };
+        let html = r#"
+            <a href="torch-2.10.0%2Brocm7.13.0a20260513-cp312-cp312-win_amd64.whl">torch-2.10.0%2Brocm7.13.0a20260513-cp312-cp312-win_amd64.whl</a>
+            <a href="torch-2.11.0%2Brocm7.13.0a20260514-cp313-cp313-win_amd64.whl">torch-2.11.0%2Brocm7.13.0a20260514-cp313-cp313-win_amd64.whl</a>
+            <a href="torch-2.12.0+rocm7.13.0a20260515-cp312-cp312-linux_x86_64.whl">torch-2.12.0+rocm7.13.0a20260515-cp312-cp312-linux_x86_64.whl</a>
+        "#;
+
+        assert_eq!(
+            parse_simple_index_versions(html, "torch", Some(&compatibility)),
+            vec!["2.10.0+rocm7.13.0a20260513".to_owned()]
+        );
+    }
+
+    #[test]
+    fn pip_cache_defaults_inside_explicit_install_folder() {
+        let (_root, paths) = test_paths("prefix-pip-cache");
+        let install_root = paths.data_dir.join("chosen-rocm-folder");
+        let expected = install_root.join("pip-cache");
+
+        assert_eq!(pip_cache_dir(&paths, "therock", &install_root), expected);
+        assert!(
+            !expected.exists(),
+            "pip cache path calculation must not create the first-run cache directory"
+        );
+    }
+
+    #[test]
+    fn install_folder_wins_over_pip_cache_env_override() {
+        let (_root, paths) = test_paths("prefix-pip-cache-env");
+        let install_root = paths.data_dir.join("chosen-rocm-folder");
+        let env_override = paths.cache_dir.join("env-override");
+
+        assert_eq!(
+            pip_cache_dir_with_override(&paths, "therock", &install_root, Some(env_override)),
+            install_root.join("pip-cache")
+        );
+    }
+
+    #[test]
+    fn python_venv_args_use_copies_on_unix_mounts() {
+        let args = python_venv_args(Path::new("/mnt/d/jam/rocm"));
+        if cfg!(windows) {
+            assert!(!args.iter().any(|arg| arg == "--copies"));
+        } else {
+            assert!(args.iter().any(|arg| arg == "--copies"));
+        }
+        assert_eq!(args.last().map(String::as_str), Some("/mnt/d/jam/rocm"));
+    }
+
+    #[test]
+    fn managed_pip_cache_defaults_inside_generated_runtime_folder() {
+        let (_root, paths) = test_paths("managed-pip-cache");
+        let runtime_key = "release-pip-gfx120x-all-7-14-0";
+        let install_root = managed_runtime_root(&paths, "pip", runtime_key);
+
+        assert_eq!(
+            pip_cache_dir(&paths, "therock", &install_root),
+            install_root.join("pip-cache")
+        );
+    }
+
+    #[test]
+    fn managed_python_asset_selector_prefers_install_only_for_host_platform() -> Result<()> {
+        let platform = python_standalone_platform_triple()?;
+        let release = PythonStandaloneRelease {
+            tag_name: "20250409".to_owned(),
+            assets: vec![
+                PythonStandaloneAsset {
+                    name: format!(
+                        "cpython-3.12.10+20250409-{platform}-install_only_stripped.tar.gz"
+                    ),
+                    browser_download_url: "https://example.invalid/stripped.tar.gz".to_owned(),
+                },
+                PythonStandaloneAsset {
+                    name: format!("cpython-3.12.10+20250409-{platform}-install_only.tar.gz"),
+                    browser_download_url: "https://example.invalid/install.tar.gz".to_owned(),
+                },
+            ],
+        };
+
+        let asset = select_python_standalone_asset(&release)?;
+
+        assert_eq!(
+            asset.browser_download_url,
+            "https://example.invalid/install.tar.gz"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_python_defaults_target_pinned_31210_release() {
+        assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12.10");
+        assert_eq!(
+            PYTHON_BUILD_STANDALONE_DEFAULT_RELEASE_URL,
+            "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20250409"
+        );
+    }
+
+    #[test]
+    fn managed_python_manifest_round_trips() -> Result<()> {
+        let (root, paths) = test_paths("managed-python-manifest");
+        let manifest = ManagedPythonManifest {
+            executable: paths
+                .data_dir
+                .join("tools")
+                .join("python")
+                .join("python.exe"),
+            source_url: "https://example.invalid/python.tar.gz".to_owned(),
+            release_tag: "20260510".to_owned(),
+            asset_name: "python.tar.gz".to_owned(),
+            version: "3.12.10".to_owned(),
+            installed_at_unix_ms: 123,
+        };
+
+        save_managed_python_manifest(&paths, &manifest)?;
+        let loaded = load_managed_python_manifest(&paths)?.expect("manifest should load");
+
+        fs::remove_dir_all(root).ok();
+        assert_eq!(loaded.executable, manifest.executable);
+        assert_eq!(loaded.release_tag, "20260510");
+        Ok(())
+    }
+
+    #[test]
+    fn display_command_quotes_package_extras() {
+        assert_eq!(quote_display_arg("package[extra]"), "\"package[extra]\"");
+        assert_eq!(
+            quote_display_arg("C:\\Program Files\\Python\\python.exe"),
+            "\"C:\\Program Files\\Python\\python.exe\""
+        );
+    }
+
+    #[test]
+    fn runtime_key_includes_version_for_side_by_side_installs() {
+        assert_eq!(
+            runtime_key(
+                TheRockChannel::Release,
+                "pip",
+                "gfx120X-all",
+                Some("7.13.0a20260416")
+            ),
+            "release-pip-gfx120x-all-7-13-0a20260416"
+        );
+    }
+
+    #[test]
+    fn metadata_cache_paths_stay_under_rocm_cli_cache() {
+        let (root, paths) = test_paths("metadata-cache-paths");
+        let (body, metadata) = metadata_cache_paths(&paths, "simple-index:https://example.invalid");
+
+        assert!(body.starts_with(paths.cache_dir.join("therock").join("metadata")));
+        assert_eq!(
+            body.extension().and_then(|value| value.to_str()),
+            Some("body")
+        );
+        assert_eq!(
+            metadata.extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_signature_paths_are_sidecars() {
+        let (root, paths) = test_paths("metadata-signature-paths");
+        let (body, _) = metadata_cache_paths(&paths, "simple-index:https://example.invalid");
+
+        assert_eq!(
+            metadata_signature_url("https://example.invalid/index").as_str(),
+            "https://example.invalid/index.sig"
+        );
+        assert_eq!(
+            metadata_signature_path(&body)
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("sig")
+        );
+        assert!(metadata_signature_path(&body).starts_with(&paths.cache_dir));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_signature_policy_requires_public_key_when_enabled() {
+        let (root, paths) = test_paths("metadata-signature-requires-key");
+        let policy = MetadataSignaturePolicy {
+            required: true,
+            public_key_path: None,
+            public_key_pem: None,
+        };
+        let temp_key = paths.cache_dir.join("metadata-key.pem");
+
+        let error = with_metadata_public_key(&policy, &temp_key, |_path, _source| Ok(()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"));
+        assert!(error.contains("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_signature_policy_writes_inline_public_key_temporarily() -> Result<()> {
+        let (root, paths) = test_paths("metadata-signature-inline-key");
+        let policy = MetadataSignaturePolicy {
+            required: true,
+            public_key_path: None,
+            public_key_pem: Some(
+                "-----BEGIN PUBLIC KEY-----\nunit-test\n-----END PUBLIC KEY-----\n".to_owned(),
+            ),
+        };
+        let temp_key = paths.cache_dir.join("metadata-key.pem");
+
+        let observed = with_metadata_public_key(&policy, &temp_key, |path, source| {
+            assert_eq!(source, "env-pem");
+            assert_eq!(
+                fs::read_to_string(path)?,
+                "-----BEGIN PUBLIC KEY-----\nunit-test\n-----END PUBLIC KEY-----\n"
+            );
+            Ok(path.to_path_buf())
+        })?
+        .expect("inline key should be active");
+
+        assert_eq!(observed, temp_key);
+        assert!(!temp_key.exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_revalidation_requires_cached_signature_when_policy_is_active() -> Result<()> {
+        let (root, paths) = test_paths("metadata-signature-revalidate");
+        fs::create_dir_all(&paths.cache_dir)?;
+        let signature_path = paths.cache_dir.join("index.sig");
+        let unsigned_metadata = CachedHttpMetadata {
+            url: "https://example.invalid/index".to_owned(),
+            etag: Some("etag".to_owned()),
+            last_modified: None,
+            signature: None,
+            fetched_at_unix_ms: 1,
+        };
+        let signed_metadata = CachedHttpMetadata {
+            signature: Some(CachedHttpSignatureMetadata {
+                url: "https://example.invalid/index.sig".to_owned(),
+                verified_at_unix_ms: 2,
+                public_key_source: "path".to_owned(),
+            }),
+            ..unsigned_metadata.clone()
+        };
+        let inactive_policy = MetadataSignaturePolicy::default();
+        let active_policy = MetadataSignaturePolicy {
+            required: true,
+            public_key_path: None,
+            public_key_pem: Some("key".to_owned()),
+        };
+
+        assert!(metadata_cache_can_revalidate(
+            &unsigned_metadata,
+            &inactive_policy,
+            &signature_path
+        ));
+        assert!(!metadata_cache_can_revalidate(
+            &unsigned_metadata,
+            &active_policy,
+            &signature_path
+        ));
+        assert!(!metadata_cache_can_revalidate(
+            &signed_metadata,
+            &active_policy,
+            &signature_path
+        ));
+
+        fs::write(&signature_path, "signature")?;
+        assert!(metadata_cache_can_revalidate(
+            &signed_metadata,
+            &active_policy,
+            &signature_path
+        ));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_signature_verification_accepts_generated_key_and_rejects_tamper() -> Result<()> {
+        let (root, paths) = test_paths("metadata-signature-generated-key");
+        fs::create_dir_all(&paths.cache_dir)?;
+        let private_key = paths.cache_dir.join("metadata-private.pem");
+        let public_key = paths.cache_dir.join("metadata-public.pem");
+        let payload_path = paths.cache_dir.join("index.body");
+        let signature_path = paths.cache_dir.join("index.sig");
+        let temp_key = paths.cache_dir.join("metadata-public.tmp.pem");
+
+        generate_test_signing_key(&private_key, &public_key)?;
+        fs::write(&payload_path, "version = 1\n")?;
+        sign_test_payload(&private_key, &payload_path, &signature_path)?;
+
+        let policy = MetadataSignaturePolicy {
+            required: true,
+            public_key_path: Some(public_key),
+            public_key_pem: None,
+        };
+        verify_cached_metadata_signature(&policy, &payload_path, &signature_path, &temp_key)?;
+
+        fs::write(&payload_path, "version = 2\n")?;
+        let error =
+            verify_cached_metadata_signature(&policy, &payload_path, &signature_path, &temp_key)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("metadata signature verification failed"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn http_header_value_uses_last_response_header_block() {
+        let headers =
+            "HTTP/2 302\r\netag: old\r\n\r\nHTTP/2 200\r\nETag: new\r\nLast-Modified: today\r\n";
+
+        assert_eq!(http_header_value(headers, "etag").as_deref(), Some("new"));
+        assert_eq!(
+            http_header_value(headers, "last-modified").as_deref(),
+            Some("today")
+        );
+    }
+
+    #[test]
+    fn update_report_policy_mentions_bounded_startup_check() -> Result<()> {
+        let (root, paths) = test_paths("update-report-policy");
+
+        let rendered = render_update_report(&paths)?;
+
+        assert!(rendered.contains("policy: bounded startup check, cached metadata"));
+        assert!(rendered.contains("prompt before mutating state"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_update_check_skips_first_run_without_creating_cache() -> Result<()> {
+        let (root, paths) = test_paths("startup-no-runtime");
+
+        let record = maybe_refresh_startup_update_check_at(&paths, None, 1_000)?;
+
+        assert!(record.is_none());
+        assert!(!paths.cache_dir.exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_update_check_due_uses_bounded_interval() {
+        assert!(!startup_update_check_due(
+            1_000,
+            1_000 + STARTUP_UPDATE_CHECK_INTERVAL_MS - 1
+        ));
+        assert!(startup_update_check_due(
+            1_000,
+            1_000 + STARTUP_UPDATE_CHECK_INTERVAL_MS
+        ));
+    }
+
+    #[test]
+    fn startup_update_check_prefers_active_runtime_key() {
+        let newest = test_runtime_manifest("newer", "therock-release:gfx120X-all", 2);
+        let active = test_runtime_manifest("active", "therock-release:gfx110X-all", 1);
+        let manifests = vec![newest, active];
+
+        let selected = select_startup_update_manifest(&manifests, Some("active"))
+            .expect("active runtime should be selected");
+
+        assert_eq!(selected.runtime_key, "active");
+        assert_eq!(
+            select_startup_update_manifest(&manifests, None)
+                .expect("newest runtime should be selected")
+                .runtime_key,
+            "newer"
+        );
+    }
+
+    #[test]
+    fn startup_update_check_uses_recent_record_without_network() -> Result<()> {
+        let (root, paths) = test_paths("startup-recent-record");
+        let manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+        save_startup_update_check(
+            &paths,
+            &StartupUpdateCheckRecord {
+                runtime_key: "active".to_owned(),
+                runtime_id: manifest.runtime_id.clone(),
+                channel: manifest.channel.clone(),
+                format: manifest.format.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: Some(manifest.version.clone()),
+                status: "up_to_date".to_owned(),
+                message: None,
+                checked_at_unix_ms: 2_000,
+            },
+        )?;
+
+        let record = maybe_refresh_startup_update_check_at(&paths, Some("active"), 2_001)?
+            .expect("recent check should be returned");
+
+        assert_eq!(record.status, "up_to_date");
+        assert!(!paths.cache_dir.join("therock").join("metadata").exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_family_uses_managed_runtime_before_host_detection() -> Result<()> {
+        if std::env::var("ROCM_CLI_THEROCK_FAMILY")
+            .ok()
+            .and_then(|value| normalize_therock_family(&value))
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let (root, paths) = test_paths("resolve-family-managed-runtime");
+        let manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let resolution = resolve_family(&paths, None)?;
+
+        assert_eq!(resolution.family, "gfx120X-all");
+        assert_eq!(resolution.source, "managed-runtime");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_v1_rejects_tarball_runtime_format() {
+        let error = ensure_install_format_supported_for_platform("tarball", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("tarball installs are not supported on Windows V1"));
+        assert!(error.contains("rocm install sdk --format pip"));
+        assert!(error.contains("managed pip virtual environment"));
+    }
+
+    #[test]
+    fn linux_allows_tarball_runtime_format() {
+        ensure_install_format_supported_for_platform("tarball", false).unwrap();
+    }
+
+    #[test]
+    fn parses_rocm_sdk_probe_contract() -> Result<()> {
+        let root_path = if cfg!(windows) {
+            PathBuf::from(r"C:\venv\Lib\site-packages\_rocm_sdk_devel")
+        } else {
+            PathBuf::from("/tmp/venv/lib/python3.12/site-packages/_rocm_sdk_devel")
+        };
+        let bin_path = root_path.join("bin");
+        let cmake_path = root_path.join("lib").join("cmake");
+        let site_packages = root_path
+            .parent()
+            .expect("test root has a parent")
+            .display()
+            .to_string();
+        let payload = serde_json::json!({
+            "import_ok": true,
+            "rocm_sdk_version": "7.13.0a20260423",
+            "site_packages": site_packages,
+            "root_path": root_path,
+            "bin_path": bin_path,
+            "cmake_path": cmake_path,
+            "runtime_roots": [root_path],
+            "bin_paths": [bin_path],
+            "library_paths": [root_path.join("lib")],
+            "default_target_family": "gfx1151",
+            "available_target_families": ["gfx1151"],
+            "resolved_target_family": "gfx1151",
+            "packages": [{"name": "rocm", "version": "7.13.0a20260423"}],
+            "library_shortnames": ["amdhip64", "hipblas"],
+            "resolved_libraries": [
+                {"shortname": "amdhip64", "paths": [root_path.join("bin").join("amdhip64_7.dll")]},
+                {"shortname": "hipblas", "paths": [root_path.join("bin").join("hipblas.dll")]}
+            ],
+            "error": null
+        })
+        .to_string();
+        let probe = parse_rocm_sdk_probe(&payload)?;
+
+        assert!(probe.import_ok);
+        assert_eq!(probe.rocm_sdk_version.as_deref(), Some("7.13.0a20260423"));
+        assert_eq!(probe.resolved_target_family.as_deref(), Some("gfx1151"));
+        assert_eq!(
+            probe
+                .root_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str()),
+            Some("_rocm_sdk_devel")
+        );
+        assert_eq!(
+            probe
+                .bin_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str()),
+            Some("bin")
+        );
+        assert_eq!(probe.available_target_families, vec!["gfx1151"]);
+        assert_eq!(probe.packages[0].name, "rocm");
+        assert!(probe.library_shortnames.contains(&"amdhip64".to_owned()));
+        assert_eq!(probe.resolved_libraries.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_only_rocm_sdk_probe_validates_without_devel_root() -> Result<()> {
+        let (root, _paths) = test_paths("runtime-only-probe");
+        let site_packages = root.join("venv").join("Lib").join("site-packages");
+        let core_root = site_packages.join("_rocm_sdk_core");
+        let core_bin = core_root.join("bin");
+        let libraries_root = site_packages.join("_rocm_sdk_libraries_gfx120X_all");
+        let libraries_bin = libraries_root.join("bin");
+        fs::create_dir_all(&core_bin)?;
+        fs::create_dir_all(&libraries_bin)?;
+        let amdhip = core_bin.join("amdhip64_7.dll");
+        let hipblas = libraries_bin.join("hipblas.dll");
+        fs::write(&amdhip, b"test")?;
+        fs::write(&hipblas, b"test")?;
+        let payload = serde_json::json!({
+            "import_ok": true,
+            "rocm_sdk_version": "7.13.0a20260416",
+            "site_packages": site_packages,
+            "root_path": core_root,
+            "bin_path": core_bin,
+            "cmake_path": null,
+            "runtime_roots": [core_root, libraries_root],
+            "bin_paths": [core_bin, libraries_bin],
+            "library_paths": [core_bin, libraries_bin],
+            "default_target_family": "gfx120X-all",
+            "available_target_families": ["gfx120X-all"],
+            "resolved_target_family": "gfx120X-all",
+            "root_path_error": "ModuleNotFoundError: rocm_sdk_devel is not installed",
+            "packages": [
+                {"name": "rocm", "version": "7.13.0a20260416"},
+                {"name": "rocm-sdk-core", "version": "7.13.0a20260416"},
+                {"name": "rocm-sdk-libraries-gfx120X-all", "version": "7.13.0a20260416"}
+            ],
+            "library_shortnames": ["amdhip64", "hipblas"],
+            "resolved_libraries": [
+                {"shortname": "amdhip64", "paths": [amdhip]},
+                {"shortname": "hipblas", "paths": [hipblas]}
+            ],
+            "error": null
+        })
+        .to_string();
+
+        let probe = parse_rocm_sdk_probe(&payload)?;
+        validate_rocm_sdk_runtime_probe(&probe)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(probe.import_ok);
+        assert_eq!(probe.runtime_roots.len(), 2);
+        assert_eq!(probe.bin_paths.len(), 2);
+        assert_eq!(probe.resolved_target_family.as_deref(), Some("gfx120X-all"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_sdk_rejects_tarball_on_windows_before_resolution() {
+        let root = workspace_test_artifact_dir()
+            .join(format!("rocm-cli-therock-test-{}", unix_time_millis()));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let error = install_sdk(&paths, "release", "tarball", None, None, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("tarball installs are not supported on Windows V1"));
+        assert!(error.contains("rocm install sdk --format pip"));
+    }
+
+    fn test_paths(name: &str) -> (PathBuf, AppPaths) {
+        let root = workspace_test_artifact_dir().join(format!(
+            "rocm-cli-therock-test-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        (
+            root.clone(),
+            AppPaths {
+                config_dir: root.join("config"),
+                data_dir: root.join("data"),
+                cache_dir: root.join("cache"),
+            },
+        )
+    }
+
+    fn workspace_test_artifact_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("therock")
+    }
+
+    fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
+        run_test_openssl(&[
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            private_key.to_string_lossy().as_ref(),
+        ])?;
+        run_test_openssl(&[
+            "rsa",
+            "-in",
+            private_key.to_string_lossy().as_ref(),
+            "-pubout",
+            "-out",
+            public_key.to_string_lossy().as_ref(),
+        ])
+    }
+
+    fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
+        run_test_openssl(&[
+            "dgst",
+            "-sha256",
+            "-sign",
+            private_key.to_string_lossy().as_ref(),
+            "-out",
+            signature.to_string_lossy().as_ref(),
+            payload.to_string_lossy().as_ref(),
+        ])
+    }
+
+    fn run_test_openssl(args: &[&str]) -> Result<()> {
+        let output = Command::new("openssl")
+            .args(args)
+            .output()
+            .context("failed to launch openssl for signature test")?;
+        if !output.status.success() {
+            bail!(
+                "openssl signature test command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn test_runtime_manifest(
+        runtime_key: &str,
+        runtime_id: &str,
+        installed_at_unix_ms: u128,
+    ) -> InstalledRuntimeManifest {
+        InstalledRuntimeManifest {
+            runtime_key: runtime_key.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            channel: "release".to_owned(),
+            format: "pip".to_owned(),
+            family: runtime_id
+                .split_once(':')
+                .map(|(_, family)| family.to_owned())
+                .unwrap_or_else(|| "gfx120X-all".to_owned()),
+            family_source: "test".to_owned(),
+            version: "7.13.0a20260416".to_owned(),
+            install_root: PathBuf::from("runtime-root"),
+            selected_artifact_url: "https://example.invalid/rocm".to_owned(),
+            index_url: Some("https://example.invalid/simple".to_owned()),
+            tarball_file_name: None,
+            python_launcher: Some("python".to_owned()),
+            python_executable: Some("python".to_owned()),
+            pip_cache_dir: None,
+            rocm_sdk: None,
+            read_only: false,
+            imported_from: None,
+            installed_at_unix_ms,
+        }
+    }
+
+    fn write_test_runtime_manifest(
+        paths: &AppPaths,
+        manifest: &InstalledRuntimeManifest,
+    ) -> Result<()> {
+        let path = runtime_manifest_path(paths, &manifest.runtime_key);
+        fs::create_dir_all(path.parent().expect("manifest path should have parent"))?;
+        fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_version_display_mentions_embedded_build_date() {
+        assert_eq!(
+            runtime_version_display("7.14.0a20260601"),
+            "7.14.0a20260601 (build 2026-06-01)"
+        );
+        assert_eq!(
+            runtime_version_display("2.11.0+rocm7.13.0a20260416"),
+            "2.11.0+rocm7.13.0a20260416 (build 2026-04-16)"
+        );
+        assert_eq!(runtime_version_display("7.14.0"), "7.14.0");
+        assert_eq!(
+            runtime_version_build_date("7.14.0a20260230"),
+            None,
+            "invalid calendar dates should not be displayed"
         );
     }
 }

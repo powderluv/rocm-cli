@@ -1,45 +1,79 @@
 # rocm-cli
 
-`rocm-cli` is the ROCm AI Command Center CLI for AMD systems.
+ROCm AI Command Center CLI for AMD systems.
 
-Install on Linux x86_64:
+## Quick Start
+
+Install on Windows x86_64 from PowerShell:
+
+```powershell
+$script = "$env:TEMP\install-rocm-cli.ps1"; irm https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.ps1 -OutFile $script; Set-ExecutionPolicy -Scope Process Bypass -Force; & $script
+```
+
+The bootstrap installer downloads the prebuilt rocm-cli bundle and updates PATH.
+It does not require ROCm, Python, Rust, or Cargo to already be installed.
+
+Install on Linux or WSL x86_64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh | sh
 ```
 
-The installer updates your shell profile to add the install directory to `PATH` when needed.
-
-Re-running the installer replaces the previous `rocm-cli` binaries from the same install directory.
-
-Install the latest nightly on Linux x86_64:
+Start rocm-cli:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powderluv/rocm-cli/main/install.sh | sh -s -- nightly
+rocm
 ```
 
-Current repository status:
-- interactive `rocm` TUI plus non-interactive CLI commands for `doctor`, `serve`, `engines`, `install`, `update`, `automations`, `daemon`, and `uninstall`
-- `rocmd` supervisor with managed service supervision and persisted automation/watcher runtime state
-- first-party `pytorch` engine with managed venv installs, TheRock PyTorch wheel resolution, and OpenAI-compatible local serving
-- TheRock SDK resolver for `pip` and tarball installs, plus managed runtime update checks
-- vendored Codex TUI scaffold with a packaged `rocm-codex` binary for experimental interactive launch
+On first run, rocm-cli opens setup before the main screen. Choose where ROCm
+should be installed, approve the install, and wait for setup to finish.
 
-Planned product shape:
-- `rocm` chat-first TUI with deeper inline tool execution and approvals
-- TheRock-managed runtime installs with `pip` venvs by default and tarballs as an explicit option
-- native automations and watchers with broader contained sandbox execution
-- pluggable serving engines including `pytorch`, `llama.cpp`, `vllm`, `sglang`, and `atom`
+After setup, check the machine:
 
-Workspace layout:
-- `apps/rocm`: main CLI and future TUI
-- `apps/rocmd`: local supervisor and daemon entrypoint
-- `crates/rocm-core`: app paths, host summary, shared defaults
-- `crates/rocm-engine-protocol`: shared engine request and response types
-- `engines/pytorch`: first-party PyTorch serving engine
+```bash
+rocm doctor
+```
 
-Planning docs:
-- `plans/rocm-cli-implementation-plan.md`
-- `plans/rocm-cli-pytorch-engine-spec.md`
+Serve a local model:
+
+```bash
+rocm engines install pytorch
+rocm serve qwen --engine pytorch --managed
+```
+
+## Developer Checks
+
+Command-line ROCm install:
+
+```bash
+rocm install sdk --channel release --format pip
+rocm runtimes list
+```
+
+Choose one installed ROCm folder:
+
+```bash
+rocm runtimes activate <runtime_key>
+```
+
+Replace `<runtime_key>` with a key printed by `rocm runtimes list`.
+
+Install a serving engine:
+
+```bash
+rocm engines install pytorch
+```
+
+## More Docs
+
+- Testing and verification: `docs/testing.md`
+- Developer manual QA: `docs/manual-testing.md`
+- Current implementation audit: `docs/implementation-completion-audit.md`
+- Engine plugin policy: `docs/engine-plugins.md`
+- ATOM adapter: `docs/atom.md`
+- vLLM adapter: `docs/vllm.md`
+- SGLang adapter: `docs/sglang.md`
+- Implementation plan: `plans/rocm-cli-implementation-plan.md`
+- PyTorch engine spec: `plans/rocm-cli-pytorch-engine-spec.md`
 
 This is an early implementation, not a production release.

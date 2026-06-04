@@ -26,24 +26,106 @@ sha256_file() {
   fi
 }
 
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 fetch() {
   url="$1"
   output="$2"
+  failure_message="${3:-failed to download $url}"
   if command -v curl >/dev/null 2>&1; then
     if [ -t 2 ]; then
-      curl -fL --progress-bar "$url" -o "$output"
+      curl -fL --progress-bar "$url" -o "$output" || {
+        rm -f "$output"
+        fail "$failure_message"
+      }
     else
-      curl -fsSL "$url" -o "$output"
+      curl -fsSL "$url" -o "$output" || {
+        rm -f "$output"
+        fail "$failure_message"
+      }
     fi
   elif command -v wget >/dev/null 2>&1; then
     if [ -t 2 ]; then
-      wget --show-progress -O "$output" "$url"
+      wget --show-progress -O "$output" "$url" || {
+        rm -f "$output"
+        fail "$failure_message"
+      }
     else
-      wget -qO "$output" "$url"
+      wget -qO "$output" "$url" || {
+        rm -f "$output"
+        fail "$failure_message"
+      }
     fi
   else
     fail "missing curl or wget"
   fi
+}
+
+signing_public_key_path() {
+  if [ -n "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH:-}" ]; then
+    printf '%s\n' "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH}"
+    return 0
+  fi
+
+  if [ -n "${ROCM_CLI_SIGNING_PUBLIC_KEY_PEM:-}" ]; then
+    key_path="${tmp_dir}/rocm-cli-signing-public-key.pem"
+    printf '%s\n' "${ROCM_CLI_SIGNING_PUBLIC_KEY_PEM}" > "$key_path"
+    printf '%s\n' "$key_path"
+    return 0
+  fi
+
+  printf '%s\n' ""
+}
+
+verify_signature() {
+  archive="$1"
+  signature="$2"
+  public_key="$3"
+  need_cmd openssl
+  openssl dgst -sha256 -verify "$public_key" -signature "$signature" "$archive" >/dev/null 2>&1 \
+    || fail "signature verification failed"
+}
+
+installer_config_dir() {
+  if [ -n "${ROCM_CLI_CONFIG_DIR:-}" ]; then
+    printf '%s\n' "${ROCM_CLI_CONFIG_DIR}"
+  else
+    [ -n "${HOME:-}" ] || fail "unable to determine the user home directory for rocm-cli config"
+    printf '%s\n' "${HOME}/.rocm"
+  fi
+}
+
+write_minimal_config_if_missing() {
+  config_dir="$(installer_config_dir)"
+  config_path="${config_dir}/config.json"
+  if [ -f "$config_path" ]; then
+    echo "config: existing ${config_path}"
+    return
+  fi
+
+  mkdir -p "$config_dir"
+  config_tmp="${tmp_dir}/config.json"
+  cat > "$config_tmp" <<'JSON'
+{
+  "default_engine": "pytorch",
+  "telemetry": {
+    "mode": "local"
+  },
+  "permissions": {
+    "mode": "ask"
+  },
+  "setup": {
+    "completed": false
+  }
+}
+JSON
+  install -m 0600 "$config_tmp" "$config_path"
+  echo "config: created ${config_path}"
 }
 
 need_cmd tar
@@ -156,6 +238,18 @@ EOF
   printf '%s\n' "updated:${profile}"
 }
 
+ensure_installer_process_path() {
+  case ":$PATH:" in
+    *:"${INSTALL_DIR}":*)
+      return 0
+      ;;
+    *)
+      export PATH="${INSTALL_DIR}:${PATH}"
+      return 0
+      ;;
+  esac
+}
+
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -191,6 +285,7 @@ esac
 download_base="${ROCM_CLI_DOWNLOAD_BASE:-https://github.com/${REPO}/${release_path}}"
 archive_url="${download_base}/${asset_base}"
 sha_url="${archive_url}.sha256"
+sig_url="${archive_url}.sig"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -202,6 +297,7 @@ manifest_path="${INSTALL_DIR}/.rocm-cli-manifest"
 
 archive_path="${tmp_dir}/${asset_base}"
 sha_path="${archive_path}.sha256"
+sig_path="${archive_path}.sig"
 
 echo "rocm-cli installer"
 echo "  repo: ${REPO}"
@@ -217,6 +313,14 @@ expected="$(awk '{print $1}' "$sha_path" | head -n1)"
 actual="$(sha256_file "$archive_path")"
 [ "$expected" = "$actual" ] || fail "checksum verification failed"
 
+public_key_path="$(signing_public_key_path)"
+if truthy "${ROCM_CLI_REQUIRE_SIGNATURE:-0}" || [ -n "$public_key_path" ]; then
+  [ -n "$public_key_path" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+  fetch "$sig_url" "$sig_path" "required signature sidecar is missing or unavailable: $sig_url"
+  verify_signature "$archive_path" "$sig_path" "$public_key_path"
+  echo "signature verified"
+fi
+
 extract_dir="${tmp_dir}/extract"
 mkdir -p "$extract_dir"
 tar -xzf "$archive_path" -C "$extract_dir"
@@ -227,9 +331,14 @@ bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 [ -f "${bundle_dir}/bin/rocm" ] || fail "bundle did not contain bin/rocm"
 [ -f "${bundle_dir}/bin/rocmd" ] || fail "bundle did not contain bin/rocmd"
 [ -f "${bundle_dir}/bin/rocm-engine-pytorch" ] || fail "bundle did not contain bin/rocm-engine-pytorch"
+[ -f "${bundle_dir}/bin/rocm-engine-llama-cpp" ] || fail "bundle did not contain bin/rocm-engine-llama-cpp"
+[ -f "${bundle_dir}/bin/rocm-engine-atom" ] || fail "bundle did not contain bin/rocm-engine-atom"
+[ -f "${bundle_dir}/bin/rocm-engine-vllm" ] || fail "bundle did not contain bin/rocm-engine-vllm"
+[ -f "${bundle_dir}/bin/rocm-engine-sglang" ] || fail "bundle did not contain bin/rocm-engine-sglang"
 [ -f "${bundle_dir}/bin/rocm-codex" ] || fail "bundle did not contain bin/rocm-codex"
 
 mkdir -p "$INSTALL_DIR"
+write_minimal_config_if_missing
 
 if [ -f "$manifest_path" ]; then
   echo "removing previous rocm-cli install"
@@ -264,39 +373,43 @@ while IFS= read -r installed_path; do
   echo "  ${installed_path}"
 done < "$manifest_path"
 
+ensure_installer_process_path
+
 case ":$PATH:" in
   *:"${INSTALL_DIR}":*)
-    ;;
-  *)
     if [ "$UPDATE_SHELL_PATH" = "1" ]; then
       profile_path="$(profile_path_for_shell)"
       path_expr="$(path_expr_for_profile "$INSTALL_DIR")"
       profile_result="$(append_path_snippet "$profile_path" "$(shell_name)" "$path_expr")" || true
       case "$profile_result" in
         updated:*)
-          echo "shell path updated:"
+          echo "shell profile updated:"
           echo "  profile: ${profile_result#updated:}"
-          echo "  added: ${path_expr}"
-          echo "  restart your shell or run:"
-          echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+          echo "  new terminals can run: rocm"
           ;;
         unchanged:*)
-          echo "shell path already configured:"
+          echo "shell profile already configured:"
           echo "  profile: ${profile_result#unchanged:}"
           ;;
         *)
-          echo "note: ${INSTALL_DIR} is not on PATH"
-          echo "  add this to your shell profile:"
-          echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+          echo "note: ${INSTALL_DIR} is not saved in your shell profile"
+          echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
           ;;
       esac
     else
-      echo "note: ${INSTALL_DIR} is not on PATH"
-      echo "  add this to your shell profile:"
-      echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+      echo "shell profile update skipped"
+      echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
     fi
+    ;;
+  *)
+    echo "note: rocm is installed but this shell could not update PATH"
+    echo "  run: ${INSTALL_DIR}/rocm doctor"
     ;;
 esac
 
-echo "run:"
-echo "  rocm doctor"
+echo "next:"
+if [ "$UPDATE_SHELL_PATH" = "1" ]; then
+  echo "  open a new terminal, then run: rocm doctor"
+else
+  echo "  ${INSTALL_DIR}/rocm doctor"
+fi

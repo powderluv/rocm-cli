@@ -38,10 +38,75 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets
+
+      - name: Local no-fallback smoke
+        run: python scripts/smoke_local.py --skip-build
+
+      - name: Acceptance harness self-tests
+        run: |
+          python scripts/pytorch_therock_gpu_test.py --self-test
+          python scripts/llama_cpp_therock_gpu_test.py --self-test
+          python scripts/comfyui_therock_gpu_test.py --self-test
+          python scripts/local_assistant_therock_gpu_test.py --self-test
+          python scripts/vllm_therock_gpu_test.py --self-test
+          python scripts/sglang_therock_gpu_test.py --self-test
+          python scripts/atom_therock_gpu_test.py --self-test
+          python scripts/wsl_preflight.py --self-test
+
+      - name: Portable WSL build deps self-test
+        run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
+
+      - name: Release readiness self-test
+        run: python scripts/release_readiness.py --self-test
 
       - name: Acceptance install lifecycle
         run: ./scripts/acceptance-install-upgrade-tui-uninstall.sh
+
+  windows-build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace --all-targets
+
+      - name: Local no-fallback smoke
+        shell: pwsh
+        run: python .\scripts\smoke_local.py --skip-build
+
+      - name: Acceptance harness self-tests
+        shell: pwsh
+        run: |
+          python .\scripts\pytorch_therock_gpu_test.py --self-test
+          python .\scripts\llama_cpp_therock_gpu_test.py --self-test
+          python .\scripts\comfyui_therock_gpu_test.py --self-test
+          python .\scripts\local_assistant_therock_gpu_test.py --self-test
+          python .\scripts\vllm_therock_gpu_test.py --self-test
+          python .\scripts\sglang_therock_gpu_test.py --self-test
+          python .\scripts\atom_therock_gpu_test.py --self-test
+          python .\scripts\wsl_preflight.py --self-test
+
+      - name: Release readiness self-test
+        shell: pwsh
+        run: python .\scripts\release_readiness.py --self-test
+
+      - name: Check PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $null = [scriptblock]::Create((Get-Content .\install.ps1 -Raw))
+          $null = [scriptblock]::Create((Get-Content .\scripts\package-windows-release.ps1 -Raw))
+
+      - name: Acceptance install lifecycle
+        shell: pwsh
+        run: .\scripts\acceptance-install-upgrade-tui-uninstall.ps1
 
   fmt:
     runs-on: ubuntu-latest
@@ -76,7 +141,7 @@ jobs:
             ${{ runner.os }}-cargo-clippy-
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -W clippy::all
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   gpu-smoke:
     name: GPU Smoke (MI300X)
@@ -100,6 +165,30 @@ jobs:
 
       - name: Engine capabilities
         run: ./target/debug/rocm-engine-pytorch capabilities
+
+      - name: llama.cpp adapter detection
+        run: ./target/debug/rocm-engine-llama-cpp detect
+
+      - name: llama.cpp adapter capabilities
+        run: ./target/debug/rocm-engine-llama-cpp capabilities
+
+      - name: ATOM adapter detection
+        run: ./target/debug/rocm-engine-atom detect
+
+      - name: ATOM adapter capabilities
+        run: ./target/debug/rocm-engine-atom capabilities
+
+      - name: vLLM adapter detection
+        run: ./target/debug/rocm-engine-vllm detect
+
+      - name: vLLM adapter capabilities
+        run: ./target/debug/rocm-engine-vllm capabilities
+
+      - name: SGLang adapter detection
+        run: ./target/debug/rocm-engine-sglang detect
+
+      - name: SGLang adapter capabilities
+        run: ./target/debug/rocm-engine-sglang capabilities
 
       - name: Resolve large-model recipe
         run: ./target/debug/rocm-engine-pytorch resolve-model qwen32b

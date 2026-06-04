@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -71,17 +72,16 @@ def detect_device(
 ) -> tuple[str, dict[str, Any], str | None, str]:
     inventory = collect_gpu_inventory()
     if policy == "cpu_only":
-        return "cpu", inventory, "cpu_only policy selected", "cpu"
+        raise RuntimeError("PyTorch CPU serving is not offered by rocm-cli; no CPU fallback is used")
 
     if not inventory["cuda_available"]:
         message = "torch.cuda.is_available() is false"
-        if policy == "gpu_required":
-            raise RuntimeError(f"device policy requires GPU but {message}")
-        if min_gpu_mem_gb is not None and min_gpu_mem_gb >= 48:
+        if policy in {"gpu_required", "gpu_preferred"}:
             raise RuntimeError(
-                f"model requires about {min_gpu_mem_gb:.1f} GiB GPU memory and {message}"
+                f"device policy {policy} does not permit implicit CPU execution because {message}; "
+                "no CPU fallback is used"
             )
-        return "cpu", inventory, message, "cpu_fallback"
+        raise RuntimeError(f"unsupported device policy {policy}")
 
     max_single_gpu_mem_gb = inventory["max_single_gpu_mem_gb"]
     total_gpu_mem_gb = inventory["total_gpu_mem_gb"]
@@ -100,9 +100,9 @@ def detect_device(
             f"detected {max_single_gpu_mem_gb:.1f} GiB GPU memory but recipe recommends "
             f"{min_gpu_mem_gb:.1f} GiB"
         )
-        if policy == "gpu_required" or min_gpu_mem_gb >= 48:
-            raise RuntimeError(message)
-        return "cpu", inventory, message, "cpu_fallback"
+        if policy in {"gpu_required", "gpu_preferred"}:
+            raise RuntimeError(f"{message}; no CPU fallback is used")
+        raise RuntimeError(f"unsupported device policy {policy}")
 
     if inventory["gpu_count"] > 1:
         return (
@@ -129,6 +129,57 @@ def normalize_content(content: Any) -> str:
     if content is None:
         return ""
     return str(content)
+
+
+TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    tool_calls: list[dict[str, Any]] = []
+    content_parts: list[str] = []
+    cursor = 0
+    for match in TOOL_CALL_PATTERN.finditer(text):
+        content_parts.append(text[cursor:match.start()])
+        cursor = match.end()
+        raw_call = match.group(1).strip()
+        try:
+            payload = json.loads(raw_call)
+        except Exception:
+            content_parts.append(match.group(0))
+            continue
+
+        name = payload.get("name")
+        arguments = payload.get("arguments", {})
+        if isinstance(payload.get("function"), dict):
+            function = payload["function"]
+            name = name or function.get("name")
+            arguments = function.get("arguments", arguments)
+        if not isinstance(name, str) or not name.strip():
+            content_parts.append(match.group(0))
+            continue
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments.strip() else {}
+            except Exception:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        call_index = len(tool_calls)
+        tool_calls.append(
+            {
+                "id": f"call_{call_index}",
+                "type": "function",
+                "function": {
+                    "name": name.strip(),
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        )
+
+    content_parts.append(text[cursor:])
+    content = "".join(content_parts).strip()
+    return content, tool_calls
 
 
 def resolve_torch_dtype(preferred_dtype: str) -> tuple[torch.dtype | None, str]:
@@ -264,7 +315,11 @@ class Runtime:
 
         return torch.device("cuda:0")
 
-    def build_chat_prompt(self, messages: list[dict[str, Any]]) -> str:
+    def build_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> str:
         normalized_messages = [
             {
                 "role": str(message.get("role", "user")),
@@ -274,11 +329,13 @@ class Runtime:
         ]
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
-                return self.tokenizer.apply_chat_template(
-                    normalized_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                kwargs: dict[str, Any] = {
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                return self.tokenizer.apply_chat_template(normalized_messages, **kwargs)
             except Exception:
                 pass
 
@@ -286,6 +343,13 @@ class Runtime:
             f"{message['role']}: {message['content']}"
             for message in normalized_messages
         ]
+        if tools:
+            lines.insert(
+                0,
+                "system: Available tools are listed as JSON. When using a tool, return "
+                '{"name": "<tool-name>", "arguments": {}} inside <tool_call></tool_call> tags.\n'
+                f"<tools>\n{json.dumps(tools, ensure_ascii=False)}\n</tools>",
+            )
         lines.append("assistant:")
         return "\n".join(lines)
 
@@ -470,7 +534,10 @@ def create_app(runtime: Runtime) -> FastAPI:
         max_tokens = request.get("max_tokens")
         temperature = request.get("temperature")
         model = request.get("model") or runtime.args.model_ref
-        prompt = runtime.build_chat_prompt(messages)
+        tools = request.get("tools")
+        if not isinstance(tools, list):
+            tools = None
+        prompt = runtime.build_chat_prompt(messages, tools)
 
         if stream:
             return StreamingResponse(
@@ -483,6 +550,12 @@ def create_app(runtime: Runtime) -> FastAPI:
             )
 
         text = runtime.generate(prompt, max_tokens, temperature)
+        content, tool_calls = parse_tool_calls(text)
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        finish_reason = "stop"
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
         return JSONResponse(
             {
                 "id": f"chatcmpl-{runtime.args.service_id}",
@@ -491,8 +564,8 @@ def create_app(runtime: Runtime) -> FastAPI:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
             }

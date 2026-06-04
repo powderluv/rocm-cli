@@ -1,8 +1,91 @@
 # rocm-cli Implementation Plan
 
+## Current Scope Note
+
+The original plan text below contains early CPU-only and CPU-fallback ideas.
+Those are superseded for the current implementation pass by the user-facing
+no-fallback policy: GPU-required serving must fail loudly instead of falling
+back to CPU, and rocm-cli does not offer local CPU serving as a workaround for
+missing ROCm GPU support. CPU-only hosts remain useful for the TUI, provider
+chat, artifact inspection, and non-serving diagnostics, but they are not a
+reason to add CPU fallback paths to PyTorch, llama.cpp, vLLM, SGLang, or ATOM.
+
+## Current Implementation State
+
+Audited on 2026-06-03. The implementation has moved well beyond the original
+greenfield plan. Use `plans/rocm-cli-remaining-implementation-plan.md` as the
+live tracker.
+
+- Implemented locally: the Rust CLI/TUI, first-time setup, TheRock managed
+  `pip` venv installs, runtime activation/import/adopt/uninstall, bounded
+  Doctor reports, service records/logs/actions, the model registry CLI/TUI,
+  provider adapters, PyTorch/llama.cpp/vLLM engine adapters, automation
+  proposals/sandbox runner, packaging scripts, installer verification, and
+  release-readiness self-tests.
+- Bootstrap installers now cover clean machines with no ROCm, Python, Rust, or
+  Cargo installed: they install the prebuilt bundle, seed minimal config, verify
+  checksum/signature before activation, and set PATH automatically. Windows
+  persists the user PATH and updates the current PowerShell process when the
+  quick-start command is run directly; Linux/WSL writes the shell profile and
+  tells users to open a new terminal after `curl | sh`.
+- TheRock installs now use a single pinned TheRock-index transaction for
+  `rocm[libraries,devel]`, `torch`, `torchvision`, and `torchaudio`, with the
+  exact ROCm wheel suffix selected for the current Python/platform.
+- Local Windows/WSL acceptance has passed for managed TheRock install,
+  PyTorch GPU smoke, llama.cpp GPU smoke, WSL ROCDXG readiness, and WSL vLLM
+  GPU smoke on the current local AMD GPU host.
+- Current local serving caveat: saved historical `Qwen/Qwen3.5-4B` PyTorch
+  service attempts fail because the managed Transformers package does not
+  recognize the checkpoint's `qwen3_5` architecture. The short `qwen` alias now
+  resolves to the recommended `Qwen/Qwen2.5-1.5B-Instruct` PyTorch assistant
+  recipe for low-VRAM ROCm machines, with `qwen-tiny` kept as the explicit
+  Qwen2.5 0.5B smoke-test path. Explicit Qwen3.5 PyTorch requests are gated
+  before launch with a clear compatibility error.
+- Remaining gates are mostly owner/upstream/infrastructure items: production
+  signing keys and hosted indexes, privileged Linux driver acceptance, live
+  ATOM/SGLang acceptance on supported upstream GPU targets, broader GPU-family
+  CI, and a production AMD driver-update source.
+
+### Done vs Left Snapshot
+
+Done locally:
+
+- TUI, first-time setup, setup reset, navigable command screens, overlapping
+  approval/progress/detail cards, logs, Doctor, services, runtimes, update, and
+  provider/local-chat surfaces.
+- Managed TheRock wheel runtime installs with rocm-cli-owned venvs, local pip
+  cache, exact TheRock torch/runtime selection, runtime activation, import,
+  adopt, uninstall, and list-based install selection.
+- Fast setup/Doctor host detection: setup shows detected GPU name/target/package
+  without running full Doctor; Windows Doctor uses native registry/system probes
+  instead of PowerShell/CIM on the common path; native Linux uses KFD/sysfs/IP
+  discovery before any ROCm userland tool; WSL avoids duplicate host display
+  probes.
+- PyTorch, llama.cpp, vLLM, SGLang, and ATOM adapters with explicit no-CPU-
+  fallback policy. PyTorch and llama.cpp have live Windows/WSL GPU acceptance;
+  vLLM has live WSL GPU acceptance on this host.
+- Local served-model chat can use ROCm command tools and approval-routed
+  mutating actions. ComfyUI install/status/logs/start is available as a managed
+  app surface.
+- Packaging, release-readiness checks, generated-key signature verification,
+  installer lifecycle acceptance, and first-install PATH setup acceptance.
+
+Left or externally gated:
+
+- Publish repository-owned production signing keys, release secrets, hosted
+  signed metadata, hosted recipe indexes, and hosted source-policy metadata.
+- Run privileged Linux DKMS driver acceptance on supported hosts with root/sudo
+  control.
+- Run live ATOM and SGLang GPU acceptance on upstream-supported targets, or
+  after upstream support expands to the current host GPU family.
+- Expand live GPU-family CI beyond the current local RDNA4/gfx1201 and
+  self-hosted adapter detect/capabilities coverage.
+- Define a production AMD driver-update feed before wiring real driver-update
+  event detection.
+
 ## Summary
 - Build `rocm-cli` as the ROCm AI Command Center CLI for AMD systems. It should install and manage TheRock runtimes on Linux and Windows, optionally install Linux DKMS drivers through official AMD flows, run local model servers, and provide a chat-first terminal experience for ROCm/TheRock operations.
-- Make `rocm` default to an interactive TUI on a real TTY. The TUI should feel like a Codex-style interface: transcript, visible plans, tool execution, approvals, logs, and local state in one screen.
+- Make `rocm` default to an interactive TUI on a real TTY. The TUI should feel like a Codex/Claude-style control room: stable arrow-key panes for browsing, focused overlapping modal cards for decisions/progress/details, and explicit Logs screens for history.
 - Keep TheRock as the only managed runtime stream:
   - `release`: latest stable TheRock release
   - `nightly`: latest nightly for the selected platform and GPU family
@@ -17,13 +100,15 @@
 
 ## Product Goals
 - Provide a one-line bootstrap install such as `curl -fsSL ... | sh` that installs a signed `rocm` launcher into `~/.local/bin/`.
-- Work on Linux and Windows systems with an AMD GPU and on CPU-only systems.
+- Work on Linux and Windows systems with an AMD GPU; CPU-only systems remain
+  useful for TUI, diagnostics, and provider-backed chat, but not local model
+  serving.
 - Work with an existing TheRock installation or install a self-contained TheRock runtime under a user-owned prefix.
 - Detect updates every time `rocm` runs and offer to update the CLI, TheRock runtime, engines, or model recipes.
 - Translate natural language requests into structured plans and explicit tool executions.
 - Make local model serving easy:
   - `serve Qwen3.5 with vllm`
-  - `run a small local model on cpu`
+  - `serve a tiny local model on this AMD GPU`
   - `install the latest TheRock nightly for this GPU`
 - Keep privileged operations explicit and auditable.
 
@@ -83,32 +168,21 @@
 
 ### TUI Layout
 
-```text
-+--------------------------------------------------------------------------------+
-| rocm                                                                            |
-| provider: local  engine: vllm  model: Qwen3.5  therock: 7.11.x  gpu: gfx95x   |
-+---------------------------------------------+----------------------------------+
-| Transcript                                   | Status                           |
-|                                             | - Host summary                    |
-| User: serve Qwen3.5 with vllm               | - TheRock runtime                |
-|                                             | - Driver status                  |
-| Plan                                        | - Active engine                  |
-| 1. Detect GPU and runtime                   | - Active model                   |
-| 2. Verify vLLM installation                 | - Running servers                |
-| 3. Resolve model variant                    | - Update availability            |
-| 4. Launch local OpenAI endpoint             |                                  |
-|                                             | Watchers                         |
-| [Approve] [Edit] [Cancel]                   | - server-recover: healthy        |
-|                                             | - therock-update: nightly found  |
-| Tool output                                 |                                  |
-| [ok] detected gfx95x                        |                                  |
-| [ok] vllm already installed                 |                                  |
-| [stream] launching server...                |                                  |
-+---------------------------------------------+----------------------------------+
-| /doctor  /serve  /engine  /provider  /logs  /automations  /update             |
-| >                                                                      [Send]  |
-+--------------------------------------------------------------------------------+
-```
+The original transcript-and-status mockup is historical. Current TUI work should
+use these surfaces instead:
+
+- First-time setup: a dedicated setup screen before Home, with arrow-key folder
+  choices, plain approval cards, live progress, and visible install output.
+- Home and slash-command screens: stable left-side choices plus a plain-English
+  detail pane. Commands such as `/doctor`, `/runtimes`, `/engine`, `/services`,
+  `/logs`, `/comfyui`, and `/serve` should open navigable screens, not append
+  command dumps to a transcript.
+- Focused work: approvals, install/update progress, log details, connection
+  details, chat tool results, help, clear, quit, and short errors should use
+  overlapping modal cards that own keyboard focus until closed.
+- Chat: local assistant sessions can remain conversational, but ROCm command
+  results and connection details should be reachable through action rows and
+  modal cards rather than dumped inline.
 
 ### TUI Interaction Model
 - The TUI should be tool-aware, not just conversational.
@@ -118,12 +192,13 @@
   3. approval decision if needed
   4. visible tool execution
   5. summarized result
-- The transcript should show:
-  - plan cards
-  - tool call cards
-  - streaming logs
-  - final outcomes
-  - links to artifacts such as config diffs, logs, or generated manifests
+- The active screen should show:
+  - plans as navigable review screens
+  - tool calls as approval cards when they change local state
+  - live command output while the current operation is running
+  - compact final outcomes with a modal/log path for details
+  - artifacts such as config diffs, logs, or generated manifests behind
+    explicit detail rows or log views
 
 ### TUI Modes
 - `Ask`
@@ -180,6 +255,7 @@
 - `rocm install sdk --channel release|nightly [--format pip|tarball] [--prefix PATH]`
 - `rocm install driver --dkms`
 - `rocm update`
+- `rocm model`
 - `rocm engines list`
 - `rocm engines install <engine>`
 - `rocm serve <model>`
@@ -192,7 +268,7 @@
 - Input text should be accepted in both TUI and non-interactive form:
   - `rocm "serve qwen3.5 with vllm"`
   - `rocm "install the latest TheRock nightly for this GPU"`
-  - `rocm "run a small local model on cpu"`
+  - `rocm "serve a tiny local model on this AMD GPU"`
 - The planner should compile this into structured actions before execution.
 
 ## Architecture
@@ -287,6 +363,9 @@
   - place it in `~/.local/bin/`
   - write a minimal config file if none exists
   - verify checksum or signature before activation
+  - set PATH automatically for future terminals, and for the current Windows
+    PowerShell process when the installer is invoked directly
+  - avoid requiring ROCm, Python, Rust, or Cargo to be installed beforehand
 - The bootstrap should not install drivers or large runtimes by default.
 
 ### Host Detection
@@ -380,8 +459,8 @@
   - built on TheRock PyTorch wheels with a `rocm-cli` managed serving wrapper
   - should expose the same normalized endpoint contract as the other engines
 - `llama.cpp`
-  - baseline CPU fallback
-  - good for quantized local models
+  - ROCm GPU path for quantized GGUF local models
+  - fail loudly when ROCm GPU execution is unavailable
 - `vllm`
   - default ROCm GPU serving path
 - `sglang`
@@ -391,7 +470,7 @@
   - treat as experimental until packaging and compatibility mature
 - Windows engine policy:
   - default to a managed `pytorch` serving engine backed by TheRock PyTorch wheels
-  - keep `llama.cpp` available as a fallback for quantized or explicit CPU-oriented workflows
+  - keep `llama.cpp` available for quantized GGUF workflows with ROCm GPU execution
   - use GPU execution through TheRock PyTorch on supported Windows systems when a usable AMD driver is present
   - do not make `vllm`, `sglang`, or `atom` native Windows GPU serving part of the V1 promise
 
@@ -403,7 +482,7 @@
   - install compatible model-serving dependencies such as `transformers`, tokenizers, and runtime helpers
   - serve selected models through the same local API contract used by the other engines
   - prefer GPU execution on Windows when a supported AMD driver and TheRock PyTorch wheel set are present
-  - fall back to CPU execution when no usable GPU path is available
+  - fail loudly when no usable ROCm GPU path is available
 - Initial scope:
   - single-model local serving
   - chat and text-generation workloads
@@ -437,8 +516,8 @@
 - The registry should support:
   - family aliases
   - size variants
-  - CPU fallback suggestions
-  - provider fallback suggestions
+  - GPU fit explanations
+  - explicit provider-backed alternatives when local GPU serving is unavailable
 
 ### Request Resolution Flow
 - For a prompt like `serve Qwen3.5 with vllm`, the resolver should:
@@ -563,9 +642,9 @@ mode = "propose"
 | Host | Scope | Notes |
 |------|-------|-------|
 | Linux x86_64 with AMD GPU | Full V1 target | TUI, TheRock runtime, drivers, serving, automations |
-| Linux x86_64 CPU-only | Supported | TUI, provider chat, CPU serving, artifacts, no driver work |
+| Linux x86_64 CPU-only | Supported non-serving host | TUI, provider chat, artifacts, no driver work, no local model serving fallback |
 | Windows x86_64 with AMD GPU | Supported in early phases | TUI, chat, TheRock `pip` runtime, driver validation, `pytorch` local serving, provider chat; assume driver already installed, no driver installer in V1 |
-| Windows x86_64 CPU-only | Supported | TUI, provider chat, `pytorch` or `llama.cpp` local serving, TheRock wheel management where applicable |
+| Windows x86_64 CPU-only | Supported non-serving host | TUI, provider chat, TheRock wheel management where applicable, no local model serving fallback |
 | macOS | Deferred | Provider-backed chat only unless future TheRock/engine artifacts make more possible |
 
 ## Initial Windows V1 Support Table
@@ -579,7 +658,7 @@ mode = "propose"
 | Windows driver install/upgrade | Deferred | Assume driver already installed; report compatibility only |
 | Provider chat (`local`, `anthropic`, `openai`) | Supported | Same chat surface as Linux |
 | Local serving via TheRock PyTorch wheels | Supported | `pytorch` is the default native Windows engine |
-| `llama.cpp` local serving | Supported fallback | Use for quantized or explicit CPU-oriented workflows |
+| `llama.cpp` local serving | Supported GPU engine | Use for quantized GGUF workflows with ROCm GPU execution; no CPU fallback |
 | Native Windows ROCm GPU serving via `vllm` | Deferred | vLLM upstream is Linux-only today |
 | Native Windows ROCm GPU serving via `sglang` | Deferred | ROCm guidance is Linux and Docker oriented |
 | Native Windows ROCm GPU serving via `atom` | Deferred | ATOM currently documents ROCm + Docker on Linux |
@@ -631,7 +710,7 @@ mode = "propose"
 - Add engine install and service lifecycle management.
 - Exit criteria:
   - Windows local model serving works through `pytorch`
-  - CPU local model serving works through `llama.cpp` on Linux and as a fallback on Windows
+  - quantized GGUF serving works through `llama.cpp` with ROCm GPU execution
   - ROCm GPU serving works through `vllm` on Linux
 
 ### Phase 4: Chat Providers and NL Planning
@@ -647,7 +726,8 @@ mode = "propose"
 
 ### Phase 5: Model Registry and Recipe Engine
 - Ship a signed model/engine recipe index.
-- Add alias resolution, fit estimation, and fallback recommendations.
+- Add alias resolution, fit estimation, and explicit alternatives for
+  unsupported or unfit model choices.
 - Support natural language requests for common serve/install operations.
 - Exit criteria:
   - model requests resolve deterministically
@@ -677,7 +757,7 @@ mode = "propose"
 
 ### Phase 9: Hardening and Release
 - Add packaging, signatures, rollback validation, telemetry policy, and CI coverage.
-- Test against supported Linux GPU families, supported Windows GPU families, and CPU-only fallback hosts.
+- Test against supported Linux GPU families, supported Windows GPU families, and CPU-only non-serving hosts.
 - Exit criteria:
   - bootstrap install, runtime install, serving, update, and watcher flows are stable
   - release process can ship signed CLI and metadata updates
@@ -689,7 +769,7 @@ mode = "propose"
 - `rocm update` prompts for newer CLI/runtime versions.
 - `rocm serve` can launch:
   - `pytorch` using TheRock PyTorch wheels on Windows
-  - `llama.cpp` on CPU on Linux and as a fallback on Windows
+  - `llama.cpp` with ROCm GPU execution for quantized GGUF models
   - `vllm` on ROCm GPU on Linux
 - `rocm` chat mode can use:
   - `local`
@@ -706,14 +786,14 @@ mode = "propose"
 - Should remote provider chat be enabled by explicit opt-in on first use, even when API keys are already present in the environment?
 
 ## Recommended Immediate Next Steps
-- Confirm the V1 host support policy:
-  - Linux and Windows
-  - CPU-only fallback
-  - macOS deferred
-- Confirm the exact activation model for `pip` venv runtimes versus tarball system installs.
-- Confirm whether `rocm-cli` should live in its own repository or inside a TheRock-adjacent org repo.
-- After that, write:
-  - command and config spec
-  - plugin protocol spec
-  - metadata/index schema
-  - TUI interaction spec
+- Keep the local-assistant service lifecycle on the regression list rather
+  than treating it as pending implementation: Windows and WSL live acceptance
+  passed with the verified `qwen`/Qwen2.5 PyTorch recipe and ROCm tool-call
+  bridge. Re-run `scripts/local_assistant_therock_gpu_test.py` when changing
+  provider, tool-call, chat handoff, or managed-server paths.
+- Publish repository-owned production signing keys and hosted metadata/model
+  recipe/source-policy indexes.
+- Run privileged Linux driver acceptance on supported hardware with explicit
+  root/sudo control.
+- Expand GPU-family CI beyond the current local RDNA4/gfx1201 and existing
+  self-hosted adapter smoke coverage.

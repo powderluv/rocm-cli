@@ -296,7 +296,7 @@ The vendored TUI should be re-skinned and re-contextualized rather than rewritte
 - `/runtimes`
 - `/install`
 - `/update`
-- `/engines`
+- `/engine`
 - `/serve`
 - `/services`
 - `/logs`
