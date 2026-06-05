@@ -426,7 +426,14 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
     refresh_startup_update_check_quietly();
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    print!("{}", render_freeform_plan(&request, &paths, &config));
+    let plan = build_freeform_plan_with_context(&request, &paths, &config);
+    if !approve
+        && let Some(answer) = render_freeform_read_only_answer(&request, &plan, &paths, &config)?
+    {
+        print!("{answer}");
+        return Ok(());
+    }
+    print!("{}", render_structured_request_plan(&plan, &paths));
     if approve {
         execute_freeform_next_action(&request, &paths, &config)?;
     }
@@ -550,6 +557,168 @@ fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
         format_structured_tool_call("rocm", &action.args)
     );
     output
+}
+
+fn render_freeform_read_only_answer(
+    request: &str,
+    plan: &StructuredRequestPlan,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    if plan.actions.len() != 1 || plan.actions[0].approval != "not required" {
+        return Ok(None);
+    }
+    match plan.actions[0].args.as_slice() {
+        [command] if command == "doctor" => {
+            render_freeform_doctor_answer(request, paths, config).map(Some)
+        }
+        [command, subcommand] if command == "comfyui" && subcommand == "status" => {
+            render_freeform_comfyui_status_answer(paths, config).map(Some)
+        }
+        [command, subcommand] if command == "comfyui" && subcommand == "logs" => {
+            let logs = comfyui::render_logs(paths, DEFAULT_LOG_TAIL_LINES)?;
+            Ok(Some(format!("ComfyUI logs\n\n{logs}")))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn render_freeform_doctor_answer(
+    request: &str,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<String> {
+    let doctor = DoctorSummary::gather()?;
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let active = current_runtime_manifest(config, &manifests);
+    let lower = request.to_ascii_lowercase();
+    let asks_where = any_substring(&lower, &["where", "folder", "path"]);
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{}",
+        if asks_where {
+            "ROCm install location"
+        } else {
+            "ROCm status"
+        }
+    );
+    let _ = writeln!(output);
+
+    if let Some(detail) = doctor.driver.detail.as_deref() {
+        let _ = writeln!(output, "GPU: {detail}");
+    } else if let Some(target) = doctor.detected_gfx_target.as_deref() {
+        let _ = writeln!(output, "GPU: AMD GPU target {target}");
+    } else {
+        let _ = writeln!(output, "GPU: I could not identify an AMD GPU yet.");
+    }
+    if let Some(target) = doctor.detected_gfx_target.as_deref() {
+        let _ = writeln!(output, "Target: {target}");
+    }
+
+    match active {
+        Some(manifest) => {
+            let status = runtime_usability_status(manifest);
+            if status == "ready" {
+                let _ = writeln!(output, "ROCm/TheRock: installed and active for ROCm CLI");
+            } else {
+                let _ = writeln!(output, "ROCm/TheRock: found, but status is {status}");
+            }
+            let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
+            let _ = writeln!(
+                output,
+                "Version: {}",
+                therock::runtime_version_display(&manifest.version)
+            );
+            let _ = writeln!(output, "GPU package: {}", manifest.family);
+        }
+        None => {
+            let setup_root = config.setup.therock_venv.as_deref();
+            if let Some(root) = setup_root {
+                let _ = writeln!(
+                    output,
+                    "ROCm/TheRock: setup folder saved, but no active runtime is selected"
+                );
+                let _ = writeln!(output, "Folder: {}", root.display());
+            } else if manifests.len() == 1 {
+                let manifest = &manifests[0];
+                let _ = writeln!(
+                    output,
+                    "ROCm/TheRock: installed, but not selected as the active runtime"
+                );
+                let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
+                let _ = writeln!(output, "Runtime: {}", manifest.runtime_key);
+                let _ = writeln!(
+                    output,
+                    "Next step: rocm runtimes activate {}",
+                    manifest.runtime_key
+                );
+            } else if manifests.is_empty() {
+                let _ = writeln!(output, "ROCm/TheRock: not installed for ROCm CLI yet");
+                let _ = writeln!(
+                    output,
+                    "Next step: run `rocm` and choose Install ROCm, or ask to install TheRock into a folder you choose."
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "ROCm/TheRock: multiple installs found, but none is active"
+                );
+                let _ = writeln!(output, "Run `rocm runtimes list` to choose one.");
+            }
+        }
+    }
+
+    if doctor.legacy_rocm.status == "not_detected" && active.is_some() {
+        let _ = writeln!(
+            output,
+            "Note: ROCm CLI is using its managed TheRock runtime, not a global ROCm install."
+        );
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Nothing was changed.");
+    Ok(output)
+}
+
+fn render_freeform_comfyui_status_answer(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<String> {
+    let status = comfyui::render_status(paths, config)?;
+    let installed = status.contains("  installed: yes");
+    let running = status.contains("  status: running");
+    let starting = status.contains("  status: starting");
+    let mut output = String::new();
+    let _ = writeln!(output, "ComfyUI status");
+    let _ = writeln!(output);
+    if installed {
+        let _ = writeln!(output, "ComfyUI: installed");
+    } else {
+        let _ = writeln!(output, "ComfyUI: not installed yet");
+    }
+    if running {
+        let url = chat_tool_value(&status, "url").unwrap_or_else(|| "<unknown>".to_owned());
+        let _ = writeln!(output, "Running: yes");
+        let _ = writeln!(output, "URL: {url}");
+    } else if starting {
+        let _ = writeln!(output, "Running: starting");
+    } else {
+        let _ = writeln!(output, "Running: no");
+    }
+    if !installed {
+        let _ = writeln!(
+            output,
+            "To install it, ask `can you setup ComfyUI for me` or run `rocm comfyui install`."
+        );
+    } else if !running {
+        let _ = writeln!(
+            output,
+            "To open it, ask `can you start ComfyUI` or run `rocm comfyui start`."
+        );
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Nothing was changed.");
+    Ok(output)
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
@@ -10144,6 +10313,75 @@ fn build_freeform_plan_with_recipes(
         };
     }
 
+    if planner_mentions_comfyui(&lower) {
+        if any_substring(&lower, &["log", "logs"]) {
+            return StructuredRequestPlan {
+                request: trimmed.to_owned(),
+                planner: "hybrid-parser-v1".to_owned(),
+                provider_assisted: false,
+                intent: PlannerIntent::Inspect,
+                confidence: "high",
+                approval: "not required for inspection",
+                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
+                actions: vec![PlannedToolCall::read_only(
+                    "Read ComfyUI logs",
+                    vec!["comfyui".to_owned(), "logs".to_owned()],
+                    "read-only app log check",
+                )],
+                notes: Vec::new(),
+            };
+        }
+        if any_substring(&lower, &["start", "run", "launch", "open"]) {
+            return StructuredRequestPlan {
+                request: trimmed.to_owned(),
+                planner: "hybrid-parser-v1".to_owned(),
+                provider_assisted: false,
+                intent: PlannerIntent::Serve,
+                confidence: "high",
+                approval: "required before launch",
+                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
+                actions: vec![PlannedToolCall::approval_required(
+                    "Start ComfyUI",
+                    vec!["comfyui".to_owned(), "start".to_owned()],
+                    "starts a local ComfyUI process",
+                )],
+                notes: Vec::new(),
+            };
+        }
+        if planner_requests_comfyui_install(&lower) {
+            return StructuredRequestPlan {
+                request: trimmed.to_owned(),
+                planner: "hybrid-parser-v1".to_owned(),
+                provider_assisted: false,
+                intent: PlannerIntent::InstallSdk,
+                confidence: "high",
+                approval: "required before installing ComfyUI",
+                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
+                actions: vec![PlannedToolCall::approval_required(
+                    "Install ComfyUI",
+                    vec!["comfyui".to_owned(), "install".to_owned()],
+                    "installs ComfyUI into ROCm CLI's managed app folder",
+                )],
+                notes: vec!["ComfyUI uses the active ROCm CLI managed TheRock runtime.".to_owned()],
+            };
+        }
+        return StructuredRequestPlan {
+            request: trimmed.to_owned(),
+            planner: "hybrid-parser-v1".to_owned(),
+            provider_assisted: false,
+            intent: PlannerIntent::Inspect,
+            confidence: "high",
+            approval: "not required for inspection",
+            parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
+            actions: vec![PlannedToolCall::read_only(
+                "Check ComfyUI",
+                vec!["comfyui".to_owned(), "status".to_owned()],
+                "read-only app status check",
+            )],
+            notes: Vec::new(),
+        };
+    }
+
     if planner_is_install_sdk_request(&lower) {
         let channel = if lower.contains("nightly") {
             "nightly"
@@ -10746,10 +10984,17 @@ fn planner_is_inspect_request(lower: &str) -> bool {
         || contains_planner_word(lower, "check")
         || contains_planner_word(lower, "status")
         || contains_planner_word(lower, "doctor")
+        || contains_planner_word(lower, "which")
+        || contains_planner_word(lower, "where")
         || lower.contains("what is installed")
         || lower.contains("what's installed")
-        || lower.contains("is installed");
+        || lower.contains("is installed")
+        || lower.contains("is rocm installed")
+        || lower.contains("is therock installed")
+        || lower.contains("is the rock installed");
     let target = lower.contains("rocm")
+        || lower.contains("therock")
+        || lower.contains("the rock")
         || lower.contains("gpu")
         || lower.contains("driver")
         || lower.contains("setup")
@@ -10757,6 +11002,26 @@ fn planner_is_inspect_request(lower: &str) -> bool {
         || lower.contains("this computer")
         || lower.contains("this machine");
     inspectish && target
+}
+
+fn planner_mentions_comfyui(lower: &str) -> bool {
+    any_substring(lower, &["comfyui", "comfy ui", "comfy"])
+}
+
+fn planner_requests_comfyui_install(lower: &str) -> bool {
+    any_substring(
+        lower,
+        &[
+            "can you setup",
+            "can you set up",
+            "please setup",
+            "please set up",
+            "setup comfyui for me",
+            "set up comfyui for me",
+            "install comfyui",
+            "download comfyui",
+        ],
+    )
 }
 
 fn contains_planner_word(text: &str, expected: &str) -> bool {
@@ -12276,6 +12541,52 @@ mod tests {
                 .iter()
                 .all(|action| action.args == vec!["doctor".to_owned()])
         );
+    }
+
+    #[test]
+    fn hybrid_planner_routes_common_status_questions_to_read_only_inspection() {
+        for prompt in [
+            "is rocm installed?",
+            "which gpu is on my machine?",
+            "where is therock installed?",
+        ] {
+            let plan = build_freeform_plan(prompt, &RocmCliConfig::default());
+
+            assert_eq!(plan.intent, PlannerIntent::Inspect, "{prompt}");
+            assert_eq!(plan.approval, "not required for inspection", "{prompt}");
+            assert_eq!(plan.actions.len(), 1, "{prompt}");
+            assert_eq!(plan.actions[0].approval, "not required", "{prompt}");
+            assert_eq!(plan.actions[0].args, vec!["doctor".to_owned()], "{prompt}");
+        }
+    }
+
+    #[test]
+    fn hybrid_planner_routes_comfyui_help_and_actions() {
+        let status = build_freeform_plan("how do i setup comfyui", &RocmCliConfig::default());
+        assert_eq!(status.intent, PlannerIntent::Inspect);
+        assert_eq!(status.approval, "not required for inspection");
+        assert_eq!(
+            status.actions[0].args,
+            vec!["comfyui".to_owned(), "status".to_owned()]
+        );
+        assert_eq!(status.actions[0].approval, "not required");
+
+        let install =
+            build_freeform_plan("can you setup comfyui for me", &RocmCliConfig::default());
+        assert_eq!(install.approval, "required before installing ComfyUI");
+        assert_eq!(
+            install.actions[0].args,
+            vec!["comfyui".to_owned(), "install".to_owned()]
+        );
+        assert_eq!(install.actions[0].approval, "required");
+
+        let start = build_freeform_plan("can you start comfyui", &RocmCliConfig::default());
+        assert_eq!(start.approval, "required before launch");
+        assert_eq!(
+            start.actions[0].args,
+            vec!["comfyui".to_owned(), "start".to_owned()]
+        );
+        assert_eq!(start.actions[0].approval, "required");
     }
 
     #[test]

@@ -1256,6 +1256,18 @@ struct ServeCommandPlan {
 }
 
 impl ServeCommandPlan {
+    fn selected_engine<'a>(&'a self, config: &'a RocmCliConfig) -> &'a str {
+        self.engine
+            .as_deref()
+            .or(config.default_engine.as_deref())
+            .unwrap_or(default_engine_for_platform())
+    }
+
+    fn engine_manages_own_runtime(&self, config: &RocmCliConfig) -> bool {
+        self.selected_engine(config)
+            .eq_ignore_ascii_case("lemonade")
+    }
+
     fn cli_args(&self) -> Vec<String> {
         let mut args = vec!["serve".to_owned()];
         if let Some(model) = self.model.as_ref() {
@@ -4177,6 +4189,17 @@ impl App {
     }
 
     fn prepare_serve_wizard_runtime(&mut self, plan: &mut ServeCommandPlan) -> bool {
+        if plan.engine_manages_own_runtime(&self.config) {
+            plan.runtime_id = None;
+            if let Some(state) = self.serve_wizard.as_mut() {
+                state.runtime_id = None;
+                state.message = Some(
+                    "Lemonade uses its own ROCm runner. No TheRock install has to be chosen here."
+                        .to_owned(),
+                );
+            }
+            return true;
+        }
         if plan.runtime_id.is_some() || plan.env_id.is_some() {
             return true;
         }
@@ -8290,7 +8313,7 @@ impl App {
                     "Install ComfyUI",
                     "ComfyUI",
                     vec!["comfyui".to_owned(), "install".to_owned()],
-                    "I can install ComfyUI into ROCm CLI's managed app folder.\n\nReview the card before anything downloads or changes.",
+                    "Sure. I can install ComfyUI into ROCm CLI's app folder. Nothing downloads until you approve it.",
                     "Install ComfyUI into ROCm CLI's managed app folder.",
                 ))
             } else if any_substring(&lower, &["start", "run", "launch", "open"]) {
@@ -8298,7 +8321,7 @@ impl App {
                     "Start ComfyUI",
                     "ComfyUI",
                     vec!["comfyui".to_owned(), "start".to_owned()],
-                    "I can start ComfyUI and show the local URL.\n\nReview the card before anything starts.",
+                    "Sure. I can start ComfyUI and show the local URL. Nothing launches until you approve it.",
                     "Start ComfyUI locally and show its URL.",
                 ))
             } else {
@@ -8333,7 +8356,7 @@ impl App {
                     "gpu_required".to_owned(),
                     "--managed".to_owned(),
                 ],
-                "I can start the recommended low-VRAM local assistant.\n\nReview the card before anything starts.",
+                "Sure. I can start the recommended local assistant on your AMD GPU. Nothing launches until you approve it.",
                 "Start the recommended low-VRAM local assistant.",
             ))
         } else {
@@ -8356,7 +8379,7 @@ impl App {
             state.message = None;
             state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         }
-        self.status = "Review the suggested action before anything runs.".to_owned();
+        self.status = "Review the suggested action.".to_owned();
         true
     }
 
@@ -13102,20 +13125,18 @@ fn plain_update_parse_error(error: &str) -> String {
 
 fn render_serve_wizard_review(plan: &ServeCommandPlan, config: &RocmCliConfig) -> String {
     let model = plan.model.as_deref().unwrap_or("<missing>");
-    let engine = plan
-        .engine
-        .as_deref()
-        .or(config.default_engine.as_deref())
-        .unwrap_or(default_engine_for_platform());
+    let engine = plan.selected_engine(config);
     let host = plan.host.as_deref().unwrap_or(DEFAULT_LOCAL_HOST);
     let port = plan.port.unwrap_or(DEFAULT_LOCAL_PORT);
 
     let mut output = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(output, "Ready to start");
+    let _ = writeln!(output, "Start local model");
     let _ = writeln!(output, "  model: {model}");
     let _ = writeln!(output, "  engine: {engine}");
-    if let Some(runtime_id) = plan.runtime_id.as_deref() {
+    if plan.engine_manages_own_runtime(config) {
+        let _ = writeln!(output, "  runner: Lemonade manages its own ROCm runtime");
+    } else if let Some(runtime_id) = plan.runtime_id.as_deref() {
         let _ = writeln!(output, "  ROCm install: {runtime_id}");
     }
     if let Some(env_id) = plan.env_id.as_deref() {
@@ -13138,15 +13159,8 @@ fn render_serve_wizard_review(plan: &ServeCommandPlan, config: &RocmCliConfig) -
     );
     let _ = writeln!(output);
     if plan.managed {
-        let _ = writeln!(
-            output,
-            "Approve to start the local model server. It stays on this computer."
-        );
-        let _ = writeln!(
-            output,
-            "First start may download and load model files, so it can take a while."
-        );
-        let _ = writeln!(output, "Use Services and Logs after it starts.");
+        let _ = writeln!(output, "Approve to start it on this computer.");
+        let _ = writeln!(output, "First start may download model files.");
     } else {
         let _ = writeln!(
             output,
@@ -15702,6 +15716,12 @@ fn chat_input_area_height(app: &App, terminal_width: u16, terminal_height: u16) 
     wanted.max(3).min(max_height)
 }
 
+fn mouse_over_chat_input(app: &App, terminal_width: u16, terminal_height: u16, row: u16) -> bool {
+    let input_height = chat_input_area_height(app, terminal_width, terminal_height);
+    row >= terminal_height.saturating_sub(input_height.saturating_add(1))
+        && row < terminal_height.saturating_sub(1)
+}
+
 fn chat_input_visual_line_count(input: &str, cursor: usize, width: usize) -> usize {
     let lines = wrapped_input_lines(input, width).len();
     let (cursor_row, _) = wrapped_input_cursor_position(input, cursor, width);
@@ -15882,13 +15902,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         app.scroll_onboarding_install_log_by(lines);
         return;
     }
-    if app.command_screen_is_chat_session()
-        || app
-            .command_screen
-            .as_ref()
-            .is_some_and(|state| state.detail_modal.is_some())
-    {
-        if app.command_screen_is_chat_session() && !app.input.is_empty() {
+    let command_detail_modal_open = app
+        .command_screen
+        .as_ref()
+        .is_some_and(|state| state.detail_modal.is_some());
+    if app.command_screen_is_chat_session() || command_detail_modal_open {
+        let (terminal_width, terminal_height) = size().unwrap_or((0, 0));
+        if !command_detail_modal_open
+            && app.command_screen_is_chat_session()
+            && !app.input.is_empty()
+            && mouse_over_chat_input(app, terminal_width, terminal_height, mouse.row)
+        {
             app.scroll_chat_input(lines);
         } else {
             app.scroll_command_screen_detail(lines);
@@ -23823,42 +23847,43 @@ fn plain_serve_approval_lines(args: &[String]) -> Vec<String> {
             .unwrap_or(default_engine_for_platform());
         let host = plan.host.as_deref().unwrap_or(DEFAULT_LOCAL_HOST);
         let port = plan.port.unwrap_or(DEFAULT_LOCAL_PORT);
-        return vec![
-            "Start the selected local model server.".to_owned(),
+        let mut lines = vec![
+            "Start the local model.".to_owned(),
             format!(
                 "Model: {}",
                 plan.model.as_deref().unwrap_or("not chosen yet")
             ),
             format!("Engine: {engine}"),
-            plan.runtime_id
-                .as_deref()
-                .map(|runtime_id| format!("ROCm install: {runtime_id}"))
-                .or_else(|| {
-                    plan.env_id
-                        .as_deref()
-                        .map(|env_id| format!("Engine env: {env_id}"))
-                })
-                .unwrap_or_else(|| "ROCm install: active/default install".to_owned()),
+        ];
+        if engine.eq_ignore_ascii_case("lemonade") {
+            lines.push("Runner: Lemonade manages its own ROCm runtime.".to_owned());
+        } else {
+            lines.push(
+                plan.runtime_id
+                    .as_deref()
+                    .map(|runtime_id| format!("ROCm install: {runtime_id}"))
+                    .or_else(|| {
+                        plan.env_id
+                            .as_deref()
+                            .map(|env_id| format!("Engine env: {env_id}"))
+                    })
+                    .unwrap_or_else(|| "ROCm install: active/default install".to_owned()),
+            );
+        }
+        lines.extend([
             format!(
                 "Device: {}",
                 serve_wizard_device_label(serve_plan_device_policy(plan.device.as_deref()))
             ),
             format!("Address: {}", format_http_base_url(host, port)),
-            format!(
-                "Mode: {}",
-                if plan.managed {
-                    "ROCm CLI manages the server"
-                } else {
-                    "show command only"
-                }
-            ),
-            "First start may download and load model files, so it can take a while.".to_owned(),
-        ];
+            "First start may download model files.".to_owned(),
+        ]);
+        return lines;
     }
     vec![
-        "Start the selected local model server.".to_owned(),
+        "Start the local model.".to_owned(),
         "The server will use GPU ROCm support.".to_owned(),
-        "First start may download and load model files, so it can take a while.".to_owned(),
+        "First start may download model files.".to_owned(),
     ]
 }
 
@@ -24031,7 +24056,7 @@ fn running_job_modal_output_text(
 
 fn running_progress_bar(started_at: Instant) -> String {
     let width = 24usize;
-    let marker = ((started_at.elapsed().as_millis() / 150) as usize) % width;
+    let marker = ((started_at.elapsed().as_millis() / 75) as usize) % width;
     let mut bar = String::with_capacity(width + 2);
     bar.push('[');
     for index in 0..width {
@@ -25042,7 +25067,7 @@ fn chat_output_is_stream_completion_marker(rendered: &str) -> bool {
 }
 
 fn small_assistant_limit_message() -> String {
-    "I did not get a useful answer from the local assistant.\n\nThis first-run assistant is a small Qwen 0.8B model. For more advanced help, install ROCm/TheRock first; then ROCm CLI can download and start the larger local assistant.".to_owned()
+    "I did not get a useful answer from the local assistant.\n\nTry asking to check your GPU, install ROCm, install ComfyUI, or start a local model. For deeper troubleshooting, start the recommended larger assistant after ROCm/TheRock is installed.".to_owned()
 }
 
 fn chat_session_cancelled_command_text(title: &str) -> String {
@@ -38352,12 +38377,11 @@ Full log
 
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Review:"));
-        assert!(rendered.contains("Start the selected local model server."));
+        assert!(rendered.contains("Start the local model."));
         assert!(rendered.contains("Model: Qwen"));
         assert!(rendered.contains("Engine: llama.cpp"));
         assert!(rendered.contains("Address: http://"));
-        assert!(rendered.contains("Mode: ROCm CLI manages the server"));
-        assert!(rendered.contains("First start may download and load model files"));
+        assert!(rendered.contains("First start may download model files"));
         assert!(!rendered.contains("rocm serve"));
         assert!(!rendered.contains("gpu_required"));
         assert!(matches!(
@@ -38700,9 +38724,9 @@ Full log
         ));
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Review:"));
-        assert!(rendered.contains("Start the selected local model server."));
+        assert!(rendered.contains("Start the local model."));
         assert!(rendered.contains("ROCm install: release-pip-gfx120x-all-7-14-0"));
-        assert!(rendered.contains("First start may download and load model files"));
+        assert!(rendered.contains("First start may download model files"));
         assert!(!rendered.contains("rocm serve"));
         Ok(())
     }
@@ -38777,6 +38801,39 @@ Full log
         assert!(rendered.contains("Set up ROCm first"));
         assert!(rendered.contains("Local AI needs a usable ROCm install"));
         assert!(!rendered.contains("Serve failed"));
+    }
+
+    #[test]
+    fn serve_wizard_lemonade_does_not_require_therock_runtime() {
+        let mut app = test_app();
+        assert!(app.handle_command("serve"));
+        {
+            let engines = super::serve_wizard_engine_names();
+            let lemonade_index = engines
+                .iter()
+                .position(|engine| engine == "lemonade")
+                .expect("lemonade engine option");
+            let state = app.serve_wizard.as_mut().expect("serve wizard");
+            state.engine_index = lemonade_index;
+        }
+        move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
+
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.serve_wizard.is_some());
+        assert!(app.install_manager.is_none());
+        assert!(app.pending_approval.is_some());
+        assert!(app.running_job.is_none());
+        assert!(matches!(
+            app.pending_approval.as_ref().map(|pending| &pending.action),
+            Some(super::ApprovalAction::CliCommand { args, .. })
+                if args.windows(2).any(|pair| pair == ["--engine", "lemonade"])
+                    && !args.iter().any(|arg| arg == "--runtime-id")
+        ));
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Lemonade manages its own ROCm runtime"));
+        assert!(!rendered.contains("Set up ROCm first"));
+        assert!(!rendered.contains("Local AI needs a usable ROCm install"));
     }
 
     #[test]
@@ -38876,7 +38933,7 @@ Full log
         assert!(app.transcript.is_empty());
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Review:"));
-        assert!(rendered.contains("Ready to start"));
+        assert!(rendered.contains("Start local model"));
         assert!(
             app.serve_wizard
                 .as_ref()
@@ -38886,8 +38943,8 @@ Full log
         let modal = super::render_modal_approval(&app, app.pending_approval.as_ref().unwrap());
         assert!(modal.contains("tiny model.gguf"));
         assert!(modal.contains("Address: http://127.0.0.1:11436"));
-        assert!(modal.contains("Start the selected local model server."));
-        assert!(modal.contains("First start may download and load model files"));
+        assert!(modal.contains("Start the local model."));
+        assert!(modal.contains("First start may download model files"));
         assert!(!rendered.contains("rocm serve"));
         Ok(())
     }
@@ -38968,7 +39025,7 @@ Full log
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
         let rendered = render_test_terminal(&app, 120, 28);
-        assert!(rendered.contains("Ready to start"));
+        assert!(rendered.contains("Start local model"));
         let modal = super::render_modal_approval(&app, app.pending_approval.as_ref().unwrap());
         assert!(modal.contains("Address: http://localhost:11435"));
         assert!(matches!(
@@ -39018,7 +39075,7 @@ Full log
         let modal = super::render_modal_approval(&app, app.pending_approval.as_ref().unwrap());
         assert!(modal.contains("typed.gguf"));
         assert!(modal.contains("Engine: llama.cpp"));
-        assert!(modal.contains("Mode: ROCm CLI manages the server"));
+        assert!(modal.contains("Start the local model."));
         assert!(!rendered.contains("rocm serve"));
         assert!(matches!(
             app.pending_approval.as_ref().map(|pending| &pending.action),

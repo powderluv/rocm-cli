@@ -70,6 +70,12 @@ def assert_contains(text: str, needle: str, label: str) -> None:
         fail(f"{label} did not contain expected text: {needle}\n{text}")
 
 
+def assert_contains_any(text: str, needles: list[str], label: str) -> None:
+    if not any(needle in text for needle in needles):
+        expected = " or ".join(repr(needle) for needle in needles)
+        fail(f"{label} did not contain expected text: {expected}\n{text}")
+
+
 def assert_not_contains(text: str, needle: str, label: str) -> None:
     if needle in text:
         fail(f"{label} contained unexpected text: {needle}\n{text}")
@@ -305,7 +311,61 @@ def main() -> int:
     )
 
     chat = run("rocm chat local status", [rocm, "chat", "--provider", "local"], env=env)
-    assert_contains(chat, "Provider: local", "rocm chat local status")
+    assert_contains_any(
+        chat,
+        ["Provider: local", "Assistant source: local model on this computer"],
+        "rocm chat local status",
+    )
+
+    freeform_status = run(
+        "rocm freeform installed status question",
+        [rocm, "is rocm installed?"],
+        env=env,
+    )
+    assert_contains(freeform_status, "ROCm status", "rocm freeform installed status question")
+    assert_contains(
+        freeform_status,
+        "Nothing was changed.",
+        "rocm freeform installed status question",
+    )
+    assert_not_contains(
+        freeform_status,
+        "No ROCm action selected",
+        "rocm freeform installed status question",
+    )
+
+    freeform_comfy_help = run(
+        "rocm freeform comfyui help question",
+        [rocm, "how do i setup comfyui"],
+        env=env,
+    )
+    assert_contains(freeform_comfy_help, "ComfyUI status", "rocm freeform comfyui help question")
+    assert_contains(
+        freeform_comfy_help,
+        "Nothing was changed.",
+        "rocm freeform comfyui help question",
+    )
+    assert_not_contains(
+        freeform_comfy_help,
+        "No ROCm action selected",
+        "rocm freeform comfyui help question",
+    )
+
+    freeform_comfy_install = run(
+        "rocm freeform comfyui install request",
+        [rocm, "can you setup comfyui for me"],
+        env=env,
+    )
+    assert_contains(
+        freeform_comfy_install,
+        "Install ComfyUI",
+        "rocm freeform comfyui install request",
+    )
+    assert_contains(
+        freeform_comfy_install,
+        "approval: required",
+        "rocm freeform comfyui install request",
+    )
 
     plan = run(
         "rocm freeform llama plan",
