@@ -1,9 +1,13 @@
 # Bootstrap Packaging Validation
 
-This page defines the current acceptance harness for the proposed pre-TheRock
-bootstrap assistant and single-file launcher spikes. The default path is
+This page defines the current acceptance harness for historical pre-TheRock
+bootstrap assistant and self-extracting APE launcher spikes. The default path is
 offline and fixture-backed: it must not download llamafiles, GGUF weights,
 TheRock wheels, ROCm packages, or driver artifacts.
+
+For the current true no-extract Cosmopolitan binary requirement, see
+`docs/cosmopolitan-universal-binary-plan.md`. The APE launcher described here
+extracts platform-native payloads and is not the final universal binary target.
 
 ## Offline CI Harness
 
@@ -41,10 +45,11 @@ Run:
 python scripts/ape_bootstrap_package.py self-test
 ```
 
-This separate offline harness validates the current P0 single-exe contract:
+This separate offline harness validates the historical self-extracting APE
+launcher contract:
 
-- one universal AMD64 APE payload carries both Windows and Linux rocm-cli
-  release archives
+- one AMD64 APE launcher payload carries both Windows and Linux rocm-cli release
+  archives and extracts the matching platform payload
 - the bootstrap assistant model is an embedded Qwen 0.8B-class `.llamafile`
 - the bootstrap payload also includes AMD GPU helper sidecars for both
   platforms: `ggml-rocm.dll` and `ggml-rocm.so`
@@ -116,8 +121,9 @@ can be used for extraction-only development builds only with
 Use `scripts/build_single_exe_release.py standalone` for the current repeatable
 release artifact. The output is the `rocm`/`rocm.exe` binary itself: no
 self-extraction, no embedded Qwen/llamafile, no ROCm sidecars, and no vendored
-Codex binary. Running it with no arguments opens rocm-cli; on first run, the
-dedicated setup wizard appears automatically.
+Codex binary. This artifact is platform-native, not Cosmopolitan-universal.
+Running it with no arguments opens rocm-cli; on first run, the dedicated setup
+wizard appears automatically.
 
 Typical flow:
 
@@ -128,8 +134,8 @@ python scripts/build_single_exe_release.py standalone
 On Windows this writes `.rocm-work/standalone-release/rocm.exe`; on Linux it
 writes `.rocm-work/standalone-release/rocm`.
 
-The older APE commands below are historical spike tooling and are not the
-active release path:
+The older APE commands below are historical self-extracting launcher tooling
+and are not the active release path or the final no-extract Cosmopolitan target:
 
 ```bash
 python scripts/build_single_exe_release.py stage-platform --platform windows-amd64
@@ -251,9 +257,10 @@ Qwen assistant immediately. The user then chats with the assistant to choose the
 TheRock install folder and approve any `rocm install sdk --prefix PATH`
 command.
 
-## 2026-06-04 Universal APE Validation Notes
+## 2026-06-04 Self-Extracting APE Validation Notes
 
-The current P0 proof uses one canonical `cosmocc`-built artifact:
+The historical self-extracting APE proof used one canonical `cosmocc`-built
+artifact:
 
 ```text
 .rocm-work/ape-min-release/output/rocm-universal-bootstrap-release.exe

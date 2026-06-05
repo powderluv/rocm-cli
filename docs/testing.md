@@ -65,6 +65,18 @@ python scripts/ape_bootstrap_package.py self-test
 Those fixture-backed harnesses cover the superseded embedded-llamafile APE
 experiment. They are not required for the current standalone release path.
 
+Run the true no-extract Cosmopolitan feasibility probe when working on the
+universal-binary plan:
+
+```bash
+python scripts/cosmopolitan_feasibility.py self-test
+python scripts/cosmopolitan_feasibility.py probe
+```
+
+This probe reports whether the local Rust toolchain exposes a Cosmopolitan/APE
+target, whether a `cosmocc` compiler is available, and whether repo wording
+still separates platform-native binaries from self-extracting APE launchers.
+
 Run the bootstrap workflow acceptance harness:
 
 ```bash

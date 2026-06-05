@@ -24782,7 +24782,7 @@ fn bootstrap_assistant_start_prompt() -> String {
 fn bootstrap_assistant_start_prompt_for_state(has_current_install: bool) -> String {
     if has_current_install {
         return [
-            "You are the ROCm CLI bootstrap guide inside the single executable.",
+            "You are the ROCm CLI legacy bootstrap guide.",
             "Greet the user in one short paragraph.",
             "Explain that ROCm CLI found an existing ROCm/TheRock setup on this computer.",
             "Ask whether the user wants to keep using it, reinstall ROCm into a chosen folder, or uninstall the existing ROCm install.",
@@ -24794,7 +24794,7 @@ fn bootstrap_assistant_start_prompt_for_state(has_current_install: bool) -> Stri
         .join(" ");
     }
     [
-        "You are the ROCm CLI bootstrap guide inside the single executable.",
+        "You are the ROCm CLI legacy bootstrap guide.",
         "Greet the user in one short paragraph.",
         "Explain that you can prepare ROCm/TheRock on this computer using ROCm CLI commands.",
         "Ask the user where the ROCm/TheRock Python folder should live.",

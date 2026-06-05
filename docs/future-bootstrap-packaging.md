@@ -1,13 +1,17 @@
 # P0 Bootstrap And Single-File Packaging Spike
 
-Status update, 2026-06-05: this embedded-llamafile/APE bootstrap direction is
-superseded for the active `jam/updates` branch. Bootstrap now uses deterministic
-first-time setup UI, and the active single-file release artifact is the
-standalone `rocm`/`rocm.exe` binary itself. Keep the notes below as historical
-research unless the user explicitly reopens the embedded assistant path.
+Status update, 2026-06-05: this embedded-llamafile/self-extracting APE
+bootstrap direction is superseded for the active `jam/updates` branch.
+Bootstrap now uses deterministic first-time setup UI, and the active release
+artifact is the platform-native standalone `rocm`/`rocm.exe` binary itself. The
+current target for a real no-extract Cosmopolitan binary is tracked in
+`docs/cosmopolitan-universal-binary-plan.md`. Keep the notes below as
+historical research unless the user explicitly reopens the embedded assistant
+or self-extracting launcher path.
 
-This note captures the active P0 spike on the `jam/updates_exe_ape` worktree.
-The goal is a Cosmopolitan/APE-inspired single-exe bootstrap artifact that can
+This note captures the historical P0 spike on the `jam/updates_exe_ape`
+worktree. The goal was a Cosmopolitan/APE-inspired self-extracting bootstrap
+artifact that could
 start a tiny GPU-required Qwen assistant before TheRock is installed, open a
 conversation-first TUI immediately, then use approval-gated `rocm` commands to
 help with setup.
@@ -17,8 +21,8 @@ The spike has two coupled requirements:
 1. Embed a pinned Qwen 0.8B-class bootstrap model, currently targeting
    `Qwen3.5-0.8B-Q8_0.llamafile`, plus the platform ROCm sidecar libraries
    needed by llamafile GPU offload.
-2. Carry the normal rocm-cli release payloads inside one universal AMD64 APE
-   launcher, then extract and delegate to the platform's real `bin/rocm`.
+2. Carry the normal rocm-cli release payloads inside one AMD64 APE launcher,
+   then extract and delegate to the platform's real `bin/rocm`.
 
 The existing signed zip/tar release bundles remain intact until the APE path
 proves equal trust, observability, and live GPU behavior. The spike still does
@@ -341,10 +345,10 @@ This would reduce "download archive, unpack, run installer" friction without
 pretending ROCm, HIP libraries, Python wheels, or model artifacts are truly
 inside one universal executable.
 
-### Cosmopolitan-Inspired But Not Assumed
+### Cosmopolitan-Inspired Self-Extractor, Not The Final Target
 
 Cosmopolitan is attractive because its APE format can carry executable content
-and ZIP data in one file. For rocm-cli, this branch treats Cosmopolitan as the
+and ZIP data in one file. This historical branch treated Cosmopolitan as the
 launcher layer, not as a rewrite of the Rust app:
 
 - rocm-cli is Rust plus several Rust engine adapters, not a small C/C++ tool.
@@ -352,8 +356,9 @@ launcher layer, not as a rewrite of the Rust app:
 - Python environments and wheels are intentionally managed on disk.
 - Windows Authenticode signing, AV reputation, installer SmartScreen behavior,
   and enterprise policy are different from detached archive signatures.
-- A universal APE still extracts native platform binaries before running them,
-  especially for Rust binaries and engine adapters.
+- The launcher still extracts native platform binaries before running them,
+  especially for Rust binaries and engine adapters. It is a compatibility
+  self-extractor, not a true no-extract Cosmopolitan rocm-cli binary.
 
 ### Non-Goals
 

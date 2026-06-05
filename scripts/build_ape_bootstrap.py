@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build and test the rocm-cli APE bootstrap launcher.
+"""Build and test the historical self-extracting rocm-cli APE launcher.
 
 The builder consumes the manifest validated by `ape_bootstrap_package.py`,
 expands the platform release archives into an uncompressed ZIP payload, compiles
 the C launcher with `cosmocc` or a local C compiler, and appends the payload to
-the launcher executable.
+the launcher executable. The result extracts and delegates to platform-native
+Rust binaries; it is not a true no-extract Cosmopolitan build of rocm-cli.
 
 Use `--compiler` or `ROCM_CLI_APE_CC` for the compiler. Production should pass
 Cosmopolitan's `cosmocc`; the self-test uses a normal POSIX C compiler so the
@@ -477,8 +478,8 @@ def build_universal_launcher(
     extra_flags: list[str],
 ) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
-    payload = work_dir / "rocm-universal-payload-expanded.zip"
-    compiled = work_dir / ("rocm-universal-launcher-compiled.exe" if os.name == "nt" else "rocm-universal-launcher-compiled")
+    payload = work_dir / "rocm-self-extracting-ape-payload-expanded.zip"
+    compiled = work_dir / ("rocm-self-extracting-ape-compiled.exe" if os.name == "nt" else "rocm-self-extracting-ape-compiled")
     create_universal_payload(
         windows_release=windows_release,
         linux_release=linux_release,
@@ -683,15 +684,15 @@ def run_self_test(
         expect(lines == [], f"default launch should delegate to rocm with no extra args, got: {lines}")
         print("APE bootstrap builder self-test: default rocm launch accepted")
 
-        universal_output = root / ("rocm-universal-ape-test.exe" if os.name == "nt" or is_cosmopolitan_compiler(cc) else "rocm-universal-ape-test")
+        universal_output = root / ("rocm-self-extracting-ape-test.exe" if os.name == "nt" or is_cosmopolitan_compiler(cc) else "rocm-self-extracting-ape-test")
         build_universal_launcher(
             windows_release=windows_release,
             linux_release=linux_release,
             output=universal_output,
             compiler=cc,
             source=DEFAULT_LAUNCHER_SOURCE,
-            work_dir=root / "build-universal",
-            version="0.0.0-test-universal",
+            work_dir=root / "build-self-extracting-ape",
+            version="0.0.0-test-self-extracting",
             extra_flags=[],
         )
         fake_log.unlink()
@@ -704,16 +705,16 @@ def run_self_test(
             stderr=subprocess.STDOUT,
             check=False,
         )
-        expect(completed.returncode == 0, f"universal delegated rocm args failed:\n{completed.stdout}")
+        expect(completed.returncode == 0, f"self-extracting APE delegated rocm args failed:\n{completed.stdout}")
         expect(
             fake_log.read_text(encoding="utf-8").splitlines() == ["version", "--json"],
-            "universal delegated rocm argv did not match",
+            "self-extracting APE delegated rocm argv did not match",
         )
         expect(
             (Path(env["ROCM_CLI_APE_ROOT"]) / "payload" / "platform" / ("windows-amd64" if os.name == "nt" else "linux-amd64") / "bin" / ("rocm.exe" if os.name == "nt" else "rocm")).is_file(),
-            "universal platform rocm binary was not extracted",
+            "self-extracting APE platform rocm binary was not extracted",
         )
-        print("APE bootstrap builder self-test: universal launcher delegated argv accepted")
+        print("APE bootstrap builder self-test: self-extracting launcher delegated argv accepted")
 
         env["ROCM_CLI_APE_ROOT"] = str(extract_root)
         completed = subprocess.run(
@@ -763,14 +764,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Allow a non-cosmocc compiler for local launcher extraction tests only.",
     )
 
-    universal = subparsers.add_parser("build-universal", help="Build the current universal rocm launcher without bootstrap model payloads.")
+    universal = subparsers.add_parser("build-universal", help="Build the self-extracting APE compatibility launcher without bootstrap model payloads.")
     universal.add_argument("--windows-release", type=Path, required=True)
     universal.add_argument("--linux-release", type=Path, required=True)
     universal.add_argument("--output", type=Path, required=True)
     universal.add_argument("--compiler", help="C compiler path. Use cosmocc for production APE builds.")
     universal.add_argument("--source", type=Path, default=DEFAULT_LAUNCHER_SOURCE)
     universal.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-builder")
-    universal.add_argument("--version", default="0.2.0-universal")
+    universal.add_argument("--version", default="0.2.0-self-extracting")
     universal.add_argument("--cflag", action="append", default=[], help="Extra C compiler flag. Repeat as needed.")
     universal.add_argument(
         "--allow-local-compiler",
@@ -825,7 +826,7 @@ def main(argv: list[str] | None = None) -> int:
                 version=args.version,
                 extra_flags=args.cflag,
             )
-            print(f"APE bootstrap builder: wrote universal launcher {output}")
+            print(f"APE bootstrap builder: wrote self-extracting APE launcher {output}")
             alias = extensionless_wsl_alias_path(output)
             if alias is not None and alias.exists():
                 print(f"APE bootstrap builder: wrote WSL alias {alias}")

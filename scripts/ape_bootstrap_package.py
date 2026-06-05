@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Validate and stage the P0 APE bootstrap package contract.
+"""Validate and stage the historical self-extracting APE bootstrap contract.
 
 This is an offline packaging harness. It does not download Cosmopolitan,
-llamafile, Qwen weights, TheRock wheels, or ROCm artifacts. It makes the
-single-exe requirement testable before a production APE builder is wired in:
+llamafile, Qwen weights, TheRock wheels, or ROCm artifacts. It makes the old
+self-extracting launcher requirement testable:
 
-- one universal AMD64 APE artifact carries Windows and Linux rocm-cli release
-  payloads;
+- one AMD64 APE launcher carries Windows and Linux rocm-cli release payloads
+  and extracts the matching platform payload;
 - the bootstrap assistant payload embeds a pinned Qwen 0.8B-class llamafile;
 - startup is loopback-only, OpenAI/Jinja tool-call ready, AMD GPU-required, and
   never CPU fallback;
 - production packaging must prove GPU execution from logs/health, not just a
   process start.
+
+This harness does not validate the current true no-extract Cosmopolitan binary
+target. See docs/cosmopolitan-universal-binary-plan.md for that path.
 """
 
 from __future__ import annotations
@@ -476,9 +479,14 @@ def validate_manifest(manifest: dict[str, Any], *, base_dir: Path | None = None)
     ape = manifest.get("ape")
     expect(isinstance(ape, dict), "ape must be an object")
     expect(ape.get("kind") == "cosmopolitan_ape", "ape.kind must be cosmopolitan_ape")
+    expect(
+        ape.get("contract") == "self_extracting_delegating_launcher",
+        "ape.contract must be self_extracting_delegating_launcher",
+    )
     expect(ape.get("target") == "universal-amd64", "ape.target must be universal-amd64")
     expect(ape.get("payload_layout") == "zipaligned-uncompressed", "ape.payload_layout must be zipaligned-uncompressed")
     expect(ape.get("extracts_release_archive") is True, "ape.extracts_release_archive must be true")
+    expect(ape.get("true_no_extract") is False, "ape.true_no_extract must be false")
 
     release_archives = manifest.get("release_archives")
     expect(isinstance(release_archives, list) and release_archives, "release_archives must be a non-empty list")
@@ -526,7 +534,7 @@ def validate_manifest(manifest: dict[str, Any], *, base_dir: Path | None = None)
     validate_size_budget(manifest, release_sizes, model_size, backend_sizes, runtime_dependency_sizes)
     return [
         "manifest schema ok",
-        "universal APE target ok",
+        "self-extracting APE launcher target ok",
         "Windows and Linux release payloads ok",
         "embedded Qwen 0.8B llamafile ok",
         "embedded ROCm llamafile backends ok",
@@ -687,8 +695,10 @@ def build_manifest(
             "kind": "cosmopolitan_ape",
             "target": "universal-amd64",
             "entrypoint": "rocm-cli-ape-launcher",
+            "contract": "self_extracting_delegating_launcher",
             "payload_layout": "zipaligned-uncompressed",
             "extracts_release_archive": True,
+            "true_no_extract": False,
             "launcher_overhead_estimate": 16 * 1024 * 1024,
             "max_windows_executable_size": DEFAULT_WINDOWS_SIZE_CAP,
         },
@@ -874,7 +884,15 @@ def run_self_test(root: Path) -> None:
         expect("embedded ROCm llamafile backends ok" in messages, "valid manifest did not validate ROCm backends")
         expect("embedded ROCm runtime dependencies ok" in messages, "valid manifest did not validate ROCm runtime dependencies")
         expect("post-TheRock CLI self-install handoff ok" in messages, "valid manifest did not validate CLI self-install handoff")
-        print("APE bootstrap self-test: valid P0 manifest accepted")
+        print("APE bootstrap self-test: historical self-extracting manifest accepted")
+
+        bad_contract = copy.deepcopy(manifest)
+        del bad_contract["ape"]["contract"]
+        expect_rejected("missing self-extracting contract", lambda: validate_manifest(bad_contract))
+
+        bad_true_no_extract = copy.deepcopy(manifest)
+        bad_true_no_extract["ape"]["true_no_extract"] = True
+        expect_rejected("false true-no-extract claim", lambda: validate_manifest(bad_true_no_extract))
 
         model_exe = root / "inputs" / f"{DEFAULT_MODEL_NAME}.exe"
         create_fake_model(model_exe)
