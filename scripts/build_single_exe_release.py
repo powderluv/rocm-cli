@@ -32,6 +32,7 @@ WINDOWS_BINARIES = [
     "rocmd.exe",
     "rocm-engine-pytorch.exe",
     "rocm-engine-llama-cpp.exe",
+    "rocm-engine-lemonade.exe",
     "rocm-engine-atom.exe",
     "rocm-engine-vllm.exe",
     "rocm-engine-sglang.exe",

@@ -1737,6 +1737,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocm-engine-lemonade"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rocm-core",
+ "rocm-engine-protocol",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "rocm-engine-llama-cpp"
 version = "0.2.0"
 dependencies = [
@@ -2443,6 +2456,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]

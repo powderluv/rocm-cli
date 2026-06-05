@@ -310,7 +310,8 @@ python scripts/pytorch_therock_gpu_test.py --self-test
 
 This opt-in test verifies that rocm-cli can install or reuse its managed
 ComfyUI app, start it through the active TheRock ROCm runtime, reach the local
-ComfyUI HTTP endpoint, and report status/logs without CPU fallback.
+ComfyUI HTTP endpoint, report status/logs, and stop the launched process
+without CPU fallback.
 
 Run the offline harness self-test:
 
@@ -331,11 +332,31 @@ To reuse an already installed ComfyUI app without reinstalling dependencies:
 python scripts/comfyui_therock_gpu_test.py --skip-install
 ```
 
+To run a real image-generation smoke test, add `--generate-cat`. The harness
+places a safetensors checkpoint in ComfyUI's checkpoint folder when needed,
+submits a cat text-to-image workflow through the ComfyUI HTTP API, waits for
+history completion, downloads the PNG, and rejects CPU-only device reports:
+
+```bash
+python scripts/comfyui_therock_gpu_test.py --generate-cat --output-dir .rocm-work/tests/comfyui-cat
+```
+
 The live test uses `rocm comfyui install`, `rocm comfyui start`, `rocm comfyui
-status`, and `rocm comfyui logs`. It starts ComfyUI with `--no-open-browser`,
-waits for `/system_stats`, verifies that `rocm comfyui status` says
-`status: running`, and stops the process it started unless `--keep-running` is
-set.
+status`, `rocm comfyui logs`, and `rocm comfyui stop`. It starts ComfyUI with
+`--no-open-browser`, waits for `/system_stats`, verifies that
+`rocm comfyui status` says `status: running`, and stops the process it started
+unless `--keep-running` is set.
+
+For WSL, run from the WSL filesystem instead of `/mnt`:
+
+```bash
+cd /home/$USER/rocm-cli-work/rocm-cli
+CARGO_TARGET_DIR=/home/$USER/rocm-cli-work/target-linux cargo build -p rocm
+python3 scripts/comfyui_therock_gpu_test.py \
+  --rocm /home/$USER/rocm-cli-work/target-linux/debug/rocm \
+  --temp-state \
+  --generate-cat
+```
 
 ## Runtime Selection And Activation
 

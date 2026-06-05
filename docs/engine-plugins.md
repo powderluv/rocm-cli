@@ -14,9 +14,15 @@ binary name in the form `rocm-engine-<engine>` on Linux/WSL and
 `rocm-engine-llama-cpp` on Linux/WSL and `rocm-engine-llama-cpp.exe` on
 Windows.
 
-Packaged first-party adapters are `pytorch`, `llama.cpp`, `atom`, `vllm`, and
-`sglang`. Linux/WSL-only ROCm GPU adapters fail explicitly on native Windows
-instead of selecting a CPU fallback.
+Packaged first-party adapters are `pytorch`, `llama.cpp`, `lemonade`, `atom`,
+`vllm`, and `sglang`. Linux/WSL-only ROCm GPU adapters fail explicitly on
+native Windows instead of selecting a CPU fallback.
+
+The `lemonade` adapter uses Lemonade embeddable and requires Lemonade's
+`llamacpp:rocm` backend. Windows ROCm serving is validated. WSL is currently
+blocked by Lemonade v10.6.0 reporting no AMD GPU through its own detector even
+when TheRock/librocdxg works; rocm-cli does not use CPU or Vulkan fallback for
+that path.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

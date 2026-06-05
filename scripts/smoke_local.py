@@ -117,6 +117,7 @@ def binary_paths(root: Path, profile: str, target_dir: Path | None = None) -> di
         "rocmd": binary_dir / exe_name("rocmd"),
         "pytorch": binary_dir / exe_name("rocm-engine-pytorch"),
         "llama": binary_dir / exe_name("rocm-engine-llama-cpp"),
+        "lemonade": binary_dir / exe_name("rocm-engine-lemonade"),
         "atom": binary_dir / exe_name("rocm-engine-atom"),
         "vllm": binary_dir / exe_name("rocm-engine-vllm"),
         "sglang": binary_dir / exe_name("rocm-engine-sglang"),

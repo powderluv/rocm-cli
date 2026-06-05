@@ -37,8 +37,12 @@ The branch currently has local implementations for the V1 product surfaces:
 - Local assistant chat against a managed local server, with ROCm tool calls,
   approval routing for mutating actions, and visible tool results/details in
   the TUI.
-- ComfyUI install/status/logs/start as a managed app surface using the active
-  TheRock runtime.
+- ComfyUI install/status/logs/start/stop as a managed app surface using the
+  active TheRock runtime, with live Windows and WSL GPU cat-generation
+  acceptance through the ComfyUI HTTP API.
+- Lemonade embeddable is available as a strict ROCm engine on Windows. WSL
+  Lemonade GPU serving remains gated on Lemonade's own WSL `/dev/dxg` AMD GPU
+  detection; rocm-cli does not use CPU or Vulkan fallback.
 - vLLM, SGLang, and ATOM adapter packaging and explicit platform/support gates
   with no CPU fallback.
 - Automations, reviewed proposals, watcher policy routing, sandbox runner, MCP
@@ -58,6 +62,7 @@ The branch currently has local implementations for the V1 product surfaces:
 | Privileged Linux driver install acceptance | Distro plans, preflight checks, approval boundaries, execution state, and reconcile commands exist. | Live DKMS acceptance needs a supported Linux host with root/sudo control and compatible driver state. |
 | ATOM live GPU acceptance | Adapter packaging, managed TheRock environment propagation, and offline exact-runtime selector tests exist. | Live acceptance needs upstream-supported ATOM GPU targets. Current local `gfx1201` host is not an upstream ATOM target. |
 | SGLang live GPU acceptance | Adapter packaging, managed-runtime parity, explicit Windows gate, and offline selector tests exist. | Current local `gfx1201` host is blocked by upstream SGLang ROCm kernel support. |
+| Lemonade WSL GPU serving | The adapter is implemented and Windows ROCm validation passes. WSL TheRock/librocdxg works independently. | Lemonade v10.6.0 reports no AMD GPU and marks `llamacpp:rocm` unsupported under WSL before model load. |
 | Broader GPU-family CI | Normal Linux/Windows CI, local no-fallback smoke, self-hosted adapter detect/capabilities smoke, and local RDNA4 Windows/WSL acceptance exist. | More live serving coverage needs additional CI hardware or lab machines. |
 | Production driver-update feed | Local update-available event handling and reviewed driver-plan proposals exist. | A real AMD driver update source/feed must be defined before wiring production event detection. |
 | Future contained mutating actions | Current contained read-only checks and reviewed mutating proposals exist. | Additional mutating automation actions need explicit product requirements before implementation. |

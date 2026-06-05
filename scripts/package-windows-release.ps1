@@ -168,6 +168,7 @@ Copy-RequiredFile (Join-Path $binaryDir "rocm.exe") (Join-Path $bundleBin "rocm.
 Copy-RequiredFile (Join-Path $binaryDir "rocmd.exe") (Join-Path $bundleBin "rocmd.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-pytorch.exe") (Join-Path $bundleBin "rocm-engine-pytorch.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-llama-cpp.exe") (Join-Path $bundleBin "rocm-engine-llama-cpp.exe")
+Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-lemonade.exe") (Join-Path $bundleBin "rocm-engine-lemonade.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-atom.exe") (Join-Path $bundleBin "rocm-engine-atom.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-vllm.exe") (Join-Path $bundleBin "rocm-engine-vllm.exe")
 Copy-RequiredFile (Join-Path $binaryDir "rocm-engine-sglang.exe") (Join-Path $bundleBin "rocm-engine-sglang.exe")

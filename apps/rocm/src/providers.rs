@@ -12,6 +12,7 @@ pub(crate) const ROCM_TOOL_SCHEMA_ID: &str = "rocm-tools-v0";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ALIAS: &str = "qwen";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = "Qwen/Qwen2.5-1.5B-Instruct";
 pub(crate) const BOOTSTRAP_ASSISTANT_MODEL_ID: &str = "Qwen/Qwen3.5-0.8B-Q8_0-llamafile";
+pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-0.6B-GGUF";
 const LOCAL_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -486,6 +487,9 @@ fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
         || service
             .canonical_model_id
             .eq_ignore_ascii_case(BOOTSTRAP_ASSISTANT_MODEL_ID)
+        || service
+            .canonical_model_id
+            .eq_ignore_ascii_case(LEMONADE_ASSISTANT_MODEL_ID)
 }
 
 fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
@@ -2044,6 +2048,38 @@ mod tests {
 
         assert_eq!(selected.service_id, "svc-bootstrap-qwen");
         assert_eq!(selected.canonical_model_id, BOOTSTRAP_ASSISTANT_MODEL_ID);
+        assert_eq!(status.auth_status, "ready");
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_accepts_lemonade_qwen_assistant() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-lemonade-qwen");
+        paths.ensure()?;
+
+        let mut lemonade = ManagedServiceRecord::new(
+            &paths,
+            "svc-lemonade-qwen",
+            "lemonade",
+            "lemonade-qwen",
+            LEMONADE_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            11435,
+            "managed",
+            124,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        lemonade.status = "ready".to_owned();
+        lemonade.write()?;
+
+        let selected = select_local_chat_service(&paths, None)?;
+        let status = provider_status(&paths, "local")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(selected.service_id, "svc-lemonade-qwen");
+        assert_eq!(selected.canonical_model_id, LEMONADE_ASSISTANT_MODEL_ID);
         assert_eq!(status.auth_status, "ready");
         Ok(())
     }

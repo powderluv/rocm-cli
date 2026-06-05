@@ -1361,6 +1361,10 @@ fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
             "GGUF serving with ROCm GPU required by rocm-cli",
         ),
         (
+            "lemonade",
+            "embedded Lemonade server with ROCm llama.cpp backend",
+        ),
+        (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
@@ -3098,7 +3102,7 @@ fn supervise_service(
         &record.service_id,
         &record.host,
         record.port,
-        Duration::from_secs(5),
+        Duration::from_secs(180),
     ) {
         record.status = "ready".to_owned();
         record.write()?;
@@ -8453,16 +8457,13 @@ fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
 fn wait_for_service_ready(
     engine: &str,
     service_id: &str,
-    host: &str,
-    port: u16,
+    _host: &str,
+    _port: u16,
     timeout: Duration,
 ) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if engine_healthcheck_ready(engine, service_id).unwrap_or(false) {
-            return true;
-        }
-        if wait_for_port(host, port, Duration::from_millis(200)) {
             return true;
         }
         thread::sleep(Duration::from_millis(200));

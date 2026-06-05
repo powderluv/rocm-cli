@@ -272,6 +272,7 @@ enum ComfyuiCommand {
         #[arg(long)]
         no_open_browser: bool,
     },
+    Stop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1212,7 +1213,7 @@ fn render_codex_bridge_instructions(
     writeln!(&mut text, "- `rocm engines install pytorch`").ok();
     writeln!(
         &mut text,
-        "- `rocm serve <model> [--engine pytorch|llama.cpp|vllm|sglang] [--foreground|--managed]`"
+        "- `rocm serve <model> [--engine pytorch|llama.cpp|lemonade|vllm|sglang] [--foreground|--managed]`"
     )
     .ok();
     writeln!(&mut text, "- `rocm automations list|enable|disable`").ok();
@@ -2648,7 +2649,8 @@ fn engines(command: EnginesCommand) -> Result<()> {
         } => {
             let paths = AppPaths::discover()?;
             let mut config = RocmCliConfig::load(&paths)?;
-            let runtime_id = resolve_engine_install_runtime_id(&paths, &config, runtime_id)?;
+            let runtime_id =
+                resolve_engine_install_runtime_id(&paths, &config, &engine, runtime_id)?;
             let response = engine_request::<_, InstallResponse>(
                 Some(&paths),
                 &engine,
@@ -2756,8 +2758,12 @@ fn engines(command: EnginesCommand) -> Result<()> {
 fn resolve_engine_install_runtime_id(
     paths: &AppPaths,
     config: &RocmCliConfig,
+    engine: &str,
     runtime_id: Option<String>,
 ) -> Result<String> {
+    if engine_manages_own_runtime(engine) {
+        return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine).to_owned()));
+    }
     let Some(selector) = runtime_id
         .or_else(|| config.active_runtime_key.clone())
         .or_else(|| config.default_runtime_id.clone())
@@ -2767,6 +2773,17 @@ fn resolve_engine_install_runtime_id(
         );
     };
     resolve_runtime_selector_to_exact_key(paths, &selector, "engine install runtime selection")
+}
+
+fn engine_manages_own_runtime(engine: &str) -> bool {
+    engine == "lemonade"
+}
+
+fn managed_engine_runtime_id(engine: &str) -> &'static str {
+    match engine {
+        "lemonade" => "lemonade-embeddable-10.6.0",
+        _ => "managed-engine-runtime",
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3094,6 +3111,7 @@ fn serve(
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
         && resolved_selection.env_id.is_none()
+        && !engine_manages_own_runtime(&selected_engine)
     {
         bail!(
             "device_policy: {}; no active ROCm runtime is configured; run `rocm runtimes list` and `rocm runtimes activate <runtime_key>`, or pass --runtime-id/--env-id",
@@ -3224,9 +3242,9 @@ fn start_managed_service(
         bail!("rocmd exited immediately; inspect {}", log_path.display());
     }
 
-    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
-    let readiness = wait_for_port(host, port, Duration::from_secs(5));
     let manifest_path = paths.service_manifest_path(service_id);
+    let readiness = wait_for_managed_service_ready(&manifest_path, Duration::from_secs(185));
+    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     let manifest = fs::read(&manifest_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ManagedServiceRecord>(&bytes).ok());
@@ -3265,6 +3283,23 @@ fn start_managed_service(
         Some(service_id),
     );
     Ok(())
+}
+
+fn wait_for_managed_service_ready(manifest_path: &Path, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(bytes) = fs::read(manifest_path)
+            && let Ok(record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
+        {
+            match record.status.as_str() {
+                "ready" => return true,
+                "failed" | "stopped" => return false,
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3492,6 +3527,31 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
                     "comfyui_start",
                     "error",
                     format!("ComfyUI start failed: {error}"),
+                    None,
+                );
+                Err(error)
+            }
+        },
+        ComfyuiCommand::Stop => match comfyui::stop(&paths) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "info",
+                    "ComfyUI stop requested",
+                    None,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "error",
+                    format!("ComfyUI stop failed: {error}"),
                     None,
                 );
                 Err(error)
@@ -5585,7 +5645,7 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["pytorch", "llama.cpp", "vllm", "sglang", "atom"] {
+        for engine in ["pytorch", "llama.cpp", "lemonade", "vllm", "sglang", "atom"] {
             if normalized.contains(engine) {
                 return Some(providers::ChatToolCall {
                     id: Some("fallback-config-default-engine".to_owned()),
@@ -5971,7 +6031,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"pytorch\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], or [\"comfyui\",\"start\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer the recommended low-VRAM assistant model qwen when available, which maps to Qwen/Qwen2.5-1.5B-Instruct, with PyTorch and gpu_required. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"pytorch\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer the recommended low-VRAM assistant model qwen when available, which maps to Qwen/Qwen2.5-1.5B-Instruct, with PyTorch and gpu_required. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 
 const ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's first-time setup helper for AMD ROCm/TheRock. Your job is narrow: help the user check this computer, choose a ROCm/TheRock Python folder, install ROCm/TheRock into that folder, keep an existing ROCm setup, or uninstall a ROCm CLI-managed setup. Speak in short, simple English for non-technical users. Treat the conversation state as important: if the user has already chosen a folder, preserve it exactly; if ROCm CLI says an install already exists, ask whether to keep using it, reinstall into a chosen folder, or uninstall it. Allowed tool use: doctor, gpu_snapshot, bridge_snapshot, path_exists, update_check, install_sdk_dry_run, install_sdk, and rocm_command only for doctor, version, config show, runtimes list, runtimes uninstall, setup reset, or install sdk. For ROCm/TheRock installs, never invent a default folder. If the user asks to install or reinstall without a folder, ask them to choose a folder; ROCm CLI may open a folder picker for them. If the user gives a folder, request install sdk with --channel release --format pip --prefix PATH, preserving any requested --build-date YYYY-MM-DD or --version VERSION. Read-only checks may run immediately. Installs, reinstalls, uninstalls, and setup reset require a ROCm CLI review card before anything changes. Do not help install or manage ComfyUI, llama.cpp, vLLM, sglang, engines, model servers, automations, provider keys, or settings during first-time setup; tell the user those are available after ROCm is ready in the main assistant. Do not request shell commands, package managers, public network binding, or CPU fallback. Do not describe ROCm as anything other than AMD ROCm/TheRock.";
 
@@ -6659,6 +6719,13 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "ComfyUI".to_owned(),
             })
         }
+        Some("comfyui") if second.as_deref() == Some("stop") => {
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Stop ComfyUI".to_owned(),
+                command_title: "ComfyUI".to_owned(),
+            })
+        }
         Some(command) => bail!("local assistant cannot use unsupported rocm command `{command}`"),
         None => bail!("rocm_command requires at least one argument"),
     }
@@ -7105,7 +7172,7 @@ fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
 fn is_engine_status_line(line: &str) -> bool {
     matches!(
         line.split_once(':').map(|(engine, _)| engine),
-        Some("pytorch" | "llama.cpp" | "vllm" | "sglang" | "atom")
+        Some("pytorch" | "llama.cpp" | "lemonade" | "vllm" | "sglang" | "atom")
     )
 }
 
@@ -10989,6 +11056,10 @@ pub(crate) fn engine_inventory() -> &'static [(&'static str, &'static str)] {
         ("pytorch", "default local serving engine"),
         ("llama.cpp", "external GGUF serving engine for llama-server"),
         (
+            "lemonade",
+            "embedded Lemonade server with ROCm llama.cpp backend",
+        ),
+        (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
@@ -11004,7 +11075,7 @@ pub(crate) fn engine_inventory() -> &'static [(&'static str, &'static str)] {
 }
 
 fn infer_engine_from_request(lower: &str) -> Option<&str> {
-    for engine in ["pytorch", "llama.cpp", "vllm", "sglang", "atom"] {
+    for engine in ["pytorch", "llama.cpp", "lemonade", "vllm", "sglang", "atom"] {
         if lower.contains(engine) {
             return Some(engine);
         }
@@ -14197,6 +14268,7 @@ install therock";
         Cli::try_parse_from(["rocm", "comfyui", "status"]).expect("comfyui status should parse");
         Cli::try_parse_from(["rocm", "comfyui", "logs", "--lines", "3"])
             .expect("comfyui logs should parse");
+        Cli::try_parse_from(["rocm", "comfyui", "stop"]).expect("comfyui stop should parse");
         Cli::try_parse_from(["rocm", "comfy", "logs"]).expect("comfy alias should parse");
     }
 
@@ -15004,10 +15076,15 @@ VERSION_ID="41"
     #[test]
     fn engine_install_runtime_selection_requires_configured_runtime() -> Result<()> {
         let (root, paths) = test_paths("engine-install-runtime-selection");
-        let error = resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), None)
-            .unwrap_err()
-            .to_string();
+        let error =
+            resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "pytorch", None)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("no active ROCm runtime is configured"));
+        assert_eq!(
+            resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "lemonade", None)?,
+            "lemonade-embeddable-10.6.0"
+        );
         write_test_pip_runtime(
             &paths,
             "release-pip-gfx120x-all",
@@ -15021,13 +15098,14 @@ VERSION_ID="41"
             ..RocmCliConfig::default()
         };
         assert_eq!(
-            resolve_engine_install_runtime_id(&paths, &config, None)?,
+            resolve_engine_install_runtime_id(&paths, &config, "pytorch", None)?,
             "release-pip-gfx120x-all"
         );
         assert_eq!(
             resolve_engine_install_runtime_id(
                 &paths,
                 &config,
+                "pytorch",
                 Some("therock-release:gfx120X-all".to_owned())
             )?,
             "release-pip-gfx120x-all"
@@ -15058,7 +15136,7 @@ VERSION_ID="41"
             ..RocmCliConfig::default()
         };
 
-        let error = resolve_engine_install_runtime_id(&paths, &config, None)
+        let error = resolve_engine_install_runtime_id(&paths, &config, "pytorch", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("matches multiple installed runtimes"));

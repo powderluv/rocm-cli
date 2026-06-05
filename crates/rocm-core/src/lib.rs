@@ -3714,6 +3714,35 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
             ],
         },
         ModelRecipeRecord {
+            canonical_model_id: "Qwen3-0.6B-GGUF".to_owned(),
+            aliases: vec![
+                "lemonade-qwen".to_owned(),
+                "qwen-gguf".to_owned(),
+                "qwen3-0.6b-gguf".to_owned(),
+            ],
+            task: "chat".to_owned(),
+            source: "recipe_index".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llamacpp".to_owned(),
+            trust_remote_code: false,
+            dtype: "gguf".to_owned(),
+            device_policy: "gpu_required".to_owned(),
+            min_gpu_mem_gb: Some(2),
+            recommended_system_ram_gb: Some(4),
+            quantization: Some("GGUF; Lemonade llama.cpp ROCm backend".to_owned()),
+            artifact_hint: Some(
+                "Lemonade model id resolved and downloaded by the Lemonade engine".to_owned(),
+            ),
+            artifacts: Vec::new(),
+            engine_recipes: Vec::new(),
+            manual_alternatives: vec!["qwen".to_owned(), "qwen-tiny".to_owned()],
+            chat_template_mode: "lemonade".to_owned(),
+            preferred_engines: vec!["lemonade".to_owned()],
+            warnings: vec![
+                "tiny Lemonade GGUF assistant path for low-VRAM ROCm machines".to_owned(),
+            ],
+        },
+        ModelRecipeRecord {
             canonical_model_id: "Qwen/Qwen3.5-4B".to_owned(),
             aliases: vec!["qwen3.5".to_owned(), "qwen3.5-4b".to_owned()],
             task: "chat".to_owned(),
@@ -4858,6 +4887,11 @@ mod tests {
         let qwen35 = resolve_builtin_model_recipe("qwen3.5").expect("qwen3.5 alias should resolve");
         assert_eq!(qwen35.canonical_model_id, "Qwen/Qwen3.5-4B");
         assert_eq!(qwen35.preferred_engines, vec!["vllm"]);
+        let lemonade_qwen =
+            resolve_builtin_model_recipe("lemonade-qwen").expect("lemonade qwen alias");
+        assert_eq!(lemonade_qwen.canonical_model_id, "Qwen3-0.6B-GGUF");
+        assert_eq!(lemonade_qwen.preferred_engines, vec!["lemonade"]);
+        assert_eq!(lemonade_qwen.device_policy, "gpu_required");
         assert!(
             qwen35
                 .warnings

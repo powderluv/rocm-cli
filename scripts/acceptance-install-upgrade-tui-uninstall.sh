@@ -106,7 +106,7 @@ expect_failure() {
 }
 
 echo "acceptance: build release binaries"
-(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang)
+(cd "${REPO_ROOT}" && cargo build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang)
 
 echo "acceptance: generate signing key"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${SIGNING_PRIVATE_KEY}" >/dev/null 2>&1 \
@@ -252,6 +252,7 @@ assert_file "${INSTALL_DIR}/rocm"
 assert_file "${INSTALL_DIR}/rocmd"
 assert_file "${INSTALL_DIR}/rocm-engine-pytorch"
 assert_file "${INSTALL_DIR}/rocm-engine-llama-cpp"
+assert_file "${INSTALL_DIR}/rocm-engine-lemonade"
 assert_file "${INSTALL_DIR}/rocm-engine-atom"
 assert_file "${INSTALL_DIR}/rocm-engine-vllm"
 assert_file "${INSTALL_DIR}/rocm-engine-sglang"
@@ -333,6 +334,7 @@ assert_missing "${INSTALL_DIR}/rocm"
 assert_missing "${INSTALL_DIR}/rocmd"
 assert_missing "${INSTALL_DIR}/rocm-engine-pytorch"
 assert_missing "${INSTALL_DIR}/rocm-engine-llama-cpp"
+assert_missing "${INSTALL_DIR}/rocm-engine-lemonade"
 assert_missing "${INSTALL_DIR}/rocm-engine-atom"
 assert_missing "${INSTALL_DIR}/rocm-engine-vllm"
 assert_missing "${INSTALL_DIR}/rocm-engine-sglang"

@@ -173,7 +173,7 @@ try {
     Write-Host "acceptance: build release binaries"
     Push-Location $RepoRoot
     try {
-        & $cargoExe build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang
+        & $cargoExe build --release -p rocm -p rocmd -p rocm-engine-pytorch -p rocm-engine-llama-cpp -p rocm-engine-lemonade -p rocm-engine-atom -p rocm-engine-vllm -p rocm-engine-sglang
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build failed"
         }
@@ -424,6 +424,7 @@ try {
     Assert-File (Join-Path $InstallDir "rocmd.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-pytorch.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-llama-cpp.exe")
+    Assert-File (Join-Path $InstallDir "rocm-engine-lemonade.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-atom.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-vllm.exe")
     Assert-File (Join-Path $InstallDir "rocm-engine-sglang.exe")
@@ -472,6 +473,7 @@ try {
     Assert-Missing (Join-Path $InstallDir "rocmd.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-pytorch.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-llama-cpp.exe")
+    Assert-Missing (Join-Path $InstallDir "rocm-engine-lemonade.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-atom.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-vllm.exe")
     Assert-Missing (Join-Path $InstallDir "rocm-engine-sglang.exe")
