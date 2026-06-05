@@ -363,27 +363,57 @@ static char *join_path2(const char *left, const char *right) {
 
 static char *default_root(void) {
   const char *configured = getenv("ROCM_CLI_APE_ROOT");
+  char *fallback = NULL;
+  char *a;
+  char *b;
+  char *c;
+  char *d;
+  char *e;
   if (configured && configured[0]) {
     return normalize_runtime_path(configured);
   }
-  const char *home = getenv("HOME");
 #if defined(_WIN32)
-  if (!home || !home[0]) {
-    home = getenv("USERPROFILE");
+  const char *base = getenv("LOCALAPPDATA");
+  if (!base || !base[0]) {
+    const char *profile = getenv("USERPROFILE");
+    if (profile && profile[0]) {
+      fallback = join_path2(profile, "AppData/Local");
+      base = fallback;
+    }
   }
+  if (!base || !base[0]) {
+    fail_message("unable to determine launcher cache directory; set ROCM_CLI_APE_ROOT");
+  }
+  a = join_path2(base, "powderluv");
+  b = join_path2(a, "rocm-cli");
+  c = join_path2(b, "launcher");
+#else
+  const char *base = getenv("XDG_CACHE_HOME");
+  if (!base || !base[0]) {
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+      fallback = join_path2(home, ".cache");
+      base = fallback;
+    }
+  }
+  if (!base || !base[0]) {
+    fail_message("unable to determine launcher cache directory; set ROCM_CLI_APE_ROOT");
+  }
+  a = join_path2(base, "rocm-cli");
+  b = join_path2(a, "launcher");
+  c = xstrdup(b);
 #endif
-  if (!home || !home[0]) {
-    fail_message("unable to determine home directory; set ROCM_CLI_APE_ROOT");
-  }
-  char *a = join_path2(home, ".rocm");
-  char *b = join_path2(a, "launcher");
-  char *c = join_path2(b, ROCM_CLI_APE_VERSION);
-  char *d = join_path2(c, platform_id());
+  d = join_path2(c, ROCM_CLI_APE_VERSION);
+  e = join_path2(d, platform_id());
   free(a);
   free(b);
   free(c);
-  char *normalized = normalize_runtime_path(d);
   free(d);
+  if (fallback) {
+    free(fallback);
+  }
+  char *normalized = normalize_runtime_path(e);
+  free(e);
   return normalized;
 }
 

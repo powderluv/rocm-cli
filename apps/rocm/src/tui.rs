@@ -13557,6 +13557,7 @@ fn folder_browser_entries(current_dir: &Path) -> (Vec<FolderBrowserEntry>, Optio
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .filter(|path| path.is_dir())
+                .filter(|path| folder_browser_should_show_directory(current_dir, path))
                 .collect::<Vec<_>>();
             dirs.sort_by_key(|path| folder_browser_sort_key(path));
             for path in dirs {
@@ -13572,6 +13573,33 @@ fn folder_browser_entries(current_dir: &Path) -> (Vec<FolderBrowserEntry>, Optio
         }
     }
     (entries, message)
+}
+
+fn folder_browser_should_show_directory(current_dir: &Path, path: &Path) -> bool {
+    if current_dir
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(".rocm"))
+    {
+        let hidden = [
+            "apps",
+            "audit",
+            "automations",
+            "cache",
+            "engines",
+            "launcher",
+            "logs",
+            "runtimes",
+            "tools",
+        ];
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && hidden
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn folder_browser_drive_roots() -> Vec<PathBuf> {
@@ -37910,6 +37938,28 @@ Full log
         assert_eq!(labels[2], "+ rocm_venvs");
         assert!(labels.iter().any(|label| *label == "+ therock_venvs"));
         assert!(labels.iter().any(|label| *label == "+ rocm_venvs"));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_picker_hides_internal_rocm_launcher_cache() -> anyhow::Result<()> {
+        let (root, _paths) = test_paths("folder-picker-internal-rocm");
+        let rocm_dir = root.join(".rocm");
+        let visible = rocm_dir.join("my_rocm_envs");
+        fs::create_dir_all(rocm_dir.join("launcher"))?;
+        fs::create_dir_all(rocm_dir.join("cache"))?;
+        fs::create_dir_all(&visible)?;
+
+        let (entries, _) = super::folder_browser_entries(&rocm_dir);
+        let labels = entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label.starts_with("my_rocm_envs")));
+        assert!(!labels.iter().any(|label| label.starts_with("launcher")));
+        assert!(!labels.iter().any(|label| label.starts_with("cache")));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
