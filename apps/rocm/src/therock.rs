@@ -25,6 +25,8 @@ const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PIP_RETRIES: u32 = 8;
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
+static PYTHON_VENV_PROBE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -3036,25 +3038,33 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
         .join("python")
         .join(slugify(&format!("{}-{platform}", release.tag_name)));
     if let Some(executable) = find_python_executable(&install_dir) {
+        if python_launcher_install_ready(&executable).is_ok() {
+            progress_line(format!(
+                "Using existing Python {} at {}.",
+                managed_python_version(),
+                executable.display()
+            ));
+            let manifest = ManagedPythonManifest {
+                executable: executable.clone(),
+                source_url: asset.browser_download_url.clone(),
+                release_tag: release.tag_name.clone(),
+                asset_name: asset.name.clone(),
+                version: managed_python_version(),
+                installed_at_unix_ms: unix_time_millis(),
+            };
+            save_managed_python_manifest(paths, &manifest)?;
+            let _ = record_managed_python_config(paths, &executable);
+            return Ok(PythonLauncher {
+                executable,
+                source: "managed",
+            });
+        }
         progress_line(format!(
-            "Using existing Python {} at {}.",
-            managed_python_version(),
-            executable.display()
+            "Existing managed Python at {} cannot create a pip-ready environment; reinstalling Python {}.",
+            executable.display(),
+            managed_python_version()
         ));
-        let manifest = ManagedPythonManifest {
-            executable: executable.clone(),
-            source_url: asset.browser_download_url.clone(),
-            release_tag: release.tag_name.clone(),
-            asset_name: asset.name.clone(),
-            version: managed_python_version(),
-            installed_at_unix_ms: unix_time_millis(),
-        };
-        save_managed_python_manifest(paths, &manifest)?;
-        let _ = record_managed_python_config(paths, &executable);
-        return Ok(PythonLauncher {
-            executable,
-            source: "managed",
-        });
+        let _ = fs::remove_dir_all(&install_dir);
     }
 
     let archive_path = paths
@@ -3087,13 +3097,13 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
         )
     })?;
     progress_line(format!("Checking Python {}...", managed_python_version()));
-    if !command_succeeds(&executable, &["--version"]) {
-        bail!(
-            "Python {} did not run successfully after extraction: {}",
+    python_launcher_install_ready(&executable).with_context(|| {
+        format!(
+            "Python {} could not create a pip-ready virtual environment after extraction: {}",
             managed_python_version(),
             executable.display()
-        );
-    }
+        )
+    })?;
     let manifest = ManagedPythonManifest {
         executable: executable.clone(),
         source_url: asset.browser_download_url.clone(),
@@ -3281,32 +3291,47 @@ fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf
 }
 
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok()
-        && python_launcher_is_compatible(Path::new(&value))
-    {
+    if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok() {
+        python_launcher_install_ready(Path::new(&value))
+            .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
             source: "env",
         });
     }
 
+    let mut skipped_path_python = false;
     for candidate in python_path_candidates() {
-        if python_launcher_is_compatible(&candidate) {
-            return Ok(PythonLauncher {
-                executable: candidate,
-                source: "path",
-            });
+        match python_launcher_install_ready(&candidate) {
+            Ok(()) => {
+                return Ok(PythonLauncher {
+                    executable: candidate,
+                    source: "path",
+                });
+            }
+            Err(_) => {
+                skipped_path_python = true;
+            }
         }
+    }
+    if skipped_path_python {
+        progress_line(
+            "Python from PATH cannot create a pip-ready virtual environment; using ROCm CLI's managed Python.",
+        );
     }
 
     if let Some(manifest) = load_managed_python_manifest(paths)?
         && manifest.executable.is_file()
-        && python_launcher_is_compatible(&manifest.executable)
     {
-        return Ok(PythonLauncher {
-            executable: manifest.executable,
-            source: "managed",
-        });
+        if python_launcher_install_ready(&manifest.executable).is_ok() {
+            return Ok(PythonLauncher {
+                executable: manifest.executable,
+                source: "managed",
+            });
+        }
+        progress_line(
+            "Saved managed Python cannot create a pip-ready virtual environment; preparing Python again.",
+        );
     }
 
     if managed_python_bootstrap_disabled() {
@@ -3375,12 +3400,50 @@ fn program_path_candidates(program: &str) -> Vec<String> {
     names
 }
 
-fn python_launcher_is_compatible(program: &Path) -> bool {
-    wheel_compatibility_for_python(program)
-        .map(|compatibility| compatibility.python_tag == "cp312")
-        .unwrap_or(false)
+fn python_launcher_install_ready(program: &Path) -> Result<()> {
+    let compatibility = wheel_compatibility_for_python(program)?;
+    if compatibility.python_tag != "cp312" {
+        bail!(
+            "Python wheel tag {} is not supported; cp312 is required",
+            compatibility.python_tag
+        );
+    }
+    verify_python_can_create_pip_venv(program)
 }
 
+fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
+    let unique = PYTHON_VENV_PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe_dir = std::env::temp_dir().join(format!(
+        "rocm-cli-python-venv-probe-{}-{}-{}",
+        std::process::id(),
+        unix_time_millis(),
+        unique
+    ));
+    let _ = fs::remove_dir_all(&probe_dir);
+    let args = python_venv_args(&probe_dir);
+    let venv_result = run_command(
+        program,
+        args.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        "probe Python virtual environment support",
+    );
+    if let Err(error) = venv_result {
+        let _ = fs::remove_dir_all(&probe_dir);
+        return Err(error);
+    }
+    let env_python = venv_python_path(&probe_dir);
+    let pip_result = run_command(
+        &env_python,
+        &["-m", "pip", "--version"],
+        "probe Python pip support in virtual environment",
+    );
+    let _ = fs::remove_dir_all(&probe_dir);
+    pip_result.map(|_| ())
+}
+
+#[cfg(test)]
 fn command_succeeds(program: &Path, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -3577,6 +3640,8 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn normalize_therock_family_maps_gfx1103_to_gfx110x_all() {
@@ -3920,17 +3985,15 @@ echo Python 3.12.10
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn python_launcher_prefers_path_python_before_saved_managed_python() -> Result<()> {
+        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
-        let path_python = write_fake_python(&bin_dir, "python")?;
-        let managed_python = paths
-            .data_dir
-            .join("tools")
-            .join("python")
-            .join("python.exe");
+        let path_python = write_fake_python_with_pip_venv(&bin_dir, "python")?;
+        let managed_python = paths.data_dir.join("tools").join("python").join("python");
         fs::create_dir_all(managed_python.parent().expect("managed python parent"))?;
         fs::write(&managed_python, "not used")?;
         let manifest = ManagedPythonManifest {
@@ -3985,24 +4048,90 @@ echo Python 3.12.10
         Ok(())
     }
 
-    fn write_fake_python(dir: &Path, name: &str) -> Result<PathBuf> {
-        let path = dir.join(if cfg!(windows) {
-            format!("{name}.cmd")
-        } else {
-            name.to_owned()
-        });
-        let script = if cfg!(windows) {
-            "@echo off\r\nif \"%1\"==\"-c\" (echo cp312 & exit /b 0)\r\nif not \"%2\"==\"\" (echo cp312>\"%2\" & exit /b 0)\r\necho Python 3.12.10\r\n".to_owned()
-        } else {
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo cp312; else echo Python 3.12.10; fi\n"
-                .to_owned()
+    #[cfg(unix)]
+    #[test]
+    fn python_launcher_skips_path_python_without_pip_ready_venv() -> Result<()> {
+        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("python-skips-path-without-venv");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        let bad_path_python = write_fake_python_without_pip_venv(&bin_dir, "python3")?;
+        let managed_dir = paths.data_dir.join("tools").join("python");
+        fs::create_dir_all(&managed_dir)?;
+        let managed_python = write_fake_python_with_pip_venv(&managed_dir, "python")?;
+        let manifest = ManagedPythonManifest {
+            executable: managed_python.clone(),
+            source_url: "https://example.invalid/python.tar.gz".to_owned(),
+            release_tag: "20260510".to_owned(),
+            asset_name: "python.tar.gz".to_owned(),
+            version: "3.12.10".to_owned(),
+            installed_at_unix_ms: 123,
         };
-        fs::write(&path, script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        save_managed_python_manifest(&paths, &manifest)?;
+        let old_path = std::env::var_os("PATH");
+        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
+        let joined_path = std::env::join_paths([bin_dir.clone()])?;
+        unsafe {
+            std::env::set_var("PATH", joined_path);
+            std::env::remove_var("ROCM_CLI_PYTHON");
         }
+        let launcher = resolve_python_launcher(&paths)?;
+        unsafe {
+            match old_path {
+                Some(old_path) => std::env::set_var("PATH", old_path),
+                None => std::env::remove_var("PATH"),
+            }
+            match old_rocm_cli_python {
+                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
+                None => std::env::remove_var("ROCM_CLI_PYTHON"),
+            }
+        }
+
+        assert_eq!(launcher.source, "managed");
+        assert_eq!(launcher.executable, managed_python);
+        assert!(bad_path_python.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_without_pip_venv(dir: &Path, name: &str) -> Result<PathBuf> {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo cp312; else echo Python 3.12.10; fi\n",
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_with_pip_venv(dir: &Path, name: &str) -> Result<PathBuf> {
+        let path = dir.join(name);
+        let script = r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+  echo cp312
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  /bin/mkdir -p "$3/bin"
+  /bin/cat > "$3/bin/python" <<'PY'
+#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+  echo pip 24.0
+  exit 0
+fi
+echo Python 3.12.10
+PY
+  /bin/chmod +x "$3/bin/python"
+  exit 0
+fi
+echo Python 3.12.10
+"#;
+        fs::write(&path, script)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
 
