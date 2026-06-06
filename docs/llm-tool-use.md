@@ -16,6 +16,11 @@ rocm-cli local assistants use structured tools, not shell commands.
   Bash, `cmd`, `git`, or arbitrary package-manager commands.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready.
+- The built-in local assistant is fixed to `qwen`
+  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, SGLang,
+  PyTorch, llama.cpp, and Lemonade are general serving engines; the assistant
+  may inspect or manage them for model serving, but it should not switch its own
+  built-in chat engine away from Lemonade.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
@@ -30,6 +35,23 @@ The assistant can inspect ComfyUI state:
 ```json
 {"name":"rocm_command","arguments":{"args":["comfyui","status"]}}
 ```
+
+For “is X running?” questions, inspect before answering and do not start or stop
+anything. Use ComfyUI status for ComfyUI, `services list --all` for managed
+model servers and serving engines, and `port_status` for loopback port
+questions:
+
+```json
+{"name":"rocm_command","arguments":{"args":["services","list","--all"]}}
+```
+
+```json
+{"name":"port_status","arguments":{"host":"127.0.0.1","port":8188}}
+```
+
+Treat `ready` and `running` as running, `starting` and `recovering` as starting,
+`failed` and `stopped` as not running, and no matching service as unknown or not
+managed by rocm-cli.
 
 The assistant can read recent ComfyUI install/run logs without changing local
 state:

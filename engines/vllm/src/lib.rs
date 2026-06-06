@@ -950,6 +950,7 @@ print(json.dumps({"present": spec is not None, "version": version}))
 }
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+    command.env("VLLM_TARGET_DEVICE", "rocm");
     let Some(root) = runtime.sdk_root.as_ref() else {
         return Ok(());
     };
@@ -1069,7 +1070,8 @@ fn write_running_state(request: &ServeHttpRequest, runtime: &VllmRuntime, pid: u
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": "gpu_required",
-            "runtime_id": request.runtime_id.as_deref().unwrap_or(runtime.runtime_id.as_str()),
+            "runtime_id": runtime.runtime_id,
+            "requested_runtime_id": request.runtime_id,
             "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
             "runtime_executable": runtime.command,
             "server_pid": pid,
@@ -1524,6 +1526,32 @@ mod tests {
     }
 
     #[test]
+    fn launch_env_sets_vllm_rocm_target_device() -> Result<()> {
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        let target_device = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "VLLM_TARGET_DEVICE").then_some(value))
+            .flatten();
+        assert_eq!(target_device, Some(std::ffi::OsStr::new("rocm")));
+        Ok(())
+    }
+
+    #[test]
     fn running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
         let state_path = std::env::temp_dir().join(format!(
             "rocm-vllm-state-{}-{}.json",
@@ -1536,7 +1564,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11439,
             device_policy: DevicePolicy::GpuRequired,
-            runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
             env_id: None,
             state_path: state_path.clone(),
             engine_recipe: None,
@@ -1579,6 +1607,14 @@ mod tests {
         fs::remove_file(&state_path).ok();
 
         assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("runtime_id").and_then(Value::as_str),
+            Some("therock-release:gfx120X-all")
+        );
+        assert_eq!(
+            state.get("requested_runtime_id").and_then(Value::as_str),
+            Some("runtime-key-gfx120x")
+        );
         let runtime_env = state
             .get("therock_runtime_env")
             .expect("runtime env should be recorded");

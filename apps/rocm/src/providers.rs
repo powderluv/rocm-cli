@@ -1062,6 +1062,19 @@ fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
             }),
         ),
         rocm_openai_tool(
+            "port_status",
+            "Read whether a local loopback TCP port is listening and whether a ROCm-managed service owns it. Use this for questions like whether something is running on port 8188 or the local model server port. Do not use it for non-local hosts.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                },
+                "required": ["port"],
+                "additionalProperties": false
+            }),
+        ),
+        rocm_openai_tool(
             "rocm_command",
             "Run or request a supported ROCm CLI command with argv-style arguments. Known read-only inspection commands may run immediately. Commands that install, start, serve, stop, delete, or change ROCm state are paused for user review before they run. Use this tool for mutating TheRock setup, including --prefix PATH when the user gives an install folder, --build-date YYYY-MM-DD or --version VERSION, config changes, ComfyUI install/start, engine install, vLLM management, and local LLM serve actions; do not request shell commands, CPU execution, or public network binds.",
             serde_json::json!({
@@ -1866,6 +1879,7 @@ mod tests {
             "service_logs",
             "natural_language_plan",
             "path_exists",
+            "port_status",
             "rocm_command",
             "update_check",
             "install_sdk_dry_run",
@@ -1930,6 +1944,7 @@ mod tests {
             "service_logs",
             "natural_language_plan",
             "path_exists",
+            "port_status",
             "rocm_command",
             "update_check",
             "install_sdk_dry_run",

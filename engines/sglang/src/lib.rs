@@ -774,19 +774,25 @@ fn runtime_from_python(
     sdk_bin_paths: Vec<PathBuf>,
     sdk_library_paths: Vec<PathBuf>,
 ) -> Result<SglangRuntime> {
-    let version = probe_sglang_version(&python)
-        .with_context(|| format!("SGLang package not found in {}", python.display()))?
-        .unwrap_or_else(|| "unknown".to_owned());
-    let (command, launcher) = sglang_command_from_python(&python)
-        .map(|command| (command, SglangLauncher::Command))
-        .unwrap_or_else(|| (python.clone(), SglangLauncher::PythonModule));
+    let (command, launcher, version) = if let Some(command) = sglang_command_from_python(&python) {
+        (
+            command,
+            SglangLauncher::Command,
+            probe_sglang_version(&python).ok().flatten(),
+        )
+    } else {
+        let version = probe_sglang_version(&python)
+            .with_context(|| format!("SGLang package not found in {}", python.display()))?
+            .unwrap_or_else(|| "unknown".to_owned());
+        (python.clone(), SglangLauncher::PythonModule, Some(version))
+    };
     Ok(SglangRuntime {
         runtime_id: runtime_id.to_owned(),
         env_id: format!("external-sglang-{}", stable_id_component(runtime_id)),
         command,
         launcher,
         python_executable: Some(python),
-        version: Some(version),
+        version,
         source: source.to_owned(),
         sdk_root,
         sdk_bin,
@@ -1009,6 +1015,14 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &SglangRuntime) -> R
         .env("ROCM_HOME", root)
         .env("HIP_PATH", root)
         .env("ROCM_CLI_THEROCK_RUNTIME_ID", &runtime.runtime_id);
+    if std::env::var_os("GPU_ARCHS").is_none()
+        && let Some(arch) = sglang_rocm_gpu_arch(runtime)
+    {
+        command
+            .env("GPU_ARCHS", &arch)
+            .env("AMDGPU_TARGET", &arch)
+            .env("PYTORCH_ROCM_ARCH", &arch);
+    }
     if let Some(bin) = bin {
         command.env("ROCM_CLI_THEROCK_SDK_BIN", bin).env(
             "PATH",
@@ -1030,6 +1044,57 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &SglangRuntime) -> R
         );
     }
     Ok(())
+}
+
+fn sglang_rocm_gpu_arch(runtime: &SglangRuntime) -> Option<String> {
+    detect_sglang_rocm_gpu_arch_from_sdk(runtime)
+        .or_else(|| sglang_rocm_gpu_arch_from_text(&runtime.runtime_id))
+        .or_else(|| sglang_rocm_gpu_arch_from_text(&runtime.source))
+}
+
+fn detect_sglang_rocm_gpu_arch_from_sdk(runtime: &SglangRuntime) -> Option<String> {
+    for bin_dir in runtime_bin_paths(runtime) {
+        let tool = bin_dir.join(if cfg!(windows) {
+            "rocm_agent_enumerator.exe"
+        } else {
+            "rocm_agent_enumerator"
+        });
+        if !tool.is_file() {
+            continue;
+        }
+        let Ok(output) = ProcessCommand::new(&tool).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(arch) = sglang_rocm_gpu_arch_from_text(&stdout) {
+            return Some(arch);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(arch) = sglang_rocm_gpu_arch_from_text(&stderr) {
+            return Some(arch);
+        }
+    }
+    None
+}
+
+fn sglang_rocm_gpu_arch_from_text(text: &str) -> Option<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find_map(normalize_sglang_rocm_gpu_arch)
+}
+
+fn normalize_sglang_rocm_gpu_arch(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "gfx90a" | "gfx940" | "gfx941" | "gfx942" | "gfx950" => Some(value),
+        value if value.starts_with("gfx942") || value.starts_with("gfx94") => {
+            Some("gfx942".to_owned())
+        }
+        value if value.starts_with("gfx950") => Some("gfx950".to_owned()),
+        _ => None,
+    }
 }
 
 fn runtime_bin_paths(runtime: &SglangRuntime) -> Vec<PathBuf> {
@@ -1116,7 +1181,8 @@ fn write_running_state(
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": "gpu_required",
-            "runtime_id": request.runtime_id.as_deref().unwrap_or(runtime.runtime_id.as_str()),
+            "runtime_id": runtime.runtime_id,
+            "requested_runtime_id": request.runtime_id,
             "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
             "runtime_executable": runtime.command,
             "server_pid": pid,
@@ -1353,6 +1419,46 @@ mod tests {
     }
 
     #[test]
+    fn managed_runtime_allows_sibling_command_without_shared_python_package() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-sglang-runtime-test-{}",
+            current_unix_millis()
+        ));
+        fs::create_dir_all(&root)?;
+        let python = root.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        let command = root.join(
+            candidate_command_names("sglang")
+                .into_iter()
+                .next()
+                .expect("candidate command name"),
+        );
+        fs::write(&python, "")?;
+        fs::write(&command, "")?;
+
+        let runtime = runtime_from_python(
+            python.clone(),
+            "therock-release:gfx120X-all",
+            "managed_runtime_manifest:test",
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )?;
+
+        assert_eq!(runtime.command, command);
+        assert_eq!(runtime.launcher, SglangLauncher::Command);
+        assert_eq!(runtime.python_executable.as_deref(), Some(python.as_path()));
+        assert_eq!(runtime.version, None);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_response_errors_without_service_state() {
         let error = endpoint_response(EndpointRequest {
             service_id: format!("missing-{}", current_unix_millis()),
@@ -1546,6 +1652,23 @@ mod tests {
     }
 
     #[test]
+    fn sglang_rocm_gpu_arch_maps_runtime_families_for_aiter() {
+        assert_eq!(
+            sglang_rocm_gpu_arch_from_text("therock-release:gfx94X-dcgpu"),
+            Some("gfx942".to_owned())
+        );
+        assert_eq!(
+            sglang_rocm_gpu_arch_from_text("gfx942:sramecc+:xnack-"),
+            Some("gfx942".to_owned())
+        );
+        assert_eq!(
+            sglang_rocm_gpu_arch_from_text("release-pip-gfx950-dcgpu"),
+            Some("gfx950".to_owned())
+        );
+        assert_eq!(sglang_rocm_gpu_arch_from_text("gfx120X-all"), None);
+    }
+
+    #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let runtime = SglangRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
@@ -1609,7 +1732,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 11435,
             device_policy: DevicePolicy::GpuRequired,
-            runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
             env_id: None,
             state_path: state_path.clone(),
             engine_recipe: None,
@@ -1653,6 +1776,14 @@ mod tests {
         fs::remove_file(&state_path).ok();
 
         assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("runtime_id").and_then(Value::as_str),
+            Some("therock-release:gfx120X-all")
+        );
+        assert_eq!(
+            state.get("requested_runtime_id").and_then(Value::as_str),
+            Some("runtime-key-gfx120x")
+        );
         let runtime_env = state
             .get("therock_runtime_env")
             .expect("runtime env should be recorded");

@@ -540,6 +540,58 @@ pub fn terminate_process(pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn process_is_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 };
+    unsafe {
+        CloseHandle(handle);
+    }
+    ok && exit_code == 259
+}
+
+#[cfg(not(windows))]
+pub fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    let status = unsafe { libc::kill(pid, 0) };
+    if status == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+pub fn detach_command_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub fn detach_command_session(_command: &mut Command) {}
+
+#[cfg(windows)]
 fn spawn_windows_no_inherit(
     program: &Path,
     args: &[String],

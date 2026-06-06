@@ -17,8 +17,9 @@ use rocm_core::{
     engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
     generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    model_artifact_cache_status, read_tcp_stream_to_string, resolve_builtin_model_recipe,
-    resolve_model_recipe, sibling_binary_path, write_all_tcp_stream,
+    managed_service_endpoint_model_ready, model_artifact_cache_status, process_is_running,
+    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    sibling_binary_path, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -34,6 +35,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -3942,7 +3944,9 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-fn detach_background_command(_command: &mut ProcessCommand) {}
+fn detach_background_command(command: &mut ProcessCommand) {
+    rocm_core::detach_command_session(command);
+}
 
 #[cfg(not(windows))]
 fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>) -> Result<()> {
@@ -5981,6 +5985,12 @@ pub(crate) fn render_chat_prompt_result_with_progress(
 ) -> Result<ChatPromptResult> {
     let mut progress = progress;
     let user_prompt = latest_user_chat_message(prompt);
+    let assistant_model = local_rocm_tools_assistant_model(provider, rocm_tools).or(model);
+    let service_needed_model = if local_rocm_tools_assistant_model(provider, rocm_tools).is_some() {
+        None
+    } else {
+        model
+    };
     if rocm_tools && let Some(approval) = install_sdk_without_prefix_chat_approval(user_prompt) {
         report_chat_tool_progress(&mut progress, "Asking the assistant.");
         report_chat_tool_progress(&mut progress, "Review needed: Install ROCm");
@@ -6007,7 +6017,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             report_chat_tool_progress(&mut progress, "Preparing a review card.");
             providers::ChatResponse {
                 provider: provider.to_owned(),
-                model: model.unwrap_or("local").to_owned(),
+                model: assistant_model.unwrap_or("local").to_owned(),
                 content: deterministic_mutating_tool_intro(&call),
                 tool_calls: vec![call],
             }
@@ -6016,7 +6026,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                 paths,
                 provider,
                 &providers::ChatRequest {
-                    model: model.map(str::to_owned),
+                    model: assistant_model.map(str::to_owned),
                     messages: messages.clone(),
                     max_tokens: None,
                     rocm_tools,
@@ -6027,7 +6037,11 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                     if provider == "local" && local_provider_missing_service_error(&error) =>
                 {
                     return Ok(ChatPromptResult {
-                        rendered: local_chat_service_needed_text(model, user_prompt, rocm_tools),
+                        rendered: local_chat_service_needed_text(
+                            service_needed_model,
+                            user_prompt,
+                            rocm_tools,
+                        ),
                         approval: None,
                     });
                 }
@@ -6040,7 +6054,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             paths,
             provider,
             &providers::ChatRequest {
-                model: model.map(str::to_owned),
+                model: assistant_model.map(str::to_owned),
                 messages: messages.clone(),
                 max_tokens: None,
                 rocm_tools,
@@ -6049,7 +6063,11 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             Ok(response) => response,
             Err(error) if provider == "local" && local_provider_missing_service_error(&error) => {
                 return Ok(ChatPromptResult {
-                    rendered: local_chat_service_needed_text(model, user_prompt, rocm_tools),
+                    rendered: local_chat_service_needed_text(
+                        service_needed_model,
+                        user_prompt,
+                        rocm_tools,
+                    ),
                     approval: None,
                 });
             }
@@ -6063,6 +6081,12 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     };
     let fallback_tool_call_used = fallback_tool_call.is_some();
     if let Some(call) = fallback_tool_call {
+        response.tool_calls.push(call);
+    }
+    if rocm_tools
+        && let Some(call) =
+            supplemental_read_only_tool_call_for_prompt(user_prompt, &response.tool_calls)
+    {
         response.tool_calls.push(call);
     }
     let mut output = String::new();
@@ -6109,7 +6133,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
         let follow_up_messages = vec![
             providers::ChatMessage {
                 role: "system".to_owned(),
-                content: "You are ROCm CLI's local assistant. ROCm tools have already been checked for this turn. Use the supplied tool results for local facts about this machine. If the tool results do not contain enough information to answer the whole question, say what is known from the results and then answer the rest normally from your own model knowledge. Do not request another tool call. Do not invent local paths, GPU names, versions, or install state that are not shown in the tool results. Keep the answer concise.".to_owned(),
+                content: "You are ROCm CLI's local assistant. ROCm tools have already been checked for this turn. Use the supplied tool results for local facts about this machine. For service results, ready/running means running, starting/recovering means starting, failed/stopped means not running, and no matching service row means ROCm CLI is not managing that service as running. If the tool results do not contain enough information to answer the whole question, say what is known from the results and then answer the rest normally from your own model knowledge. Do not request another tool call. Do not invent local paths, GPU names, versions, or install state that are not shown in the tool results. Keep the answer concise.".to_owned(),
             },
             providers::ChatMessage {
                 role: "user".to_owned(),
@@ -6124,7 +6148,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             paths,
             provider,
             &providers::ChatRequest {
-                model: model.map(str::to_owned),
+                model: assistant_model.map(str::to_owned),
                 messages: follow_up_messages,
                 max_tokens: Some(256),
                 rocm_tools: false,
@@ -6199,6 +6223,68 @@ fn deterministic_mutating_tool_call_for_prompt(
     }
 }
 
+fn supplemental_read_only_tool_call_for_prompt(
+    prompt: &str,
+    existing_calls: &[providers::ChatToolCall],
+) -> Option<providers::ChatToolCall> {
+    let call = fallback_rocm_tool_call_for_prompt(prompt)?;
+    if !chat_tool_call_is_read_only(&call)
+        || chat_tool_calls_include_equivalent(existing_calls, &call)
+    {
+        return None;
+    }
+    Some(call)
+}
+
+fn chat_tool_calls_include_equivalent(
+    existing_calls: &[providers::ChatToolCall],
+    required: &providers::ChatToolCall,
+) -> bool {
+    existing_calls.iter().any(|existing| {
+        if existing.name != required.name {
+            return false;
+        }
+        if required.name == "rocm_command" {
+            return normalized_chat_rocm_command_args(existing).ok()
+                == normalized_chat_rocm_command_args(required).ok();
+        }
+        if required.name == "port_status" {
+            return chat_port_status_tool_calls_equivalent(existing, required);
+        }
+        existing.arguments == required.arguments
+    })
+}
+
+fn chat_port_status_tool_calls_equivalent(
+    left: &providers::ChatToolCall,
+    right: &providers::ChatToolCall,
+) -> bool {
+    let Some(left_object) = left.arguments.as_object() else {
+        return false;
+    };
+    let Some(right_object) = right.arguments.as_object() else {
+        return false;
+    };
+    let left_port = left_object.get("port").and_then(serde_json::Value::as_u64);
+    let right_port = right_object.get("port").and_then(serde_json::Value::as_u64);
+    if left_port != right_port {
+        return false;
+    }
+    let left_host =
+        json_string(left_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    let right_host =
+        json_string(right_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    loopback_host_key(&left_host) == loopback_host_key(&right_host)
+}
+
+fn loopback_host_key(host: &str) -> String {
+    match host.trim().to_ascii_lowercase().as_str() {
+        "localhost" | "127.0.0.1" => "127.0.0.1".to_owned(),
+        "::1" | "[::1]" => "::1".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn deterministic_mutating_tool_intro(call: &providers::ChatToolCall) -> String {
     match chat_tool_approval_request(call, None) {
         Ok(approval) if approval.pending_title == "Install ROCm" => {
@@ -6245,6 +6331,53 @@ fn local_follow_up_content_is_final(response: &providers::ChatResponse) -> bool 
 fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToolCall> {
     let prompt = latest_user_chat_message(prompt);
     let normalized = prompt.to_ascii_lowercase();
+    let asks_running_or_status = prompt_asks_running_or_status(&normalized);
+    let mentions_comfyui = any_substring(&normalized, &["comfyui", "comfy ui", "comfy"]);
+    if asks_running_or_status
+        && !mentions_comfyui
+        && any_substring(&normalized, &["8188", "port 8188"])
+    {
+        return Some(providers::ChatToolCall {
+            id: Some("fallback-port-8188-status".to_owned()),
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": DEFAULT_LOCAL_HOST, "port": 8188 }),
+        });
+    }
+    let mentions_serving_engine_or_service = any_substring(
+        &normalized,
+        &[
+            "vllm",
+            "sglang",
+            "lemonade",
+            "llama.cpp",
+            "llama cpp",
+            "pytorch",
+            "qwen",
+            "model server",
+            "local server",
+            "local model server",
+            "assistant server",
+        ],
+    );
+    if mentions_serving_engine_or_service
+        && any_substring(
+            &normalized,
+            &["installed", "available", "detected", "engine status"],
+        )
+    {
+        return Some(providers::ChatToolCall {
+            id: Some("fallback-engine-list".to_owned()),
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({ "args": ["engines", "list"] }),
+        });
+    }
+    if mentions_serving_engine_or_service && asks_running_or_status {
+        return Some(providers::ChatToolCall {
+            id: Some("fallback-services-list".to_owned()),
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({ "args": ["services", "list", "--all"] }),
+        });
+    }
     let mentions_llm_or_model = any_substring(
         &normalized,
         &["llm", "llms", "model", "models", "assistant"],
@@ -6270,12 +6403,19 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
         });
     }
 
-    if any_substring(&normalized, &["comfyui", "comfy ui", "comfy"]) {
+    if mentions_comfyui {
         if any_substring(&normalized, &["log", "logs"]) {
             return Some(providers::ChatToolCall {
                 id: Some("fallback-comfyui-logs".to_owned()),
                 name: "rocm_command".to_owned(),
                 arguments: serde_json::json!({ "args": ["comfyui", "logs"] }),
+            });
+        }
+        if asks_running_or_status {
+            return Some(providers::ChatToolCall {
+                id: Some("fallback-comfyui-status".to_owned()),
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({ "args": ["comfyui", "status"] }),
             });
         }
         if any_substring(&normalized, &["start", "run", "launch", "open"]) {
@@ -6444,6 +6584,24 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
     }
 
     None
+}
+
+fn prompt_asks_running_or_status(normalized: &str) -> bool {
+    any_substring(
+        normalized,
+        &[
+            "running",
+            "is it up",
+            "is this up",
+            "is there",
+            "are there",
+            "status",
+            "started",
+            "listening",
+            "on port",
+            "port ",
+        ],
+    )
 }
 
 fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::ChatToolCall> {
@@ -6853,7 +7011,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer qwen when available, which maps to Qwen3-4B-Instruct-2507-GGUF with Lemonade and gpu_required. Use qwen-smoke only for a quick server smoke test. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, SGLang, Lemonade, PyTorch, llama.cpp, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM, SGLang, PyTorch, and Lemonade are general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -6861,6 +7019,10 @@ fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
             .to_string()
             .contains("local provider has no ready managed service")
     })
+}
+
+fn local_rocm_tools_assistant_model(provider: &str, rocm_tools: bool) -> Option<&'static str> {
+    (provider == "local" && rocm_tools).then_some(providers::BUILTIN_ASSISTANT_MODEL_ID)
 }
 
 pub(crate) fn local_chat_service_needed_text(
@@ -7125,6 +7287,7 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         | "automations"
         | "natural_language_plan"
         | "path_exists"
+        | "port_status"
         | "rocm_command"
         | "update_check"
         | "install_sdk_dry_run"
@@ -7144,6 +7307,7 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         "automations" => validate_optional_chat_integer(call, "event_limit", 1, 64)?,
         "natural_language_plan" => validate_required_chat_string(call, "request")?,
         "path_exists" => validate_required_chat_string(call, "path")?,
+        "port_status" => validate_chat_port_status_tool_call(call)?,
         "rocm_command" => validate_chat_rocm_command_tool_call(call)?,
         "watcher_enable" => validate_chat_watcher_tool_call(call, true)?,
         "watcher_disable" => validate_chat_watcher_tool_call(call, false)?,
@@ -7253,6 +7417,24 @@ fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: b
         if !matches!(mode.as_str(), "observe" | "propose" | "contained") {
             bail!("local assistant requested unsupported watcher mode `{mode}`");
         }
+    }
+    Ok(())
+}
+
+fn validate_chat_port_status_tool_call(call: &providers::ChatToolCall) -> Result<()> {
+    let object = call
+        .arguments
+        .as_object()
+        .context("port_status arguments must be a JSON object")?;
+    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    if !is_loopback_host(&host) {
+        bail!("local assistant cannot inspect non-local host `{host}`");
+    }
+    let Some(port) = object.get("port").and_then(serde_json::Value::as_u64) else {
+        bail!("ROCm tool `port_status` requires integer `port`");
+    };
+    if !(1..=u16::MAX as u64).contains(&port) {
+        bail!("ROCm tool `port_status` argument `port` must be between 1 and 65535");
     }
     Ok(())
 }
@@ -7691,6 +7873,7 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
             | "automations"
             | "natural_language_plan"
             | "path_exists"
+            | "port_status"
             | "update_check"
             | "install_sdk_dry_run"
     )
@@ -8099,10 +8282,11 @@ fn run_internal_mcp_call(
         "services" => {
             let services = load_managed_services(paths)?;
             Ok(internal_mcp_tool_success(
-                format!("Found {} managed services.", services.len()),
+                render_services_tool_result_text(&services),
                 serde_json::json!({ "services": services }),
             ))
         }
+        "port_status" => run_chat_port_status_tool(paths, &call),
         "service_logs" => {
             let service_id = json_string(&arguments, "service_id")
                 .context("service_logs requires `service_id`")?;
@@ -8582,6 +8766,7 @@ fn run_chat_read_only_tool(
 ) -> Result<serde_json::Value> {
     match call.name.as_str() {
         "path_exists" => run_chat_path_exists_tool(call),
+        "port_status" => run_chat_port_status_tool(paths, call),
         "rocm_command" => {
             let action = chat_rocm_command_action(call)?;
             let ChatRocmCommandAction::ReadOnly(args) = action else {
@@ -8658,6 +8843,83 @@ fn run_chat_path_exists_tool(call: &providers::ChatToolCall) -> Result<serde_jso
     }))
 }
 
+fn run_chat_port_status_tool(
+    paths: &AppPaths,
+    call: &providers::ChatToolCall,
+) -> Result<serde_json::Value> {
+    let object = call
+        .arguments
+        .as_object()
+        .context("port_status arguments must be a JSON object")?;
+    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    let port = object
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .context("port_status requires port")? as u16;
+    let reachable = loopback_tcp_port_is_reachable(&host, port);
+    let matching_services = load_managed_services(paths)?
+        .into_iter()
+        .filter(|record| {
+            record.port == port
+                && record.host.eq_ignore_ascii_case(&host)
+                && managed_service_is_live(record)
+        })
+        .collect::<Vec<_>>();
+    let app_hint = if port == comfyui::default_port() {
+        Some("ComfyUI default port")
+    } else if port == rocm_core::DEFAULT_LOCAL_PORT {
+        Some("ROCm local model server default port")
+    } else {
+        None
+    };
+    let mut text = String::new();
+    let _ = writeln!(text, "host: {host}");
+    let _ = writeln!(text, "port: {port}");
+    let _ = writeln!(text, "listening: {reachable}");
+    if let Some(app_hint) = app_hint {
+        let _ = writeln!(text, "hint: {app_hint}");
+    }
+    if matching_services.is_empty() {
+        let _ = writeln!(text, "managed_service: none");
+    } else {
+        let _ = writeln!(text, "managed_services:");
+        for service in &matching_services {
+            let _ = writeln!(
+                text,
+                "  - service_id={} engine={} model={} status={} endpoint={}",
+                service.service_id,
+                service.engine,
+                service.model_ref,
+                service.status,
+                service.endpoint_url
+            );
+        }
+    }
+    Ok(serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+        "structuredContent": {
+            "host": host,
+            "port": port,
+            "listening": reachable,
+            "hint": app_hint,
+            "managed_services": matching_services,
+        },
+        "isError": false,
+    }))
+}
+
+fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
+}
+
 fn mcp_tool_result_text(value: &serde_json::Value) -> String {
     value
         .get("content")
@@ -8703,6 +8965,7 @@ fn chat_tool_display_label(name: &str) -> String {
         "automations" => "Checked automations".to_owned(),
         "natural_language_plan" => "Planned ROCm request".to_owned(),
         "path_exists" => "Checked folder path".to_owned(),
+        "port_status" => "Checked local port".to_owned(),
         "update_check" => "Checked for ROCm updates".to_owned(),
         "install_sdk_dry_run" => "Previewed ROCm install".to_owned(),
         "install_sdk" => "Install ROCm".to_owned(),
@@ -10297,6 +10560,40 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
     Ok(output)
 }
 
+fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "managed_services: {}", records.len());
+    let _ = writeln!(
+        output,
+        "status_meaning: ready/running = running; starting/recovering = starting; failed/stopped = not running; no matching row = not managed by ROCm CLI"
+    );
+    if records.is_empty() {
+        let _ = writeln!(output, "services: none");
+        return output;
+    }
+    let _ = writeln!(output, "services:");
+    for record in records {
+        let running_state = match record.status.as_str() {
+            "ready" | "running" => "running",
+            "starting" | "recovering" => "starting",
+            "failed" | "stopped" => "not_running",
+            _ => "unknown",
+        };
+        let _ = writeln!(
+            output,
+            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
+            record.service_id,
+            record.engine,
+            record.model_ref,
+            record.canonical_model_id,
+            record.status,
+            running_state,
+            record.endpoint_url
+        );
+    }
+    output
+}
+
 pub(crate) fn render_service_logs_text(paths: &AppPaths, service_id: &str) -> Result<String> {
     render_service_logs_text_with_options(paths, service_id, true)
 }
@@ -10402,7 +10699,9 @@ fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
     let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     record.normalize_paths_for_host();
-    if record.refresh_from_engine_state().unwrap_or(false) {
+    let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
+    let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+    if refreshed_from_engine || refreshed_liveness {
         let _ = record.write();
     }
     if record.service_id != service_id {
@@ -11444,6 +11743,42 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
     )
 }
 
+const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
+
+fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -> bool {
+    if !managed_service_is_live(record) {
+        return false;
+    }
+
+    let tracked_pids = [record.engine_pid, Some(record.supervisor_pid)]
+        .into_iter()
+        .flatten()
+        .filter(|pid| *pid != 0)
+        .collect::<Vec<_>>();
+    let has_tracked_pid = !tracked_pids.is_empty();
+    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
+    if has_tracked_pid && !has_live_pid {
+        if record.status != "stopped" {
+            record.status = "stopped".to_owned();
+            return true;
+        }
+        return false;
+    }
+
+    if matches!(record.status.as_str(), "ready" | "running")
+        && !managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
+            .unwrap_or(false)
+    {
+        let new_status = if has_live_pid { "starting" } else { "stopped" };
+        if record.status != new_status {
+            record.status = new_status.to_owned();
+            return true;
+        }
+    }
+
+    false
+}
+
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
     match (counts.ready, counts.starting) {
         (0, 0) => "none ready".to_owned(),
@@ -11472,7 +11807,9 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
         if let Ok(mut record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
             record.normalize_paths_for_host();
-            if record.refresh_from_engine_state().unwrap_or(false) {
+            let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
+            let refreshed_liveness = refresh_managed_service_runtime_liveness(&mut record);
+            if refreshed_from_engine || refreshed_liveness {
                 let _ = record.write();
             }
             records.push(record);
@@ -15001,6 +15338,11 @@ mod tests {
             },
             providers::ChatToolCall {
                 id: None,
+                name: "port_status".to_owned(),
+                arguments: serde_json::json!({ "host": "127.0.0.1", "port": 8188 }),
+            },
+            providers::ChatToolCall {
+                id: None,
                 name: "update_check".to_owned(),
                 arguments: serde_json::json!({}),
             },
@@ -15031,6 +15373,10 @@ mod tests {
             "First-time setup is the same thing as bootstrap",
             "vllm",
             "Qwen3-4B-Instruct-2507-GGUF",
+            "fixed to qwen",
+            "served by Lemonade",
+            "port_status",
+            "[\"services\",\"list\",\"--all\"]",
             "qwen-smoke",
             "llama-server",
             "Do not invent shell commands",
@@ -15689,6 +16035,121 @@ model recipes
     }
 
     #[test]
+    fn local_rocm_tools_chat_uses_fixed_lemonade_qwen_assistant() {
+        assert_eq!(
+            local_rocm_tools_assistant_model("local", true),
+            Some(providers::BUILTIN_ASSISTANT_MODEL_ID)
+        );
+        assert_eq!(local_rocm_tools_assistant_model("local", false), None);
+        assert_eq!(local_rocm_tools_assistant_model("openai", true), None);
+    }
+
+    #[test]
+    fn fallback_tool_call_routes_running_questions_to_status_tools() {
+        let comfy = fallback_rocm_tool_call_for_prompt("Is ComfyUI running?").unwrap();
+        assert_eq!(comfy.name, "rocm_command");
+        assert_eq!(
+            normalized_chat_rocm_command_args(&comfy).unwrap(),
+            vec!["comfyui".to_owned(), "status".to_owned()]
+        );
+        assert!(chat_tool_call_is_read_only(&comfy));
+
+        let comfy_port =
+            fallback_rocm_tool_call_for_prompt("Is ComfyUI running on port 8188?").unwrap();
+        assert_eq!(comfy_port.name, "rocm_command");
+        assert_eq!(
+            normalized_chat_rocm_command_args(&comfy_port).unwrap(),
+            vec!["comfyui".to_owned(), "status".to_owned()]
+        );
+        assert!(chat_tool_call_is_read_only(&comfy_port));
+
+        for prompt in [
+            "Is vLLM running?",
+            "is sglang running?",
+            "is the model server running?",
+            "is qwen running?",
+        ] {
+            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
+            assert_eq!(call.name, "rocm_command", "{prompt}");
+            assert_eq!(
+                normalized_chat_rocm_command_args(&call).unwrap(),
+                vec!["services".to_owned(), "list".to_owned(), "--all".to_owned(),],
+                "{prompt}"
+            );
+            assert!(chat_tool_call_is_read_only(&call), "{prompt}");
+        }
+
+        let port = fallback_rocm_tool_call_for_prompt("what is running on port 8188?").unwrap();
+        assert_eq!(port.name, "port_status");
+        assert_eq!(
+            port.arguments,
+            serde_json::json!({ "host": DEFAULT_LOCAL_HOST, "port": 8188 })
+        );
+        assert!(chat_tool_call_is_read_only(&port));
+    }
+
+    #[test]
+    fn fallback_tool_call_routes_engine_install_state_to_engines_list() {
+        for prompt in ["is vLLM installed?", "is SGLang available?"] {
+            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
+            assert_eq!(call.name, "rocm_command", "{prompt}");
+            assert_eq!(
+                normalized_chat_rocm_command_args(&call).unwrap(),
+                vec!["engines".to_owned(), "list".to_owned()],
+                "{prompt}"
+            );
+            assert!(chat_tool_call_is_read_only(&call), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn supplemental_tool_call_adds_missing_specific_status_check() {
+        let generic_services = providers::ChatToolCall {
+            id: Some("model-picked-services".to_owned()),
+            name: "services".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+
+        let call =
+            supplemental_read_only_tool_call_for_prompt("Is ComfyUI running?", &[generic_services])
+                .unwrap();
+
+        assert_eq!(call.name, "rocm_command");
+        assert_eq!(
+            normalized_chat_rocm_command_args(&call).unwrap(),
+            vec!["comfyui".to_owned(), "status".to_owned()]
+        );
+        assert!(chat_tool_call_is_read_only(&call));
+    }
+
+    #[test]
+    fn supplemental_tool_call_does_not_duplicate_equivalent_status_check() {
+        let comfy_status = fallback_rocm_tool_call_for_prompt("Is ComfyUI running?").unwrap();
+
+        assert!(
+            supplemental_read_only_tool_call_for_prompt("Is ComfyUI running?", &[comfy_status])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn supplemental_tool_call_treats_loopback_port_checks_as_equivalent() {
+        let model_port_check = providers::ChatToolCall {
+            id: Some("model-picked-port".to_owned()),
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": "localhost", "port": 8188 }),
+        };
+
+        assert!(
+            supplemental_read_only_tool_call_for_prompt(
+                "what is running on port 8188?",
+                &[model_port_check]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn fallback_tool_call_runs_status_checks() {
         for prompt in [
             "Which GPU is on my machine, and is ROCm installed?",
@@ -15957,6 +16418,26 @@ install therock";
 
         validate_chat_tool_call(&call).unwrap();
         assert!(chat_tool_call_is_read_only(&call));
+    }
+
+    #[test]
+    fn port_status_chat_tool_is_read_only_and_loopback_only() {
+        let call = providers::ChatToolCall {
+            id: Some("port-check".to_owned()),
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": "127.0.0.1", "port": 8188 }),
+        };
+
+        validate_chat_tool_call(&call).unwrap();
+        assert!(chat_tool_call_is_read_only(&call));
+
+        let public = providers::ChatToolCall {
+            id: Some("public-port-check".to_owned()),
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": "192.168.1.10", "port": 8188 }),
+        };
+        let error = validate_chat_tool_call(&public).unwrap_err().to_string();
+        assert!(error.contains("non-local host"), "{error}");
     }
 
     #[test]
@@ -16435,11 +16916,31 @@ install therock";
 
     #[test]
     fn render_services_text_lists_live_services_by_default_and_all_on_request() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
         let (root, paths) = test_paths("services-list");
         paths.ensure()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let ready_port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request)?;
+            let body = r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(())
+        });
+        let current_pid = std::process::id();
 
         for (service_id, status, port) in [
-            ("svc-ready", "ready", 11435_u16),
+            ("svc-ready", "ready", ready_port),
             ("svc-starting", "starting", 11436_u16),
             ("svc-failed", "failed", 11437_u16),
         ] {
@@ -16452,7 +16953,7 @@ install therock";
                 "127.0.0.1",
                 port,
                 "managed",
-                123,
+                current_pid,
                 Some("therock-release".to_owned()),
                 None,
                 Some("gpu_required".to_owned()),
@@ -16462,6 +16963,9 @@ install therock";
         }
 
         let rendered = render_services_text(&paths, false)?;
+        server
+            .join()
+            .expect("fake models server should not panic")?;
         let all = render_services_text(&paths, true)?;
         let _ = fs::remove_dir_all(root);
 
@@ -16475,6 +16979,66 @@ install therock";
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
         Ok(())
+    }
+
+    #[test]
+    fn render_services_text_demotes_stale_ready_record() -> Result<()> {
+        let (root, paths) = test_paths("services-stale-ready");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-stale-ready",
+            "lemonade",
+            "qwen",
+            providers::BUILTIN_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            9,
+            "managed",
+            999_999_999,
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+        record.engine_pid = Some(999_999_999);
+        record.write()?;
+
+        let rendered = render_services_text(&paths, false)?;
+        let all = render_services_text(&paths, true)?;
+        let reloaded = load_managed_service(&paths, "svc-stale-ready")?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(rendered.contains("No local servers are running."));
+        assert!(all.contains("- svc-stale-ready"));
+        assert!(all.contains("  status: stopped"));
+        assert_eq!(reloaded.status, "stopped");
+        Ok(())
+    }
+
+    #[test]
+    fn services_tool_result_text_includes_running_interpretation() {
+        let (_root, paths) = test_paths("services-tool-text");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-vllm",
+            "vllm",
+            "Qwen/Qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+
+        let rendered = render_services_tool_result_text(&[record]);
+
+        assert!(rendered.contains("status_meaning: ready/running = running"));
+        assert!(rendered.contains("engine=vllm"));
+        assert!(rendered.contains("running_state=running"));
     }
 
     #[test]

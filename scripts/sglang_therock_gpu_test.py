@@ -26,7 +26,6 @@ from vllm_therock_gpu_test import (
     restore_env,
     rocm_cli_state_paths,
     run_json,
-    wait_health,
     write_config,
     write_runtime_manifest,
 )
@@ -69,7 +68,7 @@ def main() -> int:
     )
 
     try:
-        health = wait_health(args.host, args.port, args.timeout)
+        health = wait_sglang_openai_ready(args.host, args.port, args.timeout)
         models = get_json(args.host, args.port, "/v1/models", timeout=args.timeout)
         served_model = first_model_id(models)
         completion = post_json(
@@ -180,6 +179,20 @@ def reject_external_runtime_env() -> None:
             "SGLang GPU acceptance requires discovery through a rocm-cli managed "
             f"TheRock runtime manifest; unset external runtime overrides: {', '.join(blocked)}"
         )
+
+
+def wait_sglang_openai_ready(host: str, port: int, timeout: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            models = get_json(host, port, "/v1/models", timeout=3)
+            first_model_id(models)
+            return {"status_code": 200, "body": "v1/models ready"}
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+        time.sleep(0.5)
+    raise RuntimeError(f"SGLang OpenAI model endpoint did not become ready: {last_error}")
 
 
 def resolve_runtime_id(explicit: str | None) -> str:

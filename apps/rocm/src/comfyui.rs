@@ -173,7 +173,16 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
         None => {
             writeln!(output)?;
             writeln!(output, "Running")?;
-            writeln!(output, "  status: not started by rocm-cli")?;
+            if let Some(url) = default_unmanaged_running_url() {
+                writeln!(output, "  status: running outside rocm-cli")?;
+                writeln!(output, "  url: {url}")?;
+                writeln!(
+                    output,
+                    "  note: ROCm CLI did not start this ComfyUI process"
+                )?;
+            } else {
+                writeln!(output, "  status: not started by rocm-cli")?;
+            }
         }
     }
 
@@ -248,7 +257,13 @@ pub(crate) fn render_tui_status(paths: &AppPaths, config: &RocmCliConfig) -> Res
         }
         None => {
             writeln!(output, "Running")?;
-            writeln!(output, "  status: not started")?;
+            if let Some(url) = default_unmanaged_running_url() {
+                writeln!(output, "  status: running outside rocm-cli")?;
+                writeln!(output, "  URL: {url}")?;
+                writeln!(output, "  ROCm CLI did not start this ComfyUI process.")?;
+            } else {
+                writeln!(output, "  status: not started")?;
+            }
         }
     }
 
@@ -289,7 +304,7 @@ pub(crate) fn render_models_path(paths: &AppPaths) -> Result<String> {
 
 pub(crate) fn running_url(paths: &AppPaths) -> Result<Option<String>> {
     let Some(state) = load_state(paths)? else {
-        return Ok(None);
+        return Ok(default_unmanaged_running_url());
     };
     let report = evaluate_running_state(&state);
     if matches!(
@@ -300,6 +315,14 @@ pub(crate) fn running_url(paths: &AppPaths) -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn default_unmanaged_running_url() -> Option<String> {
+    unmanaged_running_url(COMFYUI_DEFAULT_HOST, COMFYUI_DEFAULT_PORT)
+}
+
+fn unmanaged_running_url(host: &str, port: u16) -> Option<String> {
+    endpoint_is_reachable(host, port).then(|| format_http_base_url(host, port))
 }
 
 fn render_logs_with_options(
@@ -1974,6 +1997,17 @@ mod tests {
         assert_eq!(report.state, ComfyUiRunState::Running);
         assert!(report.process_running);
         assert!(report.endpoint_reachable);
+        Ok(())
+    }
+
+    #[test]
+    fn unmanaged_running_url_reports_reachable_loopback_endpoint() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+
+        let url = unmanaged_running_url("127.0.0.1", port);
+
+        assert_eq!(url, Some(format!("http://127.0.0.1:{port}")));
         Ok(())
     }
 
