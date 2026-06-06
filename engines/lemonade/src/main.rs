@@ -1,6 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use rocm_core::{AppPaths, DEFAULT_LOCAL_PORT, format_http_base_url, require_nonempty};
+use rocm_core::{
+    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
+    download_file_to_path, format_host_port, format_http_base_url, http_get_text,
+    prepend_runtime_paths, require_nonempty, runtime_is_linux, runtime_is_windows,
+};
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
     EndpointResponse, EngineCapabilities, EngineDeviceAvailability, EngineMethod, EngineRecipeHint,
@@ -11,10 +15,11 @@ use rocm_engine_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{VecDeque, hash_map::DefaultHasher};
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,19 +28,16 @@ const ENGINE_NAME: &str = "lemonade";
 const LEMONADE_VERSION: &str = "10.6.0";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MODEL: &str = "Qwen3-0.6B-GGUF";
+const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-0.6B-GGUF";
+const DEFAULT_MODEL_GGUF: &str = "Qwen3-0.6B-Q4_0.gguf";
 const ROCM_BACKEND_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 
-#[cfg(windows)]
-const EMBEDDABLE_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-windows-x64.zip";
-#[cfg(not(windows))]
-const EMBEDDABLE_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
-
-#[cfg(windows)]
-const EMBEDDABLE_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-windows-x64.zip";
-#[cfg(not(windows))]
-const EMBEDDABLE_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-windows-x64.zip";
+const EMBEDDABLE_LINUX_ARCHIVE_NAME: &str = "lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
+const EMBEDDABLE_WINDOWS_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-windows-x64.zip";
+const EMBEDDABLE_LINUX_URL: &str = "https://github.com/lemonade-sdk/lemonade/releases/download/v10.6.0/lemonade-embeddable-10.6.0-ubuntu-x64.tar.gz";
 
 #[derive(Parser)]
 #[command(name = "rocm-engine-lemonade")]
@@ -109,6 +111,13 @@ struct LemonadeInstallManifest {
 #[derive(Debug, Clone)]
 struct LemonadeRuntime {
     manifest: LemonadeInstallManifest,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LemonadeProcessEnvironment {
+    rocm_root: Option<PathBuf>,
+    path_entries: Vec<PathBuf>,
+    library_entries: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +212,37 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    handle_envelope(envelope)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn builtin_serve_http(
+    service_id: String,
+    model_ref: String,
+    host: String,
+    port: u16,
+    device_policy: DevicePolicy,
+    runtime_id: Option<String>,
+    env_id: Option<String>,
+    state_path: PathBuf,
+    log_path: Option<PathBuf>,
+    engine_recipe: Option<EngineRecipeHint>,
+) -> Result<()> {
+    serve_http(ServeHttpRequest {
+        service_id,
+        model_ref,
+        host,
+        port,
+        device_policy,
+        runtime_id,
+        env_id,
+        state_path,
+        log_path,
+        engine_recipe,
+    })
+}
+
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     match envelope.method {
         EngineMethod::Detect => {
@@ -246,10 +286,21 @@ where
     match serde_json::from_value::<T>(payload) {
         Ok(request) => match handler(request) {
             Ok(response) => EngineResponseEnvelope::success(response),
-            Err(error) => EngineResponseEnvelope::failure("request_failed", error.to_string()),
+            Err(error) => EngineResponseEnvelope::failure("request_failed", format_error(&error)),
         },
         Err(error) => EngineResponseEnvelope::failure("invalid_payload", error.to_string()),
     }
+}
+
+fn format_error(error: &anyhow::Error) -> String {
+    let mut lines = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if !lines.iter().any(|line| line == &text) {
+            lines.push(text);
+        }
+    }
+    lines.join(": ")
 }
 
 fn capabilities() -> EngineCapabilities {
@@ -425,9 +476,26 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
 fn serve_http(request: ServeHttpRequest) -> Result<()> {
     require_gpu_required(&request.device_policy)?;
     let runtime = resolve_runtime()?;
+    let process_env = lemonade_process_environment()?;
     let log_path = request.log_path.as_deref();
     write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
-    let mut child = spawn_lemond(&runtime.manifest, &request.host, request.port, log_path)?;
+    if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+        ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
+        return serve_direct_rocm_llama_server(
+            &request,
+            &runtime,
+            &process_env,
+            log_path,
+            &anyhow!("using Lemonade packaged ROCm llama-server directly on Linux"),
+        );
+    }
+    let mut child = spawn_lemond(
+        &runtime.manifest,
+        &request.host,
+        request.port,
+        log_path,
+        &process_env,
+    )?;
     write_running_state(
         &request,
         &runtime,
@@ -435,45 +503,83 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
         Some(child.id()),
         "running",
     )?;
-    wait_for_health(&request.host, request.port, Duration::from_secs(20))
-        .context("Lemonade server did not become ready")?;
-    let system_info = query_system_info(&request.host, request.port)?;
-    let backend = lemonade_rocm_backend(&system_info)?;
-    if !backend.backend_is_ready() {
-        bail!(
-            "Lemonade ROCm backend is {}; run `rocm engines install lemonade` first. No CPU fallback is used.",
-            backend.state
-        );
-    }
-    let load_response = post_load_model_rocm(&request.host, request.port, &request.model_ref)
-        .with_context(|| {
+    wait_for_lemonade_cli_status(
+        &runtime.manifest,
+        &request.host,
+        request.port,
+        Duration::from_secs(30),
+        &process_env,
+    )
+    .context("Lemonade server did not become ready")?;
+    let load_result = run_lemonade_model_load(
+        &runtime.manifest,
+        &request.host,
+        request.port,
+        &request.model_ref,
+        log_path,
+        &process_env,
+    );
+    let router_ready = load_result.is_ok()
+        && query_loaded_model_endpoint(
+            &endpoint_url(&request.host, request.port),
+            &request.model_ref,
+        )
+        .unwrap_or(false)
+        && query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)
+            .unwrap_or(false);
+    if let Err(error) = load_result {
+        if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+            let _ = terminate_pid(child.id(), true);
+            let _ = child.wait();
+            return serve_direct_rocm_llama_server(
+                &request,
+                &runtime,
+                &process_env,
+                log_path,
+                &error,
+            );
+        }
+        return Err(error).with_context(|| {
             format!(
                 "failed to load {} with Lemonade llamacpp:rocm; no CPU or Vulkan fallback is allowed",
                 request.model_ref
             )
-        })?;
-    let loaded_health = wait_for_model_loaded(
-        &request.host,
-        request.port,
-        &request.model_ref,
-        Duration::from_secs(900),
-    )
-    .with_context(|| {
-        format!(
-            "Lemonade did not report {} as loaded with the ROCm backend",
-            request.model_ref
-        )
-    })?;
+        });
+    }
+    if !router_ready {
+        let error =
+            anyhow!("Lemonade load completed but the endpoint did not report a ROCm-loaded model");
+        if runtime_is_linux() && direct_llama_server_path(&runtime.manifest).is_file() {
+            let _ = terminate_pid(child.id(), true);
+            let _ = child.wait();
+            return serve_direct_rocm_llama_server(
+                &request,
+                &runtime,
+                &process_env,
+                log_path,
+                &error,
+            );
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to verify {} with Lemonade llamacpp:rocm; no CPU or Vulkan fallback is allowed",
+                request.model_ref
+            )
+        });
+    }
     merge_json_state(
         &request.state_path,
         &json!({
             "status": "ready",
             "server_pid": child.id(),
-            "backend_state": backend.state,
+            "backend_state": "ready",
             "backend_requested": ROCM_BACKEND_NAME,
-            "load_response": load_response,
-            "loaded_health": loaded_health,
-            "system_info": system_info,
+            "load_response": {
+                "status": "loaded",
+                "method": "lemonade-cli",
+                "model_name": request.model_ref,
+                "llamacpp_backend": ROCM_BACKEND_NAME
+            },
         }),
     )?;
     let status = child.wait().context("failed waiting for Lemonade server")?;
@@ -490,6 +596,55 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
     } else {
         bail!("Lemonade server exited with status {status}")
     }
+}
+
+fn ensure_direct_llama_model_available(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        return Ok(());
+    }
+
+    let download_port = free_local_port()?;
+    let mut child = spawn_lemond(
+        &runtime.manifest,
+        DEFAULT_HOST,
+        download_port,
+        log_path,
+        process_env,
+    )?;
+    let result = (|| -> Result<()> {
+        wait_for_lemonade_cli_status(
+            &runtime.manifest,
+            DEFAULT_HOST,
+            download_port,
+            Duration::from_secs(30),
+            process_env,
+        )?;
+        let _ = run_lemonade_model_load(
+            &runtime.manifest,
+            DEFAULT_HOST,
+            download_port,
+            &request.model_ref,
+            log_path,
+            process_env,
+        );
+        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+            Ok(())
+        } else {
+            bail!(
+                "Lemonade did not download `{}` for direct ROCm serving",
+                request.model_ref
+            )
+        }
+    })();
+    let _ = terminate_pid(child.id(), true);
+    let _ = child.wait();
+    result
 }
 
 fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckResponse> {
@@ -587,14 +742,16 @@ fn stop_service(request: StopRequest) -> Result<StopResponse> {
 
 fn prepare_embeddable(paths: &AppPaths, reinstall: bool) -> Result<LemonadeInstallManifest> {
     let root = paths.engine_dir(ENGINE_NAME);
+    let archive_name = embeddable_archive_name();
+    let archive_url = embeddable_url();
     let downloads = root.join("downloads");
-    let archive = downloads.join(EMBEDDABLE_ARCHIVE_NAME);
+    let archive = downloads.join(archive_name);
     fs::create_dir_all(&downloads)?;
     if !archive.is_file() {
-        eprintln!("Downloading {EMBEDDABLE_ARCHIVE_NAME}...");
-        download_file(EMBEDDABLE_URL, &archive)?;
+        eprintln!("Downloading {archive_name}...");
+        download_file(archive_url, &archive)?;
     } else {
-        eprintln!("Using cached {EMBEDDABLE_ARCHIVE_NAME}.");
+        eprintln!("Using cached {archive_name}.");
     }
     let runtime_dir = runtime_dir(paths);
     if reinstall || !lemond_path_in(&runtime_dir).is_file() {
@@ -634,22 +791,18 @@ fn prepare_embeddable(paths: &AppPaths, reinstall: bool) -> Result<LemonadeInsta
 fn install_rocm_backend(manifest: &LemonadeInstallManifest) -> Result<()> {
     let port = free_local_port()?;
     let log_path = manifest.runtime_dir.join("install-lemond.log");
-    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, Some(&log_path))?;
+    let process_env = lemonade_process_environment()?;
+    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, Some(&log_path), &process_env)?;
     let result = (|| -> Result<()> {
-        wait_for_health(DEFAULT_HOST, port, Duration::from_secs(30))?;
-        let system_info = query_system_info(DEFAULT_HOST, port)?;
-        let backend = lemonade_rocm_backend(&system_info)?;
-        match backend.state.as_str() {
-            "installed" | "ready" => Ok(()),
-            "installable" | "not_installed" | "available" | "update_required" => {
-                eprintln!("Installing Lemonade llamacpp:rocm backend...");
-                post_install_backend(DEFAULT_HOST, port)
-            }
-            other => bail!(
-                "Lemonade llamacpp:rocm backend is not usable: state={other} detail={}. No CPU fallback is used.",
-                backend.message.unwrap_or_else(|| "no detail".to_owned())
-            ),
-        }
+        wait_for_lemonade_cli_status(
+            manifest,
+            DEFAULT_HOST,
+            port,
+            Duration::from_secs(30),
+            &process_env,
+        )?;
+        eprintln!("Installing Lemonade llamacpp:rocm backend...");
+        run_lemonade_backend_install(manifest, DEFAULT_HOST, port, &process_env)
     })();
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
@@ -700,73 +853,88 @@ fn lemonade_path_in(runtime_dir: &Path) -> PathBuf {
 }
 
 fn platform_binary_name(name: &str) -> String {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         format!("{name}.exe")
     } else {
         name.to_owned()
     }
 }
 
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let response = ureq::get(url)
-        .timeout(Duration::from_secs(900))
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+fn embeddable_archive_name() -> &'static str {
+    if runtime_is_windows() {
+        EMBEDDABLE_WINDOWS_ARCHIVE_NAME
+    } else {
+        EMBEDDABLE_LINUX_ARCHIVE_NAME
     }
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    std::io::copy(&mut reader, &mut file)
-        .with_context(|| format!("failed to write {}", destination.display()))?;
-    Ok(())
+}
+
+fn embeddable_url() -> &'static str {
+    if runtime_is_windows() {
+        EMBEDDABLE_WINDOWS_URL
+    } else {
+        EMBEDDABLE_LINUX_URL
+    }
+}
+
+fn download_file(url: &str, destination: &Path) -> Result<()> {
+    download_file_to_path(url, destination, Duration::from_secs(900))
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
-    if cfg!(windows) {
-        let output = ProcessCommand::new("powershell.exe")
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg(
-                "& { param($archive, $destination) \
-                 Add-Type -AssemblyName System.IO.Compression.FileSystem; \
-                 [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $destination) }",
-            )
-            .arg(archive)
-            .arg(destination)
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to run PowerShell ZIP extraction")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        bail!(
-            "PowerShell ZIP extraction failed with status {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let stderr_path = destination.join("extract-stderr.txt");
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut command = if runtime_is_cosmopolitan_windows() {
+        ProcessCommand::new("tar.exe")
+    } else {
+        ProcessCommand::new("tar")
+    };
+    command.arg(if runtime_is_windows() { "-xf" } else { "-xzf" });
+    if runtime_is_cosmopolitan_windows() {
+        command
+            .arg(windows_child_path(archive))
+            .arg("-C")
+            .arg(windows_child_path(destination));
+    } else {
+        command.arg(archive).arg("-C").arg(destination);
     }
-    let output = ProcessCommand::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(destination)
+    command
         .stdin(Stdio::null())
-        .output()
-        .context("failed to run tar")?;
-    if output.status.success() {
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file));
+    let status = command.status().context("failed to run tar")?;
+    if status.success() {
+        let _ = fs::remove_file(stderr_path);
         Ok(())
     } else {
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let _ = fs::remove_file(stderr_path);
         bail!(
             "tar extraction failed with status {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            status,
+            stderr.trim()
         )
     }
+}
+
+fn windows_child_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let normalized = raw.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = normalized[3..].replace('/', "\\");
+        return format!("{drive}:\\{rest}");
+    }
+    if bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        return format!("{drive}:\\");
+    }
+    raw
+}
+
+fn runtime_is_cosmopolitan_windows() -> bool {
+    runtime_is_windows() && std::path::MAIN_SEPARATOR == '/'
 }
 
 fn find_embeddable_root(extract_root: &Path) -> Result<PathBuf> {
@@ -841,15 +1009,31 @@ fn spawn_lemond(
     host: &str,
     port: u16,
     log_path: Option<&Path>,
-) -> Result<std::process::Child> {
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<LemondChild> {
+    #[cfg(windows)]
+    if let Some(log_path) = log_path {
+        let args = vec![
+            child_process_path(&manifest.runtime_dir),
+            "--host".to_owned(),
+            host.to_owned(),
+            "--port".to_owned(),
+            port.to_string(),
+        ];
+        let pid = rocm_core::spawn_hidden_console_with_log(&manifest.lemond, &args, &[], log_path)
+            .with_context(|| format!("failed to start {}", manifest.lemond.display()))?;
+        return Ok(LemondChild::Pid(pid));
+    }
+
     let mut command = ProcessCommand::new(&manifest.lemond);
     command
-        .arg(&manifest.runtime_dir)
+        .arg(child_process_path(&manifest.runtime_dir))
         .arg("--host")
         .arg(host)
         .arg("--port")
         .arg(port.to_string())
         .stdin(Stdio::null());
+    apply_lemonade_process_environment(&mut command, process_env)?;
     if let Some(log_path) = log_path {
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
@@ -861,186 +1045,524 @@ fn spawn_lemond(
     } else {
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     }
+    hide_child_console_window(&mut command);
     command
         .spawn()
         .with_context(|| format!("failed to start {}", manifest.lemond.display()))
+        .map(LemondChild::Child)
 }
 
-fn post_install_backend(host: &str, port: u16) -> Result<()> {
-    let url = format!("{}/v1/install", format_http_base_url(host, port));
-    let body = json!({
-        "recipe": ROCM_BACKEND_RECIPE,
-        "backend": ROCM_BACKEND_NAME,
-        "stream": false,
-    });
-    let response = ureq::post(&url)
-        .timeout(Duration::from_secs(1800))
-        .send_json(body)
-        .with_context(|| format!("failed to request Lemonade backend install at {url}"))?;
-    let text = response.into_string().unwrap_or_default();
-    if !text.trim().is_empty()
-        && let Ok(value) = serde_json::from_str::<Value>(&text)
-        && value.get("error").is_some()
-    {
-        bail!("Lemonade backend install failed: {value}");
+enum LemondChild {
+    Child(std::process::Child),
+    #[cfg(windows)]
+    Pid(u32),
+}
+
+impl LemondChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Child(child) => child.id(),
+            #[cfg(windows)]
+            Self::Pid(pid) => *pid,
+        }
+    }
+
+    fn wait(&mut self) -> Result<LemondExitStatus> {
+        match self {
+            Self::Child(child) => {
+                let status = child.wait().context("failed waiting for Lemonade server")?;
+                Ok(LemondExitStatus {
+                    success: status.success(),
+                    description: status.to_string(),
+                })
+            }
+            #[cfg(windows)]
+            Self::Pid(pid) => {
+                let code = rocm_core::wait_for_process_exit(*pid)?;
+                Ok(LemondExitStatus {
+                    success: code == 0,
+                    description: format!("exit code {code}"),
+                })
+            }
+        }
+    }
+}
+
+struct LemondExitStatus {
+    success: bool,
+    description: String,
+}
+
+impl LemondExitStatus {
+    fn success(&self) -> bool {
+        self.success
+    }
+}
+
+impl std::fmt::Display for LemondExitStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.description)
+    }
+}
+
+#[cfg(windows)]
+fn hide_child_console_window(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_child_console_window(_command: &mut ProcessCommand) {}
+
+fn child_process_path(path: &Path) -> String {
+    if runtime_is_windows() {
+        windows_child_path(path)
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn lemonade_process_environment() -> Result<LemonadeProcessEnvironment> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let Some(env) = active_managed_therock_environment(&paths, &config)? else {
+        return Ok(LemonadeProcessEnvironment::default());
+    };
+    Ok(LemonadeProcessEnvironment {
+        rocm_root: env.rocm_root,
+        path_entries: env.path_entries,
+        library_entries: env.library_entries,
+    })
+}
+
+fn apply_lemonade_process_environment(
+    command: &mut ProcessCommand,
+    env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    for (key, value) in lemonade_process_environment_vars(env)? {
+        command.env(key, value);
     }
     Ok(())
 }
 
-fn post_load_model_rocm(host: &str, port: u16, model_ref: &str) -> Result<Value> {
-    let url = format!("{}/v1/load", format_http_base_url(host, port));
-    let body = json!({
-        "model_name": model_ref,
-        "llamacpp_backend": ROCM_BACKEND_NAME,
-        "save_options": true,
-    });
-    let response = ureq::post(&url)
-        .timeout(Duration::from_secs(900))
-        .send_json(body)
-        .with_context(|| format!("failed to request Lemonade model load at {url}"))?;
-    let text = response.into_string().unwrap_or_default();
-    if text.trim().is_empty() {
-        return Ok(json!({
-            "status": "unknown",
-            "message": "empty Lemonade load response"
-        }));
+fn lemonade_process_environment_vars(
+    env: &LemonadeProcessEnvironment,
+) -> Result<Vec<(&'static str, OsString)>> {
+    let mut vars = Vec::new();
+    if let Some(rocm_root) = env.rocm_root.as_ref() {
+        vars.push(("ROCM_PATH", rocm_root.as_os_str().to_owned()));
     }
-    let value = serde_json::from_str::<Value>(&text)
-        .with_context(|| format!("failed to parse Lemonade load response: {text}"))?;
-    if value.get("error").is_some()
-        || value
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| status.eq_ignore_ascii_case("error"))
+    let mut path_entries = env.path_entries.clone();
+    if runtime_is_windows() {
+        path_entries.extend(env.library_entries.iter().cloned());
+    }
+    if let Some(path) = prepend_runtime_paths(&path_entries, std::env::var_os("PATH"))? {
+        vars.push(("PATH", path));
+    }
+    if runtime_is_linux()
+        && let Some(ld_library_path) =
+            prepend_runtime_paths(&env.library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
     {
-        bail!("Lemonade ROCm model load failed: {value}");
+        vars.push(("LD_LIBRARY_PATH", ld_library_path));
     }
-    Ok(value)
+    Ok(vars)
 }
 
-fn query_system_info(host: &str, port: u16) -> Result<Value> {
-    let url = format!("{}/v1/system-info", format_http_base_url(host, port));
-    let text = ureq::get(&url)
-        .timeout(Duration::from_secs(15))
-        .call()
-        .with_context(|| format!("failed to query Lemonade system info at {url}"))?
-        .into_string()
-        .context("failed to read Lemonade system info")?;
-    serde_json::from_str(&text).context("failed to parse Lemonade system info JSON")
-}
-
-#[derive(Debug, Clone)]
-struct LemonadeBackendState {
-    state: String,
-    message: Option<String>,
-}
-
-impl LemonadeBackendState {
-    fn backend_is_ready(&self) -> bool {
-        matches!(self.state.as_str(), "installed" | "ready")
+fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() || paths.iter().any(|existing| existing == &path) {
+        return;
     }
+    paths.push(path);
 }
 
-fn lemonade_rocm_backend(system_info: &Value) -> Result<LemonadeBackendState> {
-    let backends = system_info
-        .get("recipes")
-        .and_then(|recipes| recipes.get(ROCM_BACKEND_RECIPE))
-        .and_then(|recipe| recipe.get("backends"))
-        .with_context(|| "Lemonade system-info did not include llamacpp backends")?;
-    let backend = backends
-        .get(ROCM_BACKEND_NAME)
-        .with_context(|| "Lemonade system-info did not include llamacpp:rocm")?;
-    let state = backend
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let message = backend
-        .get("message")
-        .or_else(|| backend.get("error"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if state == "unsupported" {
+fn wait_for_lemonade_cli_status(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < timeout {
+        let mut command = ProcessCommand::new(&manifest.lemonade);
+        command
+            .arg("--host")
+            .arg(host)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("status")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_lemonade_process_environment(&mut command, process_env)?;
+        hide_child_console_window(&mut command);
+        match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_status = Some(status.to_string()),
+            Err(error) => last_status = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    bail!(
+        "Lemonade server did not become ready: {}",
+        last_status.unwrap_or_else(|| "not checked".to_owned())
+    )
+}
+
+fn run_lemonade_backend_install(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    let mut command = ProcessCommand::new(&manifest.lemonade);
+    command
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("backends")
+        .arg("install")
+        .arg(format!("{ROCM_BACKEND_RECIPE}:{ROCM_BACKEND_NAME}"))
+        .arg("--force")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    apply_lemonade_process_environment(&mut command, process_env)?;
+    hide_child_console_window(&mut command);
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !status.success() {
+        bail!("Lemonade backend install failed with status {status}");
+    }
+    Ok(())
+}
+
+fn run_lemonade_model_load(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
+    let mut command = ProcessCommand::new(&manifest.lemonade);
+    command
+        .args(lemonade_model_load_args(host, port, model_ref))
+        .stdin(Stdio::null());
+    if let Some(log_path) = log_path {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    apply_lemonade_process_environment(&mut command, process_env)?;
+    hide_child_console_window(&mut command);
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !status.success() {
+        bail!("Lemonade model load failed with status {status}");
+    }
+    Ok(())
+}
+
+fn serve_direct_rocm_llama_server(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    log_path: Option<&Path>,
+    router_error: &anyhow::Error,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
+        format!(
+            "Lemonade downloaded model `{}` was not found after its ROCm router refused to load it",
+            request.model_ref
+        )
+    })?;
+    let server = direct_llama_server_path(&runtime.manifest);
+    if !server.is_file() {
         bail!(
-            "Lemonade reports llamacpp:rocm is unsupported on this host: {}. No CPU fallback is used.",
-            message.unwrap_or_else(|| "no detail".to_owned())
+            "Lemonade ROCm llama-server is missing at {}",
+            server.display()
         );
     }
-    Ok(LemonadeBackendState { state, message })
+
+    if let Some(log_path) = log_path
+        && let Some(parent) = log_path.parent()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(log_path) = log_path {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        writeln!(
+            log,
+            "\nLemonade router refused ROCm, launching Lemonade packaged llama-server directly: {router_error:#}"
+        )
+        .ok();
+    }
+
+    let mut direct_env = process_env.clone();
+    if let Some(server_dir) = server.parent() {
+        push_existing_path(&mut direct_env.path_entries, server_dir.to_path_buf());
+        push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
+    }
+
+    let mut command = ProcessCommand::new(&server);
+    command
+        .arg("-m")
+        .arg(&model_path)
+        .arg("--host")
+        .arg(&request.host)
+        .arg("--port")
+        .arg(request.port.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--alias")
+        .arg(&request.model_ref)
+        .stdin(Stdio::null());
+    if let Some(log_path) = log_path {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    apply_lemonade_process_environment(&mut command, &direct_env)?;
+    hide_child_console_window(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", server.display()))?;
+    write_running_state(
+        request,
+        runtime,
+        std::process::id(),
+        Some(child.id()),
+        "running",
+    )?;
+    wait_for_openai_models_ready(
+        &request.host,
+        request.port,
+        &request.model_ref,
+        Duration::from_secs(120),
+    )?;
+    if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
+        bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
+    }
+    merge_json_state(
+        &request.state_path,
+        &json!({
+            "status": "ready",
+            "server_pid": child.id(),
+            "backend_state": "ready",
+            "backend_requested": ROCM_BACKEND_NAME,
+            "backend_mode": "lemonade-packaged-llama-server-rocm",
+            "load_response": {
+                "status": "loaded",
+                "method": "lemonade-packaged-llama-server",
+                "model_name": request.model_ref,
+                "model_path": model_path,
+                "llamacpp_backend": ROCM_BACKEND_NAME
+            },
+        }),
+    )?;
+    let status = child
+        .wait()
+        .context("failed waiting for Lemonade packaged llama-server")?;
+    mark_json_status(
+        &request.state_path,
+        if status.success() {
+            "stopped"
+        } else {
+            "failed"
+        },
+    )?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Lemonade packaged llama-server exited with status {status}")
+    }
 }
 
-fn wait_for_health(host: &str, port: u16, timeout: Duration) -> Result<()> {
+fn direct_llama_server_path(manifest: &LemonadeInstallManifest) -> PathBuf {
+    manifest
+        .runtime_dir
+        .join("bin")
+        .join("llamacpp")
+        .join("rocm-stable")
+        .join(platform_binary_name("llama-server"))
+}
+
+fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Option<PathBuf> {
+    let as_path = PathBuf::from(model_ref);
+    if as_path.is_file() {
+        return Some(as_path);
+    }
+    if resolve_lemonade_model_ref(model_ref) != DEFAULT_MODEL {
+        return None;
+    }
+    default_qwen_cache_roots(paths)
+        .into_iter()
+        .find_map(find_default_qwen_gguf)
+}
+
+fn default_qwen_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
+    let mut roots = vec![paths.cache_dir.join("huggingface").join("hub")];
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        roots.push(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    roots
+}
+
+fn find_default_qwen_gguf(cache_root: PathBuf) -> Option<PathBuf> {
+    let snapshots = cache_root.join(DEFAULT_MODEL_REPO_DIR).join("snapshots");
+    let entries = fs::read_dir(snapshots).ok()?;
+    entries
+        .flatten()
+        .map(|entry| entry.path().join(DEFAULT_MODEL_GGUF))
+        .find(|path| path.is_file())
+}
+
+fn wait_for_openai_models_ready(
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let endpoint = format_http_base_url(host, port);
     let start = std::time::Instant::now();
     let mut last_error = None;
     while start.elapsed() < timeout {
-        match query_health(host, port) {
+        match http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
+            .and_then(|body| parse_models_ready(&body, model_ref))
+        {
             Ok(true) => return Ok(()),
-            Ok(false) => last_error = Some("health endpoint returned not ok".to_owned()),
+            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
             Err(error) => last_error = Some(error.to_string()),
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(500));
     }
     bail!(
-        "Lemonade health endpoint did not become ready: {}",
+        "Lemonade packaged llama-server did not become ready: {}",
         last_error.unwrap_or_else(|| "not checked".to_owned())
     )
 }
 
-fn query_health(host: &str, port: u16) -> Result<bool> {
-    let value = query_health_json(host, port)?;
-    Ok(value
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "ok" | "ready" | "running")))
+fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
+    let value = serde_json::from_str::<Value>(body.trim())
+        .context("failed to parse /v1/models response")?;
+    Ok(models_payload_has_loaded_model(&value, model_ref))
+}
+
+fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
+    value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                ["id", "model", "name"]
+                    .into_iter()
+                    .filter_map(|field| model.get(field).and_then(Value::as_str))
+                    .any(|loaded| model_names_match(loaded, model_ref))
+            })
+        })
+}
+
+fn lemonade_model_load_args(host: &str, port: u16, model_ref: &str) -> Vec<String> {
+    vec![
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+        "load".to_owned(),
+        model_ref.to_owned(),
+        "--llamacpp".to_owned(),
+        ROCM_BACKEND_NAME.to_owned(),
+        "--save-options".to_owned(),
+    ]
 }
 
 fn query_health_json(host: &str, port: u16) -> Result<Value> {
-    let url = format!("{}/v1/health", format_http_base_url(host, port));
-    ureq::get(&url)
-        .timeout(Duration::from_secs(3))
-        .call()
-        .with_context(|| format!("failed to query Lemonade health at {url}"))?
-        .into_json()
-        .context("failed to parse Lemonade health JSON")
+    let endpoint = format_http_base_url(host, port);
+    let body = http_get_text(&endpoint, "/v1/health", Duration::from_secs(3))
+        .with_context(|| format!("failed to query Lemonade health at {endpoint}/v1/health"))?;
+    serde_json::from_str(&body).context("failed to parse Lemonade health JSON")
 }
 
 fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: &str) -> Result<bool> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    let health = query_health_json(&host, port)?;
-    Ok(health_has_loaded_model(&health, model_ref))
+    match query_health_json(&host, port) {
+        Ok(health) => Ok(health_has_loaded_model(&health, model_ref)),
+        Err(_) => {
+            let endpoint = format_http_base_url(&host, port);
+            let body = http_get_text(&endpoint, "/v1/models", Duration::from_secs(3))
+                .with_context(|| {
+                    format!("failed to query Lemonade models at {endpoint}/v1/models")
+                })?;
+            let models = serde_json::from_str::<Value>(&body)
+                .context("failed to parse Lemonade /v1/models JSON")?;
+            Ok(models_payload_has_loaded_model(&models, model_ref))
+        }
+    }
 }
 
-fn wait_for_model_loaded(
-    host: &str,
-    port: u16,
-    model_ref: &str,
-    timeout: Duration,
-) -> Result<Value> {
-    let start = std::time::Instant::now();
-    let mut last_health = None;
-    let mut last_error = None;
-    while start.elapsed() < timeout {
-        match query_health_json(host, port) {
-            Ok(health) => {
-                if health_has_loaded_model(&health, model_ref) {
-                    return Ok(health);
-                }
-                last_health = Some(health);
-            }
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    if let Some(error) = last_error {
-        bail!("failed while waiting for Lemonade model load: {error}");
-    }
-    bail!(
-        "timed out waiting for Lemonade to load {model_ref}; last health: {}",
-        last_health
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_owned())
+fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) -> Result<bool> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {host}:{port}"))?
+        .next()
+        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
+    let timeout = Duration::from_secs(8);
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to {host}:{port}"))?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    let body = json!({
+        "model": model_ref,
+        "messages": [{"role": "user", "content": "Say ok."}],
+        "max_tokens": 2,
+        "stream": false
+    });
+    let body = serde_json::to_string(&body).context("failed to serialize chat smoke request")?;
+    let host_header = format_host_port(host, port);
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
     )
+    .context("failed to write chat smoke request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read chat smoke response")?;
+    let status_line = response.lines().next().unwrap_or_default();
+    Ok(status_line.contains(" 200 "))
 }
 
 fn health_has_loaded_model(health: &Value, model_ref: &str) -> bool {
@@ -1113,28 +1635,8 @@ fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String> {
 
 #[cfg(windows)]
 fn spawn_serve_http_background(current_exe: &Path, serve_args: &[String]) -> Result<u32> {
-    let output = ProcessCommand::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg("$p = Start-Process -FilePath $args[0] -ArgumentList $args[1..($args.Count-1)] -WindowStyle Hidden -PassThru; [Console]::Out.Write($p.Id)")
-        .arg(current_exe)
-        .args(serve_args)
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to invoke PowerShell background launcher")?;
-    if !output.status.success() {
-        bail!(
-            "PowerShell background launcher failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    pid_text
-        .parse::<u32>()
-        .with_context(|| format!("invalid launcher pid `{pid_text}`"))
+    rocm_core::spawn_detached_no_inherit(current_exe, serve_args, &[])
+        .context("failed to launch Lemonade serve-http background process")
 }
 
 #[cfg(not(windows))]
@@ -1282,33 +1784,8 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(lines.into_iter().collect())
 }
 
-fn terminate_pid(pid: u32, force: bool) -> bool {
-    #[cfg(windows)]
-    {
-        let mut command = ProcessCommand::new("taskkill");
-        command.arg("/PID").arg(pid.to_string()).arg("/T");
-        if force {
-            command.arg("/F");
-        }
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        let signal = if force { "-KILL" } else { "-TERM" };
-        ProcessCommand::new("kill")
-            .arg(signal)
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
+fn terminate_pid(pid: u32, _force: bool) -> bool {
+    rocm_core::terminate_process(pid).is_ok()
 }
 
 fn free_local_port() -> Result<u16> {
@@ -1465,6 +1942,47 @@ mod tests {
     }
 
     #[test]
+    fn embeddable_package_matches_runtime_os() {
+        if runtime_is_windows() {
+            assert!(embeddable_archive_name().ends_with("windows-x64.zip"));
+            assert!(embeddable_url().ends_with("windows-x64.zip"));
+            assert_eq!(platform_binary_name("lemond"), "lemond.exe");
+        } else {
+            assert!(embeddable_archive_name().ends_with("ubuntu-x64.tar.gz"));
+            assert!(embeddable_url().ends_with("ubuntu-x64.tar.gz"));
+            assert_eq!(platform_binary_name("lemond"), "lemond");
+        }
+    }
+
+    #[test]
+    fn windows_child_path_maps_ape_drive_paths() {
+        assert_eq!(
+            windows_child_path(Path::new("/D/jam/rocm-cli/file.zip")),
+            r"D:\jam\rocm-cli\file.zip"
+        );
+        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
+    }
+
+    #[test]
+    fn lemonade_model_load_uses_rocm_backend() {
+        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL);
+        assert_eq!(
+            args,
+            vec![
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
+                "load",
+                DEFAULT_MODEL,
+                "--llamacpp",
+                "rocm",
+                "--save-options",
+            ]
+        );
+    }
+
+    #[test]
     fn device_policy_rejects_cpu_without_fallback() {
         let error = normalize_device_policy(Some(DevicePolicy::CpuOnly))
             .expect_err("cpu should be rejected")
@@ -1500,27 +2018,6 @@ mod tests {
         assert!(args.contains(&"--env-id".to_owned()));
         assert!(args.contains(&"env".to_owned()));
         assert!(!args.iter().any(|arg| arg == "cpu"));
-    }
-
-    #[test]
-    fn rocm_backend_parser_rejects_unsupported_state() {
-        let value = json!({
-            "recipes": {
-                "llamacpp": {
-                    "backends": {
-                        "rocm": {
-                            "state": "unsupported",
-                            "message": "Unsupported GPU"
-                        }
-                    }
-                }
-            }
-        });
-        let error = lemonade_rocm_backend(&value)
-            .expect_err("unsupported backend should fail")
-            .to_string();
-        assert!(error.contains("unsupported"));
-        assert!(error.contains("No CPU fallback"));
     }
 
     #[test]

@@ -7,19 +7,23 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(test)]
+use rocm_core::engine_plugin_dirs;
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord,
     ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
     append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, daemon_binary_path, default_engine_for_platform, engine_binary_path,
-    engine_plugin_dirs, format_host_port, load_recent_automation_events,
-    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
+    builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
+    load_recent_automation_events, model_artifact_cache_status, resolve_model_recipe_artifact,
+    unix_time_millis,
 };
+#[cfg(test)]
+use rocm_engine_protocol::EnginePluginDescriptor;
 use rocm_engine_protocol::{
-    EngineMethod, EnginePluginDescriptor, EngineRequestEnvelope, EngineResponseEnvelope,
-    HealthcheckRequest, HealthcheckResponse,
+    EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, HealthcheckRequest,
+    HealthcheckResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,7 @@ use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -242,6 +247,19 @@ fn resolve_huggingface_token() -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    run_cli(cli).await
+}
+
+pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
+    let cli = Cli::try_parse_from(args)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create rocmd runtime")?;
+    runtime.block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     let paths = AppPaths::discover()?;
 
     match cli.command.unwrap_or(Command::Status) {
@@ -1338,17 +1356,15 @@ fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
 
 fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
     let default_engine = default_engine_for_platform();
+    let current_exe = std::env::current_exe().ok();
     rocmd_engine_inventory()
         .iter()
-        .map(|(id, summary)| {
-            let binary_path = resolve_engine_binary_path(id).ok();
-            CodexBridgeEngine {
-                id: (*id).to_owned(),
-                summary: (*summary).to_owned(),
-                default_for_platform: *id == default_engine,
-                installed_binary: binary_path.is_some(),
-                binary_path: binary_path.map(|path| path.display().to_string()),
-            }
+        .map(|(id, summary)| CodexBridgeEngine {
+            id: (*id).to_owned(),
+            summary: (*summary).to_owned(),
+            default_for_platform: *id == default_engine,
+            installed_binary: true,
+            binary_path: current_exe.as_ref().map(|path| path.display().to_string()),
         })
         .collect()
 }
@@ -1379,14 +1395,7 @@ fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn resolve_engine_binary_path(engine: &str) -> Result<PathBuf> {
-    let paths = AppPaths::discover()?;
-    if let Some(path) = find_engine_plugin_binary(engine, engine_plugin_dirs(&paths))? {
-        return Ok(path);
-    }
-    engine_binary_path(engine)
-}
-
+#[cfg(test)]
 fn find_engine_plugin_binary<I, P>(engine: &str, plugin_dirs: I) -> Result<Option<PathBuf>>
 where
     I: IntoIterator<Item = P>,
@@ -3074,9 +3083,11 @@ fn supervise_service(
         .try_clone()
         .context("failed to clone service log file handle")?;
 
-    let engine_binary = resolve_engine_binary_path(&engine)?;
-    let mut child = ProcessCommand::new(engine_binary)
+    let rocm_binary =
+        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+    let mut child = ProcessCommand::new(rocm_binary)
         .args(engine_serve_http_args(
+            &engine,
             &record.service_id,
             &canonical_model_id,
             &record.host,
@@ -3125,6 +3136,7 @@ fn supervise_service(
 
 #[allow(clippy::too_many_arguments)]
 fn engine_serve_http_args(
+    engine: &str,
     service_id: &str,
     canonical_model_id: &str,
     host: &str,
@@ -3136,7 +3148,8 @@ fn engine_serve_http_args(
     state_path: &Path,
 ) -> Vec<String> {
     let mut args = vec![
-        "serve-http".to_owned(),
+        "__engine-serve-http".to_owned(),
+        engine.to_owned(),
         service_id.to_owned(),
         canonical_model_id.to_owned(),
         "--host".to_owned(),
@@ -4965,6 +4978,7 @@ mod tests {
     fn engine_serve_http_args_forward_engine_recipe_json() {
         let engine_recipe_json = r#"{"contract_version":"0.1.0","engine":"vllm","required_flags":["--enable-auto-tool-choice"]}"#;
         let args = engine_serve_http_args(
+            "vllm",
             "svc-1",
             "Qwen/Qwen3.5-4B",
             "127.0.0.1",
@@ -8503,13 +8517,15 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
-    let engine_binary = resolve_engine_binary_path(engine)?;
     let envelope = EngineRequestEnvelope {
         method,
         payload: serde_json::to_value(request).context("failed to serialize engine request")?,
     };
+    let engine_binary =
+        std::env::current_exe().context("failed to resolve current rocm executable path")?;
     let mut child = ProcessCommand::new(&engine_binary)
-        .arg("stdio")
+        .arg("__engine-stdio")
+        .arg(engine)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

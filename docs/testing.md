@@ -77,6 +77,60 @@ This probe reports whether the local Rust toolchain exposes a Cosmopolitan/APE
 target, whether a `cosmocc` compiler is available, and whether repo wording
 still separates platform-native binaries from self-extracting APE launchers.
 
+Run the current clean Rust/Cosmopolitan APE rebuild when working on the true
+single-file rocm-cli artifact:
+
+```bash
+rm -rf .rocm-work
+scripts/setup-cosmocc.sh
+python3 scripts/rust_cosmopolitan_spike.py install-toolchain
+python3 scripts/rust_cosmopolitan_spike.py build-rocm --release --clean --jobs 96
+python3 scripts/rust_cosmopolitan_spike.py smoke-wsl-linux-path --release
+```
+
+The release artifact is:
+
+```text
+.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
+```
+
+Run the production single-exe gate for safe isolated checks:
+
+```bash
+python scripts/single_exe_release_gate.py
+```
+
+When a managed TheRock runtime already exists and you want live GPU checks,
+copy only runtime state into a temporary root:
+
+```bash
+python scripts/single_exe_release_gate.py \
+  --runtime-state ~/.rocm \
+  --live-assistant \
+  --live-comfyui \
+  --generate-cat
+```
+
+On native Windows, run it directly. For WSL validation, launch the same file
+through a POSIX path so WSLInterop cannot treat the `MZ` header as a Windows
+program before rocm-cli starts:
+
+```bash
+sh .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
+
+.rocm-work/tools/cosmocc-wsl-elf/bin/ape-x86_64.elf \
+  .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
+```
+
+The WSL output must include `os: linux` and `wsl: true`, and must not include
+`os: windows`. Direct `./rocm` may be intercepted by WSLInterop even without a
+`.exe` extension because WSL matches the file header, so the smoke test uses
+`sh <same file>` and fails if the command reports Windows.
+
+Use isolated `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and
+`ROCM_CLI_CACHE_DIR` roots for smoke tests, then delete those roots after the
+test so the user's real `.rocm` state stays clean.
+
 Run the bootstrap workflow acceptance harness:
 
 ```bash
@@ -338,6 +392,18 @@ ROCm runtime:
 python scripts/comfyui_therock_gpu_test.py
 ```
 
+Run the live test with isolated rocm-cli state while reusing only the existing
+managed TheRock runtime records:
+
+```bash
+python scripts/comfyui_therock_gpu_test.py --temp-state --copy-runtime-state-from %USERPROFILE%\.rocm
+```
+
+That command copies `config.json` and `runtimes/` into a temporary
+`ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR`, installs
+ComfyUI in that temporary app state, then removes the temporary state after it
+stops the process it started.
+
 To reuse an already installed ComfyUI app without reinstalling dependencies:
 
 ```bash
@@ -359,6 +425,17 @@ status`, `rocm comfyui logs`, and `rocm comfyui stop`. It starts ComfyUI with
 `rocm comfyui status` says `status: running`, and stops the process it started
 unless `--keep-running` is set.
 
+Manual non-TUI launch:
+
+```bash
+rocm comfyui install
+rocm comfyui start
+```
+
+`rocm comfyui start` prints the local browser URL, normally
+`http://127.0.0.1:8188`. It must also print `AMD GPU check: ready`; if that
+check fails, rocm-cli stops instead of launching ComfyUI in CPU mode.
+
 For WSL, run from the WSL filesystem instead of `/mnt`:
 
 ```bash
@@ -367,6 +444,7 @@ CARGO_TARGET_DIR=/home/$USER/rocm-cli-work/target-linux cargo build -p rocm
 python3 scripts/comfyui_therock_gpu_test.py \
   --rocm /home/$USER/rocm-cli-work/target-linux/debug/rocm \
   --temp-state \
+  --copy-runtime-state-from /home/$USER/.rocm \
   --generate-cat
 ```
 

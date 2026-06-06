@@ -1,7 +1,11 @@
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use rocm_core::{AppPaths, RocmCliConfig, format_http_base_url, unix_time_millis};
+use rocm_core::{
+    AppPaths, RocmCliConfig, download_file_to_path, format_http_base_url,
+    runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
+    runtime_path_for_windows_child, unix_time_millis,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -9,7 +13,7 @@ use std::fs;
 use std::io::{self, Read, Write as IoWrite};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -411,6 +415,7 @@ pub(crate) fn install(
         run_logged_command(
             &runtime.python,
             pip_install_args(&pip_cache, &packages),
+            Some(&runtime_env),
             &mut log,
             "install ComfyUI dependencies",
         )?;
@@ -482,20 +487,25 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
     fs::File::create(&log_path)
         .with_context(|| format!("failed to create {}", log_path.display()))?;
     let pid = spawn_comfyui_background(paths, &manifest, &options, &runtime_env, &log_path)?;
-    save_state(
-        paths,
-        &ComfyUiState {
-            app_id: APP_ID.to_owned(),
-            url: url.clone(),
-            host: options.host.clone(),
-            port: options.port,
-            pid,
-            source_path: manifest.source_path.clone(),
-            python_executable: manifest.python_executable.clone(),
-            log_path: log_path.clone(),
-            started_at_unix_ms: unix_time_millis(),
-        },
-    )?;
+    let state = ComfyUiState {
+        app_id: APP_ID.to_owned(),
+        url: url.clone(),
+        host: options.host.clone(),
+        port: options.port,
+        pid,
+        source_path: manifest.source_path.clone(),
+        python_executable: manifest.python_executable.clone(),
+        log_path: log_path.clone(),
+        started_at_unix_ms: unix_time_millis(),
+    };
+    save_state(paths, &state)?;
+    let run_report = wait_for_running_state(&state, Duration::from_secs(180));
+    if run_report.state == ComfyUiRunState::Stopped {
+        bail!(
+            "ComfyUI stopped before the local URL was ready. Check the log at {}",
+            log_path.display()
+        );
+    }
     let browser_status = if options.no_open_browser {
         "not opened (--no-open-browser)".to_owned()
     } else {
@@ -507,7 +517,11 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
 
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
-    writeln!(output, "  status: starting")?;
+    writeln!(
+        output,
+        "  status: {}",
+        comfyui_run_state_cli_label(run_report.state)
+    )?;
     writeln!(
         output,
         "  AMD GPU check: ready ({} device{})",
@@ -521,10 +535,12 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
     writeln!(output, "  browser: {browser_status}")?;
     writeln!(output, "  pid: {pid}")?;
     writeln!(output, "  log: {}", log_path.display())?;
-    writeln!(
-        output,
-        "  note: ComfyUI keeps running in the background; if the browser did not open, use the URL above"
-    )?;
+    if run_report.state == ComfyUiRunState::Starting {
+        writeln!(
+            output,
+            "  note: ComfyUI is still loading; use the URL above once it is ready"
+        )?;
+    }
     Ok(output)
 }
 
@@ -550,9 +566,20 @@ pub(crate) fn stop(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
-#[cfg(not(windows))]
 fn spawn_comfyui_background(
-    _paths: &AppPaths,
+    paths: &AppPaths,
+    manifest: &ComfyUiManifest,
+    options: &ComfyUiStartOptions,
+    runtime_env: &ComfyUiRuntimeEnvironment,
+    log_path: &Path,
+) -> Result<u32> {
+    if runtime_is_windows() {
+        return spawn_comfyui_background_windows(paths, manifest, options, runtime_env, log_path);
+    }
+    spawn_comfyui_background_unix(manifest, options, runtime_env, log_path)
+}
+
+fn spawn_comfyui_background_unix(
     manifest: &ComfyUiManifest,
     options: &ComfyUiStartOptions,
     runtime_env: &ComfyUiRuntimeEnvironment,
@@ -589,8 +616,7 @@ fn spawn_comfyui_background(
     Ok(child.id())
 }
 
-#[cfg(windows)]
-fn spawn_comfyui_background(
+fn spawn_comfyui_background_windows(
     paths: &AppPaths,
     manifest: &ComfyUiManifest,
     options: &ComfyUiStartOptions,
@@ -602,15 +628,19 @@ fn spawn_comfyui_background(
         .with_context(|| format!("failed to create {}", state_dir.display()))?;
     let runner_path = state_dir.join("run-comfyui.ps1");
     let launcher_path = state_dir.join("launch-comfyui.ps1");
+    let pid_path = state_dir.join("comfyui-launch.pid");
 
     let mut runner = String::new();
     writeln!(runner, "$ErrorActionPreference = 'Continue'")?;
     writeln!(
         runner,
         "Set-Location -LiteralPath {}",
-        powershell_quote(&manifest.source_path.to_string_lossy())
+        powershell_quote(&child_path_string(&manifest.source_path))
     )?;
     for (key, value) in runtime_environment_assignments(runtime_env)? {
+        if key == "PATH" {
+            continue;
+        }
         writeln!(
             runner,
             "$env:{} = {}",
@@ -618,7 +648,21 @@ fn spawn_comfyui_background(
             powershell_quote(&value.to_string_lossy())
         )?;
     }
-    let mut command_line = windows_cmd_quote(&manifest.python_executable.to_string_lossy());
+    let mut path_prefix_entries = runtime_env.path_entries.clone();
+    path_prefix_entries.extend(runtime_env.library_entries.iter().cloned());
+    let path_prefix = path_prefix_entries
+        .iter()
+        .map(|path| child_path_string(path))
+        .collect::<Vec<_>>()
+        .join(";");
+    if !path_prefix.is_empty() {
+        writeln!(
+            runner,
+            "$env:PATH = {} + ';' + $env:PATH",
+            powershell_quote(&path_prefix)
+        )?;
+    }
+    let mut command_line = powershell_quote(&child_path_string(&manifest.python_executable));
     for arg in [
         "main.py",
         "--listen",
@@ -626,45 +670,45 @@ fn spawn_comfyui_background(
         "--port",
         &options.port.to_string(),
     ] {
-        write!(command_line, " {}", windows_cmd_quote(arg))?;
+        write!(command_line, " {}", powershell_quote(arg))?;
     }
-    write!(
-        command_line,
-        " 1>>{} 2>>&1",
-        windows_cmd_quote(&log_path.to_string_lossy())
-    )?;
     writeln!(
         runner,
-        "& 'cmd.exe' '/S' '/C' {}",
-        powershell_quote(&command_line)
+        "& {} *>> {}",
+        command_line,
+        powershell_quote(&child_path_string(log_path))
     )?;
     fs::write(&runner_path, runner)
         .with_context(|| format!("failed to write {}", runner_path.display()))?;
 
     let launcher = format!(
-        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -WindowStyle Hidden -PassThru\n$p.Id\n",
-        powershell_quote(&runner_path.to_string_lossy())
+        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -WindowStyle Hidden -PassThru\nSet-Content -LiteralPath {} -Value $p.Id -Encoding ASCII\n",
+        powershell_quote(&child_path_string(&runner_path)),
+        powershell_quote(&child_path_string(&pid_path))
     );
     fs::write(&launcher_path, launcher)
         .with_context(|| format!("failed to write {}", launcher_path.display()))?;
 
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-File")
-        .arg(&launcher_path)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run {}", launcher_path.display()))?;
-    if !output.status.success() {
+        .arg(&launcher_path);
+    let output = capture_configured_command(
+        command,
+        &format!("run ComfyUI launcher {}", launcher_path.display()),
+    )?;
+    let pid_text = fs::read_to_string(&pid_path).unwrap_or_default();
+    let _ = fs::remove_file(&pid_path);
+    if !output.status.success() && pid_text.trim().is_empty() {
         bail!(
             "failed to launch ComfyUI in the background: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let pid = stdout
+    let pid = pid_text
         .split_whitespace()
         .next()
         .context("PowerShell launcher did not return a process id")?
@@ -673,14 +717,8 @@ fn spawn_comfyui_background(
     Ok(pid)
 }
 
-#[cfg(windows)]
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(windows)]
-fn windows_cmd_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 fn app_root(paths: &AppPaths) -> PathBuf {
@@ -826,7 +864,7 @@ fn strip_ansi_sequences(text: &str) -> String {
 
 fn evaluate_running_state(state: &ComfyUiState) -> ComfyUiRunReport {
     let process_running = process_is_running(state.pid);
-    let endpoint_reachable = process_running && endpoint_is_reachable(&state.host, state.port);
+    let endpoint_reachable = endpoint_is_reachable(&state.host, state.port);
     let state = if endpoint_reachable {
         ComfyUiRunState::Running
     } else if process_running {
@@ -841,6 +879,19 @@ fn evaluate_running_state(state: &ComfyUiState) -> ComfyUiRunReport {
     }
 }
 
+fn wait_for_running_state(state: &ComfyUiState, timeout: Duration) -> ComfyUiRunReport {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_report = evaluate_running_state(state);
+    while std::time::Instant::now() < deadline {
+        if last_report.state == ComfyUiRunState::Running {
+            return last_report;
+        }
+        thread::sleep(Duration::from_millis(500));
+        last_report = evaluate_running_state(state);
+    }
+    last_report
+}
+
 fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
     match state {
         ComfyUiRunState::Running => "running",
@@ -850,6 +901,9 @@ fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
 }
 
 fn endpoint_is_reachable(host: &str, port: u16) -> bool {
+    if runtime_is_cosmopolitan_windows() {
+        return http_endpoint_is_reachable_with_download(host, port);
+    }
     let Ok(addresses) = (host, port).to_socket_addrs() else {
         return false;
     };
@@ -858,31 +912,57 @@ fn endpoint_is_reachable(host: &str, port: u16) -> bool {
         .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
 }
 
-#[cfg(windows)]
+fn http_endpoint_is_reachable_with_download(host: &str, port: u16) -> bool {
+    let url = format!("{}/system_stats", format_http_base_url(host, port));
+    let script = format!(
+        "$ProgressPreference = 'SilentlyContinue'; try {{ $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri {}; if ($r.StatusCode -eq 200 -and $r.Content.Length -gt 0) {{ Write-Output 'ready'; exit 0 }} exit 1 }} catch {{ exit 1 }}",
+        powershell_quote(&url)
+    );
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script);
+    let Ok(output) = capture_configured_command(command, "check ComfyUI HTTP endpoint") else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    output.status.success() || stdout.contains("ready")
+}
+
 fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    if runtime_is_windows() {
+        return windows_process_is_running(pid);
+    }
+    if runtime_is_linux() {
+        return unix_process_is_running(pid);
+    }
+    true
+}
+
+fn windows_process_is_running(pid: u32) -> bool {
     let filter = format!("PID eq {pid}");
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .stdin(Stdio::null())
-        .output()
-    else {
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    let Ok(output) = capture_configured_command(command, "check ComfyUI process") else {
         return false;
     };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains(&format!("\"{pid}\"")) {
+        return true;
+    }
     if !output.status.success() {
         return false;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.contains(&format!("\"{pid}\""))
+    false
 }
 
-#[cfg(unix)]
-fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
+fn unix_process_is_running(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -894,11 +974,6 @@ fn process_is_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(any(windows, unix)))]
-fn process_is_running(pid: u32) -> bool {
-    pid != 0
-}
-
 fn wait_until_stopped(pid: u32) {
     for _ in 0..20 {
         if !process_is_running(pid) {
@@ -908,11 +983,20 @@ fn wait_until_stopped(pid: u32) {
     }
 }
 
-#[cfg(windows)]
 fn terminate_process_tree(pid: u32) -> Result<()> {
     if !process_is_running(pid) {
         return Ok(());
     }
+    if runtime_is_windows() {
+        return terminate_windows_process_tree(pid);
+    }
+    if runtime_is_linux() {
+        return terminate_unix_process(pid);
+    }
+    Ok(())
+}
+
+fn terminate_windows_process_tree(pid: u32) -> Result<()> {
     let status = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -926,11 +1010,7 @@ fn terminate_process_tree(pid: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn terminate_process_tree(pid: u32) -> Result<()> {
-    if !process_is_running(pid) {
-        return Ok(());
-    }
+fn terminate_unix_process(pid: u32) -> Result<()> {
     let status = Command::new("kill")
         .arg(pid.to_string())
         .stdin(Stdio::null())
@@ -941,11 +1021,6 @@ fn terminate_process_tree(pid: u32) -> Result<()> {
     if !status.success() && process_is_running(pid) {
         bail!("failed to stop ComfyUI process {pid}");
     }
-    Ok(())
-}
-
-#[cfg(not(any(windows, unix)))]
-fn terminate_process_tree(_pid: u32) -> Result<()> {
     Ok(())
 }
 
@@ -1158,7 +1233,7 @@ fn runtime_environment_from_runtime(
         }
     }
     collect_rocm_runtime_paths(&manifest.install_root, &mut env);
-    if !cfg!(windows) {
+    if runtime_is_linux() {
         push_existing_path(&mut env.library_entries, PathBuf::from("/usr/lib/wsl/lib"));
     }
     env
@@ -1208,17 +1283,18 @@ fn runtime_environment_assignments(
         values.push(("ROCM_PATH", rocm_root.as_os_str().to_owned()));
     }
     let mut path_entries = env.path_entries.clone();
-    if cfg!(windows) {
+    if runtime_is_windows() {
         path_entries.extend(env.library_entries.iter().cloned());
     }
     if let Some(path) = prepend_env_paths(&path_entries, std::env::var_os("PATH"))? {
         values.push(("PATH", path));
     }
-    if !cfg!(windows)
-        && let Some(ld_library_path) =
+    if runtime_is_linux() {
+        if let Some(ld_library_path) =
             prepend_env_paths(&env.library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
-    {
-        values.push(("LD_LIBRARY_PATH", ld_library_path));
+        {
+            values.push(("LD_LIBRARY_PATH", ld_library_path));
+        }
     }
     Ok(values)
 }
@@ -1228,20 +1304,44 @@ fn prepend_env_paths(entries: &[PathBuf], current: Option<OsString>) -> Result<O
     for entry in entries {
         push_existing_path(&mut parts, entry.clone());
     }
-    if let Some(current) = current
-        && !current.is_empty()
-    {
-        for entry in std::env::split_paths(&current) {
-            push_existing_path(&mut parts, entry);
+    if let Some(current) = current {
+        if !current.is_empty() {
+            for entry in split_runtime_paths(&current) {
+                push_existing_path(&mut parts, entry);
+            }
         }
     }
     if parts.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(
-            std::env::join_paths(parts).context("failed to join runtime environment paths")?,
-        ))
+        join_runtime_paths(parts)
     }
+}
+
+fn split_runtime_paths(paths: &OsString) -> Vec<PathBuf> {
+    if runtime_is_windows() {
+        return paths
+            .to_string_lossy()
+            .split(';')
+            .filter(|part| !part.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
+    std::env::split_paths(paths).collect()
+}
+
+fn join_runtime_paths(paths: Vec<PathBuf>) -> Result<Option<OsString>> {
+    if runtime_is_windows() {
+        let joined = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(";");
+        return Ok(Some(OsString::from(joined)));
+    }
+    Ok(Some(
+        std::env::join_paths(paths).context("failed to join runtime environment paths")?,
+    ))
 }
 
 fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1254,7 +1354,7 @@ fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn same_path_text(left: &Path, right: &Path) -> bool {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         left.to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
     } else {
@@ -1345,24 +1445,7 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let response = ureq::get(url)
-        .timeout(Duration::from_secs(120))
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
-    if response.status() != 200 {
-        bail!("HTTP {} while downloading {url}", response.status());
-    }
-    let parent = destination
-        .parent()
-        .context("download destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read download {url}"))?;
-    fs::write(destination, bytes)
-        .with_context(|| format!("failed to write {}", destination.display()))
+    download_file_to_path(url, destination, Duration::from_secs(120))
 }
 
 fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
@@ -1422,6 +1505,7 @@ fn pip_install_args(pip_cache: &Path, packages: &[String]) -> Vec<String> {
 fn run_logged_command(
     program: &Path,
     args: Vec<String>,
+    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
     log: &mut fs::File,
     context_text: &str,
 ) -> Result<()> {
@@ -1434,11 +1518,16 @@ fn run_logged_command(
             .collect::<Vec<_>>()
             .join(" ")
     )?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(runtime_env) = runtime_env {
+        apply_runtime_environment(&mut command, runtime_env)?;
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("{context_text}: failed to run {}", program.display()))?;
     let stdout = child
@@ -1514,10 +1603,14 @@ fn probe_comfyui(
     source_path: &Path,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
 ) -> Result<ComfyUiProbe> {
+    let probe_dir = create_temp_dir_under(source_path, "probe")?;
+    let probe_path = probe_dir.join("probe.py");
+    let result_path = probe_dir.join("result.json");
+    let source_literal = serde_json::to_string(&child_path_string(source_path))?;
     let script = format!(
         r#"
 import json, sys
-sys.path.insert(0, {source:?})
+sys.path.insert(0, {source})
 import torch
 result = {{
     "torch_version": getattr(torch, "__version__", None),
@@ -1525,29 +1618,108 @@ result = {{
     "device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
     "devices": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [],
 }}
-print(json.dumps(result))
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(result, handle)
 "#,
-        source = source_path.display().to_string()
+        source = source_literal
     );
+    fs::write(&probe_path, script)
+        .with_context(|| format!("failed to write {}", probe_path.display()))?;
     let mut command = Command::new(python);
-    command.arg("-c").arg(script);
+    command
+        .arg(child_path_string(&probe_path))
+        .arg(child_path_string(&result_path));
     if let Some(runtime_env) = runtime_env {
         apply_runtime_environment(&mut command, runtime_env)?;
     }
-    let output = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to run GPU check with {}", python.display()))?;
+    let output = capture_configured_command(
+        command,
+        &format!("run ComfyUI GPU check with {}", python.display()),
+    )?;
+    let result_text = fs::read_to_string(&result_path).unwrap_or_default();
+    let parsed_result = serde_json::from_str::<ComfyUiProbe>(result_text.trim());
     if !output.status.success() {
+        if let Ok(probe) = parsed_result {
+            let _ = fs::remove_dir_all(&probe_dir);
+            return Ok(probe);
+        }
+        let _ = fs::remove_dir_all(&probe_dir);
         bail!(
-            "ComfyUI GPU check failed: {}",
+            "ComfyUI GPU check failed with status {}.\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).context("failed to parse ComfyUI GPU check output")
+    let probe = match parsed_result {
+        Ok(probe) => probe,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&probe_dir);
+            return Err(error).context("failed to parse ComfyUI GPU check output");
+        }
+    };
+    let _ = fs::remove_dir_all(&probe_dir);
+    Ok(probe)
+}
+
+struct CapturedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn capture_configured_command(
+    mut command: Command,
+    context_label: &str,
+) -> Result<CapturedCommandOutput> {
+    let temp_dir = create_capture_temp_dir()?;
+    let stdout_path = temp_dir.join("stdout.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status_result = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("{context_label}: failed to start command"));
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(CapturedCommandOutput {
+        status: status_result?,
+        stdout,
+        stderr,
+    })
+}
+
+fn create_capture_temp_dir() -> Result<PathBuf> {
+    create_temp_dir("capture")
+}
+
+fn create_temp_dir(label: &str) -> Result<PathBuf> {
+    create_temp_dir_under(&std::env::temp_dir(), label)
+}
+
+fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
+    fs::create_dir_all(root).with_context(|| format!("failed to create {}", root.display()))?;
+    for attempt in 0..1000 {
+        let path = root.join(format!(
+            "rocm-comfyui-{label}-{}-{}-{attempt}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            }
+        }
+    }
+    bail!("failed to allocate a temporary command capture directory")
 }
 
 fn quote_log_arg(value: &str) -> String {
@@ -1561,15 +1733,23 @@ fn quote_log_arg(value: &str) -> String {
     }
 }
 
+fn child_path_string(path: &Path) -> String {
+    if runtime_is_windows() {
+        runtime_path_for_windows_child(path)
+    } else {
+        path.display().to_string()
+    }
+}
+
 fn open_browser(url: &str) -> Result<()> {
-    let status = if cfg!(windows) {
+    let status = if runtime_is_windows() {
         Command::new("cmd")
             .args(["/C", "start", "", url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(target_os = "macos") && !runtime_is_linux() {
         Command::new("open")
             .arg(url)
             .stdin(Stdio::null())
@@ -1595,6 +1775,7 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_core::{runtime_python_bin_dir_name, runtime_python_executable_name};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1854,24 +2035,20 @@ mod tests {
     fn default_runtime_selection_uses_single_ready_runtime() -> Result<()> {
         let paths = test_paths("comfyui-single-ready-runtime");
         let runtime_root = paths.data_dir.join("runtimes").join("default");
-        let python_bin = runtime_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python = python_bin.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
+        let python_bin = runtime_root.join(runtime_python_bin_dir_name());
+        let python = python_bin.join(runtime_python_executable_name());
         let sdk_root = runtime_root.join("sdk");
         let sdk_bin = sdk_root.join("bin");
         fs::create_dir_all(&python_bin)?;
         fs::create_dir_all(&sdk_bin)?;
         fs::write(runtime_root.join(".rocm-cli-runtime.json"), "{}")?;
         fs::write(&python, "python")?;
-        let amdhip = sdk_bin.join(if cfg!(windows) {
+        let amdhip = sdk_bin.join(if runtime_is_windows() {
             "amdhip64.dll"
         } else {
             "libamdhip64.so"
         });
-        let hipblas = sdk_bin.join(if cfg!(windows) {
+        let hipblas = sdk_bin.join(if runtime_is_windows() {
             "hipblas.dll"
         } else {
             "libhipblas.so"
@@ -1928,12 +2105,8 @@ mod tests {
     fn runtime_environment_preloads_managed_rocm_paths() -> Result<()> {
         let paths = test_paths("comfyui-runtime-env");
         let env_root = paths.data_dir.join("envs").join("therock");
-        let python_bin = env_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python = python_bin.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
+        let python_bin = env_root.join(runtime_python_bin_dir_name());
+        let python = python_bin.join(runtime_python_executable_name());
         let sdk_root = paths.data_dir.join("runtimes").join("sdk");
         let sdk_bin = sdk_root.join("bin");
         let sdk_lib = sdk_root.join("lib");
@@ -1994,18 +2167,18 @@ mod tests {
             Some(sdk_root.as_os_str())
         );
         let path = command_env_value(&command, "PATH").context("PATH should be set")?;
-        let path_entries = std::env::split_paths(&path).collect::<Vec<_>>();
+        let path_entries = split_runtime_paths(&path);
         assert!(path_entries.contains(&python_bin));
         assert!(path_entries.contains(&sdk_bin));
         assert!(path_entries.contains(&runtime_bin));
 
-        if cfg!(windows) {
+        if runtime_is_windows() {
             assert!(path_entries.contains(&sdk_lib));
             assert!(path_entries.contains(&runtime_lib));
         } else {
             let ld_library_path =
                 command_env_value(&command, "LD_LIBRARY_PATH").context("LD_LIBRARY_PATH")?;
-            let library_entries = std::env::split_paths(&ld_library_path).collect::<Vec<_>>();
+            let library_entries = split_runtime_paths(&ld_library_path);
             assert!(library_entries.contains(&sdk_lib));
             assert!(library_entries.contains(&runtime_lib));
             assert!(library_entries.contains(&runtime_sysdeps));

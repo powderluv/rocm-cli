@@ -14,7 +14,13 @@ flate2 = "1.1"
 keyring-core.workspace = true
 ratatui.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
+rocm-engine-atom = { path = "../../engines/atom" }
+rocm-engine-lemonade = { path = "../../engines/lemonade" }
+rocm-engine-llama-cpp = { path = "../../engines/llama-cpp" }
+rocm-engine-pytorch = { path = "../../engines/pytorch" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
+rocm-engine-sglang = { path = "../../engines/sglang" }
+rocm-engine-vllm = { path = "../../engines/vllm" }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,5 +33,8 @@ windows-native-keyring-store = "1.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"), not(target_vendor = "cosmo")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_vendor = "cosmo")'.dependencies]
+crossterm_028 = { package = "crossterm", version = "0.28.1", features = ["libc", "use-dev-tty"] }

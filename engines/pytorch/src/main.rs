@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, detect_host_therock_family, extract_first_gfx_token,
-    format_host_port, format_http_base_url, interactive_terminal, normalize_therock_family,
-    require_nonempty, resolve_model_recipe as resolve_shared_model_recipe,
+    AppPaths, DEFAULT_LOCAL_PORT, ModelRecipeRecord, detect_host_therock_family,
+    extract_first_gfx_token, format_host_port, format_http_base_url, interactive_terminal,
+    normalize_runtime_path_for_host, normalize_runtime_path_text_for_host,
+    normalize_therock_family, require_nonempty,
+    resolve_model_recipe as resolve_shared_model_recipe, runtime_is_windows, unix_time_millis,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -20,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -401,6 +403,35 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    handle_envelope(envelope)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn builtin_serve_http(
+    service_id: String,
+    model_ref: String,
+    host: String,
+    port: u16,
+    device_policy: DevicePolicy,
+    env_id: Option<String>,
+    runtime_id: Option<String>,
+    state_path: PathBuf,
+    engine_recipe: Option<EngineRecipeHint>,
+) -> Result<()> {
+    serve_http(
+        service_id,
+        model_ref,
+        host,
+        port,
+        device_policy,
+        env_id,
+        runtime_id,
+        state_path,
+        engine_recipe,
+    )
+}
+
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     match envelope.method {
         EngineMethod::Detect => {
@@ -707,7 +738,7 @@ fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
 
     let current_exe =
         std::env::current_exe().context("failed to discover current engine binary")?;
-    let child = Command::new(current_exe)
+    let child = Command::new(command_path(&current_exe))
         .arg("serve-http")
         .arg(&request.service_id)
         .arg(&request.model_ref)
@@ -1137,58 +1168,10 @@ fn dedupe_pids(pids: &mut Vec<u32>) {
     *pids = unique;
 }
 
-fn terminate_pid(pid: u32, force: bool) -> PidTermination {
-    match process_is_running(pid) {
-        Ok(false) => return PidTermination::NotFound,
-        Ok(true) => {}
-        Err(_) => {}
-    }
-
-    let status = if cfg!(windows) {
-        let mut command = Command::new("taskkill");
-        command.arg("/PID").arg(pid.to_string()).arg("/T");
-        if force {
-            command.arg("/F");
-        }
-        command.status()
-    } else {
-        Command::new("kill")
-            .arg(if force { "-KILL" } else { "-TERM" })
-            .arg(pid.to_string())
-            .status()
-    };
-
-    match status {
-        Ok(status) if status.success() => PidTermination::Terminated,
-        _ => match process_is_running(pid) {
-            Ok(false) => PidTermination::NotFound,
-            _ => PidTermination::Failed,
-        },
-    }
-}
-
-fn process_is_running(pid: u32) -> Result<bool> {
-    if cfg!(windows) {
-        let output = Command::new("tasklist")
-            .arg("/FI")
-            .arg(format!("PID eq {pid}"))
-            .arg("/FO")
-            .arg("CSV")
-            .arg("/NH")
-            .output()
-            .context("failed to query tasklist")?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains(&format!("\"{pid}\"")))
-    } else {
-        let status = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .context("failed to query process status")?;
-        Ok(status.success())
+fn terminate_pid(pid: u32, _force: bool) -> PidTermination {
+    match rocm_core::terminate_process(pid) {
+        Ok(()) => PidTermination::Terminated,
+        Err(_) => PidTermination::Failed,
     }
 }
 
@@ -1480,62 +1463,75 @@ fn create_or_update_env_manifest(request: &InstallRequest) -> Result<EngineEnvMa
         }
     }
 
-    let freeze = capture_command(
-        &python_executable_string,
-        ["-m", "pip", "freeze"],
-        "capture managed pytorch env lockfile",
-    )?;
+    let installed_packages = if cosmo_windows_host() {
+        installed_package_specs_from_runtime_metadata(&python_executable_string)
+            .context("capture managed pytorch env lockfile from package metadata")?
+    } else {
+        let freeze = capture_command(
+            &python_executable_string,
+            ["-m", "pip", "freeze"],
+            "capture managed pytorch env lockfile",
+        )?;
+        freeze
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let freeze = installed_packages.join("\n") + "\n";
     fs::write(&lock_path, &freeze)
         .with_context(|| format!("failed to write {}", lock_path.display()))?;
-    let installed_packages = freeze
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
     let lock_hash = simple_hash(&freeze);
-    let torch_runtime_probe = match probe_torch_runtime(&python_executable_string) {
-        Ok(probe) => {
-            if therock_family.is_some() {
-                match probe.rocm_sdk.as_ref() {
-                    Some(sdk) if sdk.import_ok => {
-                        if let (Some(expected), Some(actual)) = (
-                            probe
-                                .torch_rocm_init
-                                .as_ref()
-                                .and_then(|init| init.check_version.as_deref()),
-                            sdk.version.as_deref(),
-                        ) && expected != actual
-                        {
-                            warnings.push(format!(
+    let torch_runtime_probe = if cosmo_windows_host() {
+        warnings.push(
+            "managed PyTorch runtime probe deferred for the universal Windows launcher".to_owned(),
+        );
+        None
+    } else {
+        match probe_torch_runtime(&python_executable_string) {
+            Ok(probe) => {
+                if therock_family.is_some() {
+                    match probe.rocm_sdk.as_ref() {
+                        Some(sdk) if sdk.import_ok => {
+                            if let (Some(expected), Some(actual)) = (
+                                probe
+                                    .torch_rocm_init
+                                    .as_ref()
+                                    .and_then(|init| init.check_version.as_deref()),
+                                sdk.version.as_deref(),
+                            ) && expected != actual
+                            {
+                                warnings.push(format!(
                                 "torch._rocm_init expects ROCm SDK {expected}, but rocm_sdk reports {actual}"
                             ));
+                            }
                         }
+                        Some(sdk) => warnings.push(format!(
+                            "rocm_sdk import probe failed in managed PyTorch env: {}",
+                            sdk.error.as_deref().unwrap_or("unknown error")
+                        )),
+                        None => warnings.push(
+                            "rocm_sdk probe was not reported by the managed PyTorch env".to_owned(),
+                        ),
                     }
-                    Some(sdk) => warnings.push(format!(
-                        "rocm_sdk import probe failed in managed PyTorch env: {}",
-                        sdk.error.as_deref().unwrap_or("unknown error")
-                    )),
-                    None => warnings.push(
-                        "rocm_sdk probe was not reported by the managed PyTorch env".to_owned(),
-                    ),
-                }
-                if !probe
-                    .torch_rocm_init
-                    .as_ref()
-                    .map(|init| init.present)
-                    .unwrap_or(false)
-                {
-                    warnings.push(
+                    if !probe
+                        .torch_rocm_init
+                        .as_ref()
+                        .map(|init| init.present)
+                        .unwrap_or(false)
+                    {
+                        warnings.push(
                         "torch._rocm_init was not found; TheRock library preloading may be unavailable"
                             .to_owned(),
                     );
+                    }
                 }
+                Some(probe)
             }
-            Some(probe)
-        }
-        Err(error) => {
-            warnings.push(format!("managed PyTorch runtime probe failed: {error}"));
-            None
+            Err(error) => {
+                warnings.push(format!("managed PyTorch runtime probe failed: {error}"));
+                None
+            }
         }
     };
 
@@ -1589,10 +1585,22 @@ fn load_manifest(path: &Path) -> Result<EngineEnvManifest> {
         .with_context(|| format!("failed to read engine manifest {}", path.display()))?;
     let mut manifest: EngineEnvManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse engine manifest {}", path.display()))?;
+    normalize_manifest_paths_for_host(&mut manifest);
     manifest.python_executable = resolve_manifest_python_executable(&manifest)
         .display()
         .to_string();
     Ok(manifest)
+}
+
+fn normalize_manifest_paths_for_host(manifest: &mut EngineEnvManifest) {
+    manifest.python_executable = normalize_runtime_path_text_for_host(&manifest.python_executable);
+    manifest.env_path = normalize_runtime_path_for_host(&manifest.env_path);
+    manifest.manifest_path = normalize_runtime_path_for_host(&manifest.manifest_path);
+    manifest.lock_path = normalize_runtime_path_for_host(&manifest.lock_path);
+    manifest.pip_cache_dir = manifest
+        .pip_cache_dir
+        .as_ref()
+        .map(|path| normalize_runtime_path_for_host(path));
 }
 
 fn write_manifest(manifest: &EngineEnvManifest) -> Result<()> {
@@ -1609,17 +1617,24 @@ fn discover_python_launcher(
     preferred_python: Option<&str>,
 ) -> Result<PythonLauncher> {
     let mut candidates = Vec::new();
-    if requested_version.is_none()
-        && let Some(python) = preferred_python
+    if let Some(python) = preferred_python
         && !python.trim().is_empty()
     {
+        let normalized = normalize_runtime_path_text_for_host(python);
+        if runtime_is_windows() {
+            return Ok(PythonLauncher {
+                program: normalized.clone(),
+                args: Vec::new(),
+                display: normalized,
+            });
+        }
         candidates.push(PythonLauncher {
-            program: python.to_owned(),
+            program: normalized.clone(),
             args: Vec::new(),
-            display: python.to_owned(),
+            display: normalized,
         });
     }
-    if cfg!(windows) {
+    if runtime_is_windows() {
         if let Some(version) = requested_version {
             candidates.push(PythonLauncher {
                 program: "py".to_owned(),
@@ -1657,19 +1672,27 @@ fn discover_python_launcher(
         });
     }
 
+    let mut attempts = Vec::new();
     for launcher in candidates {
-        let status = Command::new(&launcher.program)
+        let status = Command::new(command_program(&launcher.program))
             .args(&launcher.args)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        attempts.push(format!("{} -> {:?}", launcher.display, status));
         if matches!(status, Ok(value) if value.success()) {
             return Ok(launcher);
         }
     }
 
-    bail!("unable to locate a usable Python launcher for the pytorch engine")
+    bail!(
+        "unable to locate a usable Python launcher for the pytorch engine (runtime_os={}, requested_version={}, preferred_python={}, attempts={})",
+        rocm_core::runtime_os_name(),
+        requested_version.unwrap_or("<none>"),
+        preferred_python.unwrap_or("<none>"),
+        attempts.join("; ")
+    )
 }
 
 fn runtime_python_executable_for_selector(
@@ -1686,6 +1709,9 @@ fn runtime_python_executable_for_selector(
 }
 
 fn runtime_python_major_minor(python_executable: &str) -> Result<String> {
+    if cosmo_windows_host() {
+        return Ok("3.12".to_owned());
+    }
     let output = capture_command(
         python_executable,
         [
@@ -1702,7 +1728,7 @@ fn runtime_python_major_minor(python_executable: &str) -> Result<String> {
 }
 
 fn venv_python_path(env_path: &Path) -> PathBuf {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         env_path.join("Scripts").join("python.exe")
     } else {
         env_path.join("bin").join("python")
@@ -1725,7 +1751,7 @@ fn resolve_manifest_python_executable(manifest: &EngineEnvManifest) -> PathBuf {
 }
 
 fn venv_python_candidates(env_path: &Path) -> Vec<PathBuf> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return vec![
             env_path.join("Scripts").join("python.exe"),
             env_path.join("Scripts").join("python3.exe"),
@@ -1785,7 +1811,8 @@ fn serve_http(
             "endpoint_url": endpoint_url
         }))?,
     )?;
-    let mut child = Command::new(&manifest.python_executable)
+    let mut worker_command = Command::new(command_program(&manifest.python_executable));
+    worker_command
         .arg(&worker_script)
         .arg("--service-id")
         .arg(&service_id)
@@ -1812,9 +1839,15 @@ fn serve_http(
         .args(flag_arg("--trust-remote-code", recipe.trust_remote_code))
         .env("PYTHONUNBUFFERED", "1")
         .env("TOKENIZERS_PARALLELISM", "false")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdin(Stdio::null());
+    if cosmo_windows_host() {
+        worker_command.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        worker_command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
+    let mut child = worker_command
         .spawn()
         .context("failed to start python worker for pytorch engine")?;
 
@@ -1845,7 +1878,9 @@ fn serve_http(
 }
 
 fn canonical_model_id(model_ref: &str) -> String {
-    if let Ok(Some(recipe)) = resolve_shared_model_recipe(model_ref) {
+    if let Ok(Some(recipe)) = resolve_shared_model_recipe(model_ref)
+        && shared_recipe_supports_engine(&recipe, ENGINE_NAME)
+    {
         return recipe.canonical_model_id;
     }
 
@@ -1917,6 +1952,9 @@ fn known_recipe_for_model(model_ref: &str) -> Result<Option<ModelRecipe>> {
     let Some(recipe) = resolve_shared_model_recipe(model_ref)? else {
         return Ok(None);
     };
+    if !shared_recipe_supports_engine(&recipe, ENGINE_NAME) {
+        return Ok(None);
+    }
     let device_policy = parse_device_policy(&recipe.device_policy)
         .unwrap_or_else(|_| default_device_policy_for_memory(recipe.min_gpu_mem_gb));
     let canonical_model_id = recipe.canonical_model_id;
@@ -1935,6 +1973,17 @@ fn known_recipe_for_model(model_ref: &str) -> Result<Option<ModelRecipe>> {
         min_gpu_mem_gb,
         warnings,
     )))
+}
+
+fn shared_recipe_supports_engine(recipe: &ModelRecipeRecord, engine: &str) -> bool {
+    recipe
+        .preferred_engines
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(engine))
+        || recipe
+            .engine_recipes
+            .iter()
+            .any(|candidate| candidate.engine.eq_ignore_ascii_case(engine))
 }
 
 fn ensure_pytorch_model_supported(canonical_model_id: &str) -> Result<()> {
@@ -2215,14 +2264,14 @@ fn managed_env_id(runtime_id: &str, python_version: Option<&str>) -> String {
     let python = python_version.unwrap_or(default_python_version());
     format!(
         "{}-{}-{}",
-        std::env::consts::OS,
+        rocm_core::runtime_os_name(),
         slugify(runtime_id),
         slugify(python)
     )
 }
 
 fn default_python_version() -> &'static str {
-    if cfg!(windows) { "3.11" } else { "3.10" }
+    "3.12"
 }
 
 fn parse_therock_runtime_request(runtime_id: &str) -> TheRockRuntimeRequest {
@@ -2385,6 +2434,14 @@ fn load_runtime_registry_manifest_path(path: &Path) -> Result<RuntimeRegistryMan
 }
 
 fn pinned_torch_package_specs_from_runtime(python_executable: &str) -> Result<Vec<String>> {
+    match pinned_torch_package_specs_from_runtime_metadata(python_executable) {
+        Ok(specs) => return Ok(specs),
+        Err(metadata_error) if cosmo_windows_host() => {
+            bail!("failed to inspect runtime package metadata: {metadata_error}");
+        }
+        Err(_) => {}
+    }
+
     let code = format!(
         "import importlib.metadata as md, json; names = {names:?}; print(json.dumps({{name: md.version(name) for name in names}}, sort_keys=True))",
         names = THEROCK_TORCH_PACKAGES
@@ -2395,6 +2452,159 @@ fn pinned_torch_package_specs_from_runtime(python_executable: &str) -> Result<Ve
         "inspect managed runtime torch package versions",
     )?;
     parse_torch_package_version_specs(&output)
+}
+
+fn pinned_torch_package_specs_from_runtime_metadata(
+    python_executable: &str,
+) -> Result<Vec<String>> {
+    let packages = installed_package_specs_from_runtime_metadata(python_executable)?;
+    let versions = packages
+        .iter()
+        .filter_map(|spec| spec.split_once("=="))
+        .map(|(name, version)| (name.to_ascii_lowercase(), version.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let mut specs = Vec::new();
+    for name in THEROCK_TORCH_PACKAGES {
+        let version = versions
+            .get(*name)
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("runtime metadata is missing package `{name}`"))?;
+        specs.push(format!("{name}=={version}"));
+    }
+    Ok(specs)
+}
+
+fn installed_package_specs_from_runtime_metadata(python_executable: &str) -> Result<Vec<String>> {
+    let mut errors = Vec::new();
+    for site_packages in site_packages_candidates_for_python(python_executable) {
+        match installed_package_specs_from_dist_info_dir(&site_packages) {
+            Ok(specs) => return Ok(specs),
+            Err(error) => errors.push(format!("{}: {error}", site_packages.display())),
+        }
+    }
+    bail!(
+        "could not find installed package metadata ({})",
+        errors.join("; ")
+    )
+}
+
+fn site_packages_candidates_for_python(python_executable: &str) -> Vec<PathBuf> {
+    let python_path = PathBuf::from(normalize_runtime_path_text_for_host(python_executable));
+    let Some(parent) = python_path.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    if runtime_is_windows() {
+        if parent
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("scripts"))
+            .unwrap_or(false)
+            && let Some(env_root) = parent.parent()
+        {
+            candidates.push(env_root.join("Lib").join("site-packages"));
+        }
+        candidates.push(parent.join("Lib").join("site-packages"));
+    } else {
+        if parent
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value == "bin")
+            .unwrap_or(false)
+            && let Some(env_root) = parent.parent()
+        {
+            let lib_dir = env_root.join("lib");
+            if let Ok(entries) = fs::read_dir(&lib_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("python") {
+                        candidates.push(path.join("site-packages"));
+                    }
+                }
+            }
+            candidates.push(
+                lib_dir
+                    .join(format!("python{}", default_python_version()))
+                    .join("site-packages"),
+            );
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn installed_package_specs_from_dist_info_dir(site_packages: &Path) -> Result<Vec<String>> {
+    let mut versions = BTreeMap::new();
+    let entries = fs::read_dir(site_packages)
+        .with_context(|| format!("failed to read {}", site_packages.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let is_dist_info = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase().ends_with(".dist-info"))
+            .unwrap_or(false);
+        if !path.is_dir() || !is_dist_info {
+            continue;
+        }
+        let metadata_path = path.join("METADATA");
+        if !metadata_path.is_file() {
+            continue;
+        }
+        if let Some((name, version)) = dist_info_name_version(&metadata_path)?
+            && !name.trim().is_empty()
+            && !version.trim().is_empty()
+        {
+            versions.insert(name, version);
+        }
+    }
+    if versions.is_empty() {
+        bail!("no installed package metadata found");
+    }
+    Ok(versions
+        .into_iter()
+        .map(|(name, version)| format!("{name}=={version}"))
+        .collect())
+}
+
+fn pinned_torch_package_specs_from_dist_info_dir(site_packages: &Path) -> Result<Vec<String>> {
+    let packages = installed_package_specs_from_dist_info_dir(site_packages)?;
+    let versions = packages
+        .iter()
+        .filter_map(|spec| spec.split_once("=="))
+        .map(|(name, version)| (name.to_ascii_lowercase(), version.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let mut specs = Vec::new();
+    for name in THEROCK_TORCH_PACKAGES {
+        let version = versions
+            .get(*name)
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("runtime metadata is missing package `{name}`"))?;
+        specs.push(format!("{name}=={version}"));
+    }
+    Ok(specs)
+}
+
+fn dist_info_name_version(metadata_path: &Path) -> Result<Option<(String, String)>> {
+    let metadata = fs::read_to_string(metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let mut name = None;
+    let mut version = None;
+    for line in metadata.lines() {
+        if let Some(value) = line.strip_prefix("Name:") {
+            name = Some(value.trim().to_ascii_lowercase());
+        } else if let Some(value) = line.strip_prefix("Version:") {
+            version = Some(value.trim().to_owned());
+        }
+        if name.is_some() && version.is_some() {
+            break;
+        }
+    }
+    Ok(name.zip(version))
 }
 
 fn parse_torch_package_version_specs(output: &str) -> Result<Vec<String>> {
@@ -2646,11 +2856,14 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
-    let output = Command::new(program)
+    let status = Command::new(command_program(program))
         .args(&args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .with_context(|| format!("failed to start {}", args.join(" ")))?;
-    Ok(output.status.success())
+    Ok(status.success())
 }
 
 fn ensure_service_env(runtime_id: Option<&str>, env_id: Option<&str>) -> Result<EngineEnvManifest> {
@@ -2779,10 +2992,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
-    let output = Command::new(program)
-        .args(&args)
-        .output()
-        .with_context(|| format!("failed to start {context_label}"))?;
+    let output = capture_command_files(program, &args, context_label)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -2800,8 +3010,8 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
-    if interactive_terminal() {
-        let status = Command::new(program)
+    if interactive_terminal() || cosmo_windows_host() {
+        let status = Command::new(command_program(program))
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -2835,7 +3045,7 @@ fn run_progress_command_forwarded(
     args: &[String],
     context_label: &str,
 ) -> Result<()> {
-    let mut child = Command::new(program)
+    let mut child = Command::new(command_program(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2905,10 +3115,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
-    let output = Command::new(program)
-        .args(&args)
-        .output()
-        .with_context(|| format!("failed to start {context_label}"))?;
+    let output = capture_command_files(program, &args, context_label)?;
     if !output.status.success() {
         bail!(
             "{} failed (status {}): {}",
@@ -2918,6 +3125,59 @@ where
         );
     }
     String::from_utf8(output.stdout).context("command output was not valid utf-8")
+}
+
+fn command_program(program: &str) -> String {
+    normalize_runtime_path_text_for_host(program)
+}
+
+fn command_path(path: &Path) -> String {
+    normalize_runtime_path_text_for_host(&path.display().to_string())
+}
+
+fn cosmo_windows_host() -> bool {
+    runtime_is_windows() && !cfg!(windows)
+}
+
+struct CapturedCommand {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn capture_command_files(
+    program: &str,
+    args: &[String],
+    context_label: &str,
+) -> Result<CapturedCommand> {
+    let temp_dir = std::env::temp_dir();
+    let stem = format!(
+        "rocm-pytorch-command-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    );
+    let stdout_path = temp_dir.join(format!("{stem}.out"));
+    let stderr_path = temp_dir.join(format!("{stem}.err"));
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status_result = Command::new(command_program(program))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("failed to start {context_label}"));
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
+    Ok(CapturedCommand {
+        status: status_result?,
+        stdout,
+        stderr,
+    })
 }
 
 fn read_request() -> Result<EngineRequestEnvelope> {
@@ -3417,6 +3677,41 @@ mod tests {
     }
 
     #[test]
+    fn reads_runtime_torch_versions_from_dist_info_metadata() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-pytorch-dist-info-{}",
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        for (name, version) in [
+            ("torch", "2.10.0+rocm7.13.0a20260511"),
+            ("torchvision", "0.25.0+rocm7.13.0a20260511"),
+            ("torchaudio", "2.10.0+rocm7.13.0a20260511"),
+        ] {
+            let dist_info = root.join(format!("{name}-{version}.dist-info"));
+            fs::create_dir_all(&dist_info)?;
+            fs::write(
+                dist_info.join("METADATA"),
+                format!("Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"),
+            )?;
+        }
+
+        let specs = pinned_torch_package_specs_from_dist_info_dir(&root)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            specs,
+            vec![
+                "torch==2.10.0+rocm7.13.0a20260511",
+                "torchvision==0.25.0+rocm7.13.0a20260511",
+                "torchaudio==2.10.0+rocm7.13.0a20260511",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_torch_version_parse_requires_full_stack() {
         let error = parse_torch_package_version_specs(
             r#"{"torch":"2.11.0+rocm7.13.0a20260416","torchvision":"0.26.0+rocm7.13.0a20260416"}"#,
@@ -3429,9 +3724,9 @@ mod tests {
     fn known_model_recipe_comes_from_shared_registry() {
         let recipe = resolve_model_recipe("qwen").expect("recipe should resolve");
         assert_eq!(recipe.canonical_model_id, "Qwen/Qwen2.5-1.5B-Instruct");
-        assert_eq!(recipe.source, "recipe_index");
-        assert_eq!(recipe.preferred_dtype, "float16");
-        assert_eq!(recipe.device_policy, DevicePolicy::GpuRequired);
+        assert_eq!(recipe.source, "alias");
+        assert_eq!(recipe.preferred_dtype, "bfloat16");
+        assert_eq!(recipe.device_policy, DevicePolicy::GpuPreferred);
     }
 
     #[test]

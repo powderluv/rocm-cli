@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, format_host_port, format_http_base_url, require_nonempty,
+    AppPaths, DEFAULT_LOCAL_PORT, format_http_base_url, openai_models_endpoint_has_model,
+    require_nonempty,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -18,7 +19,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -243,6 +243,37 @@ fn main() -> Result<()> {
         })?,
     }
     Ok(())
+}
+
+pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    handle_envelope(envelope)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn builtin_serve_http(
+    service_id: String,
+    model_ref: String,
+    host: String,
+    port: u16,
+    device_policy: Option<String>,
+    runtime_id: Option<String>,
+    env_id: Option<String>,
+    state_path: PathBuf,
+    log_path: Option<PathBuf>,
+    engine_recipe: Option<EngineRecipeHint>,
+) -> Result<()> {
+    serve_http(ServeHttpRequest {
+        service_id,
+        model_ref,
+        host,
+        port,
+        device_policy,
+        runtime_id,
+        env_id,
+        state_path,
+        log_path,
+        engine_recipe,
+    })
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
@@ -935,9 +966,12 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
     let files = service_files(&request.service_id)?;
     let state = read_service_state(&files.state_path).ok();
     let endpoint_url = state.as_ref().and_then(endpoint_url_from_state);
+    let model_ref = state
+        .as_ref()
+        .and_then(|value| value_string(value, "model_ref"));
     let ready = endpoint_url
         .as_deref()
-        .map(query_health_endpoint)
+        .map(|endpoint| query_loaded_model_endpoint(endpoint, model_ref.as_deref()))
         .transpose()
         .unwrap_or(None)
         .unwrap_or(false);
@@ -1686,32 +1720,15 @@ fn value_u32(value: &Value, key: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn query_health_endpoint(endpoint_url: &str) -> Result<bool> {
-    let (host, port) = parse_http_endpoint(endpoint_url)
-        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    let timeout = Duration::from_millis(HEALTHCHECK_TIMEOUT_MS);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-    let host_header = format_host_port(&host, port);
-    write!(
-        stream,
-        "GET /health HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
+fn query_loaded_model_endpoint(endpoint_url: &str, model_ref: Option<&str>) -> Result<bool> {
+    openai_models_endpoint_has_model(
+        endpoint_url,
+        model_ref,
+        Duration::from_millis(HEALTHCHECK_TIMEOUT_MS),
     )
-    .context("failed to write llama.cpp health request")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read llama.cpp health response")?;
-    Ok(response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"))
 }
 
+#[cfg(test)]
 fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
     let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
     let authority = without_scheme.split('/').next()?.trim();
@@ -1743,33 +1760,8 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(lines.into_iter().collect())
 }
 
-fn terminate_pid(pid: u32, force: bool) -> bool {
-    #[cfg(windows)]
-    {
-        let mut command = ProcessCommand::new("taskkill");
-        command.arg("/PID").arg(pid.to_string()).arg("/T");
-        if force {
-            command.arg("/F");
-        }
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        let signal = if force { "-KILL" } else { "-TERM" };
-        ProcessCommand::new("kill")
-            .arg(signal)
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
+fn terminate_pid(pid: u32, _force: bool) -> bool {
+    rocm_core::terminate_process(pid).is_ok()
 }
 
 fn device_policy_name(policy: &DevicePolicy) -> &'static str {

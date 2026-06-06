@@ -1,19 +1,20 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, ManagedServiceRecord, RocmCliConfig, append_audit_event,
-    format_host_port, unix_time_millis,
+    connect_tcp_stream, format_host_port, managed_service_endpoint_model_ready,
+    read_tcp_stream_to_string, unix_time_millis, write_all_tcp_stream,
 };
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 pub(crate) const ROCM_TOOL_SCHEMA_ID: &str = "rocm-tools-v0";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ALIAS: &str = "qwen";
-pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = "Qwen/Qwen2.5-1.5B-Instruct";
 pub(crate) const BOOTSTRAP_ASSISTANT_MODEL_ID: &str = "Qwen/Qwen3.5-0.8B-Q8_0-llamafile";
 pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-0.6B-GGUF";
+pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = LEMONADE_ASSISTANT_MODEL_ID;
 const LOCAL_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -470,9 +471,8 @@ fn select_local_chat_service(
     } else {
         services.retain(local_service_is_builtin_assistant);
     }
-    services
-        .into_iter()
-        .next()
+    services.sort_by_key(local_service_priority);
+    services.into_iter().next()
         .with_context(|| {
             format!(
                 "local provider has no ready managed service for the built-in assistant model {BUILTIN_ASSISTANT_MODEL_ID}; start `{BUILTIN_ASSISTANT_MODEL_ALIAS}` or pass --model for a custom/manual local service"
@@ -481,15 +481,18 @@ fn select_local_chat_service(
 }
 
 fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
-    service
-        .canonical_model_id
-        .eq_ignore_ascii_case(BUILTIN_ASSISTANT_MODEL_ID)
-        || service
-            .canonical_model_id
-            .eq_ignore_ascii_case(BOOTSTRAP_ASSISTANT_MODEL_ID)
-        || service
-            .canonical_model_id
-            .eq_ignore_ascii_case(LEMONADE_ASSISTANT_MODEL_ID)
+    local_service_priority(service) != usize::MAX
+}
+
+fn local_service_priority(service: &ManagedServiceRecord) -> usize {
+    let model = service.canonical_model_id.as_str();
+    if model.eq_ignore_ascii_case(LEMONADE_ASSISTANT_MODEL_ID) {
+        0
+    } else if model.eq_ignore_ascii_case(BOOTSTRAP_ASSISTANT_MODEL_ID) {
+        1
+    } else {
+        usize::MAX
+    }
 }
 
 fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
@@ -509,10 +512,21 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         }
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let Ok(record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) else {
+        let Ok(mut record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) else {
             continue;
         };
-        if matches!(record.status.as_str(), "ready" | "running") {
+        record.normalize_paths_for_host();
+        if record.refresh_from_engine_state().unwrap_or(false) {
+            let _ = record.write();
+        }
+        if matches!(record.status.as_str(), "ready" | "running")
+            && managed_service_endpoint_model_ready(&record, LOCAL_SERVICE_READY_TIMEOUT)
+                .unwrap_or(false)
+        {
+            if record.status != "ready" {
+                record.status = "ready".to_owned();
+                let _ = record.write();
+            }
             services.push(record);
         }
     }
@@ -538,28 +552,18 @@ fn post_json_to_local_endpoint_body(
 ) -> Result<String> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported local endpoint URL `{endpoint_url}`"))?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
     let body = serde_json::to_string(body).context("failed to serialize chat request")?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
-    write!(
-        stream,
+    let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )
-    .context("failed to write local provider chat request")?;
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .context("failed to write local provider chat request")?;
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
+    let response = read_tcp_stream_to_string(&mut stream)
         .context("failed to read local provider chat response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -580,24 +584,16 @@ fn stream_json_from_local_endpoint(
 ) -> Result<()> {
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported local endpoint URL `{endpoint_url}`"))?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
     let body = serde_json::to_string(body).context("failed to serialize chat request")?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
-    write!(
-        stream,
+    let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )
-    .context("failed to write local provider chat request")?;
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .context("failed to write local provider chat request")?;
 
     let mut reader = BufReader::new(stream);
     let mut headers = String::new();
@@ -886,12 +882,29 @@ fn openai_stream_chat_request_body(model: &str, request: &ChatRequest) -> serde_
 
 fn openai_local_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
     let request = local_openai_compatible_request(request);
-    openai_chat_request_body(model, &request)
+    let mut body = openai_chat_request_body(model, &request);
+    apply_local_model_request_defaults(model, &mut body);
+    body
 }
 
 fn openai_local_stream_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
     let request = local_openai_compatible_request(request);
-    openai_stream_chat_request_body(model, &request)
+    let mut body = openai_stream_chat_request_body(model, &request);
+    apply_local_model_request_defaults(model, &mut body);
+    body
+}
+
+fn apply_local_model_request_defaults(model: &str, body: &mut serde_json::Value) {
+    if local_model_should_disable_thinking(model) {
+        body["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": false
+        });
+    }
+}
+
+fn local_model_should_disable_thinking(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains("qwen3") || normalized.contains("qwen/qwen3")
 }
 
 fn local_openai_compatible_request(request: &ChatRequest) -> ChatRequest {
@@ -1478,7 +1491,8 @@ fn parse_anthropic_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
 mod tests {
     use super::*;
     use rocm_core::{AppPaths, ManagedServiceRecord, RocmCliConfig, unix_time_millis};
-    use std::net::TcpListener;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread;
@@ -1495,6 +1509,7 @@ mod tests {
     fn local_provider_reports_ready_managed_models() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-models");
         paths.ensure()?;
+        let ready_server = spawn_models_only_server(BUILTIN_ASSISTANT_MODEL_ID)?;
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
@@ -1502,7 +1517,7 @@ mod tests {
             "qwen",
             BUILTIN_ASSISTANT_MODEL_ID,
             "127.0.0.1",
-            11435,
+            ready_server.port(),
             "managed",
             123,
             None,
@@ -1530,12 +1545,97 @@ mod tests {
         stopped.write()?;
 
         let status = provider_status(&paths, "local")?;
+        let served = ready_server.stop()?;
         fs::remove_dir_all(root).ok();
 
         assert_eq!(status.provider, "local");
         assert_eq!(status.auth_status, "ready");
         assert_eq!(status.models, vec![BUILTIN_ASSISTANT_MODEL_ID.to_owned()]);
         assert_eq!(status.tool_call_schema, ROCM_TOOL_SCHEMA_ID);
+        assert!(served > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_refreshes_starting_service_from_ready_engine_state() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-engine-state-ready");
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    let request = String::from_utf8_lossy(&request_bytes);
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                let body = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, LEMONADE_ASSISTANT_MODEL_ID);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                requests.push(request);
+            }
+            Ok(requests)
+        });
+        let mut service = ManagedServiceRecord::new(
+            &paths,
+            "svc-lemonade-ready",
+            "lemonade",
+            "qwen",
+            LEMONADE_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        service.status = "starting".to_owned();
+        service.write()?;
+        fs::create_dir_all(service.engine_state_path.parent().expect("state parent"))?;
+        fs::write(
+            &service.engine_state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "ready",
+                "endpoint_url": format!("http://127.0.0.1:{port}/v1"),
+                "server_pid": 456,
+                "runtime_id": "release-pip-gfx120x-all-7-13-0a20260511",
+                "env_id": "lemonade-embeddable-10.6.0"
+            }))?,
+        )?;
+
+        let selected = select_local_chat_service(&paths, None)?;
+        let status = provider_status(&paths, "local")?;
+        let requests = server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /v1/models HTTP/1.1"))
+        );
+        assert_eq!(selected.service_id, "svc-lemonade-ready");
+        assert_eq!(selected.status, "ready");
+        assert_eq!(selected.engine_pid, Some(456));
+        assert_eq!(status.auth_status, "ready");
+        assert_eq!(status.models, vec![LEMONADE_ASSISTANT_MODEL_ID.to_owned()]);
         Ok(())
     }
 
@@ -1724,6 +1824,23 @@ mod tests {
     }
 
     #[test]
+    fn openai_local_qwen3_request_disables_thinking_for_visible_answers() {
+        let request = ChatRequest {
+            model: Some("Qwen3-0.6B-GGUF".to_owned()),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "hello".to_owned(),
+            }],
+            max_tokens: Some(16),
+            rocm_tools: false,
+        };
+
+        let body = openai_local_chat_request_body("Qwen3-0.6B-GGUF", &request);
+
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
     fn openai_request_body_includes_rocm_tools_only_for_non_streaming_tool_mode() {
         let request = ChatRequest {
             model: Some("model-a".to_owned()),
@@ -1875,32 +1992,20 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                let request = String::from_utf8_lossy(&request_bytes);
-                if request_complete(&request) {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let body = r#"{"choices":[{"message":{"content":"ready response"}}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(request)
-        });
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                let body = r#"{"choices":[{"message":{"content":"ready response"}}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                Ok(())
+            },
+        );
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -1963,6 +2068,7 @@ mod tests {
     fn local_provider_default_chat_requires_builtin_qwen_assistant() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-default-qwen");
         paths.ensure()?;
+        let custom_server = spawn_models_only_server("sshleifer/tiny-gpt2")?;
 
         let mut custom = ManagedServiceRecord::new(
             &paths,
@@ -1971,7 +2077,7 @@ mod tests {
             "tiny-gpt2",
             "sshleifer/tiny-gpt2",
             "127.0.0.1",
-            11435,
+            custom_server.port(),
             "managed",
             123,
             None,
@@ -1993,6 +2099,7 @@ mod tests {
             "svc-custom"
         );
 
+        let qwen_server = spawn_models_only_server(BUILTIN_ASSISTANT_MODEL_ID)?;
         let mut qwen = ManagedServiceRecord::new(
             &paths,
             "svc-qwen",
@@ -2000,7 +2107,7 @@ mod tests {
             BUILTIN_ASSISTANT_MODEL_ALIAS,
             BUILTIN_ASSISTANT_MODEL_ID,
             "127.0.0.1",
-            11436,
+            qwen_server.port(),
             "managed",
             124,
             None,
@@ -2012,11 +2119,15 @@ mod tests {
 
         let selected = select_local_chat_service(&paths, None)?;
         let status = provider_status(&paths, "local")?;
+        let custom_served = custom_server.stop()?;
+        let qwen_served = qwen_server.stop()?;
         fs::remove_dir_all(root).ok();
 
         assert_eq!(selected.service_id, "svc-qwen");
         assert_eq!(selected.canonical_model_id, BUILTIN_ASSISTANT_MODEL_ID);
         assert_eq!(status.auth_status, "ready");
+        assert!(custom_served > 0);
+        assert!(qwen_served > 0);
         Ok(())
     }
 
@@ -2024,6 +2135,7 @@ mod tests {
     fn local_provider_accepts_bootstrap_qwen_assistant() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-bootstrap-qwen");
         paths.ensure()?;
+        let bootstrap_server = spawn_models_only_server(BOOTSTRAP_ASSISTANT_MODEL_ID)?;
 
         let mut bootstrap = ManagedServiceRecord::new(
             &paths,
@@ -2032,7 +2144,7 @@ mod tests {
             "Qwen3.5-0.8B-Q8_0.llamafile",
             BOOTSTRAP_ASSISTANT_MODEL_ID,
             "127.0.0.1",
-            11435,
+            bootstrap_server.port(),
             "bootstrap",
             124,
             None,
@@ -2044,11 +2156,13 @@ mod tests {
 
         let selected = select_local_chat_service(&paths, None)?;
         let status = provider_status(&paths, "local")?;
+        let served = bootstrap_server.stop()?;
         fs::remove_dir_all(root).ok();
 
         assert_eq!(selected.service_id, "svc-bootstrap-qwen");
         assert_eq!(selected.canonical_model_id, BOOTSTRAP_ASSISTANT_MODEL_ID);
         assert_eq!(status.auth_status, "ready");
+        assert!(served > 0);
         Ok(())
     }
 
@@ -2056,6 +2170,7 @@ mod tests {
     fn local_provider_accepts_lemonade_qwen_assistant() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-lemonade-qwen");
         paths.ensure()?;
+        let lemonade_server = spawn_models_only_server(LEMONADE_ASSISTANT_MODEL_ID)?;
 
         let mut lemonade = ManagedServiceRecord::new(
             &paths,
@@ -2064,7 +2179,7 @@ mod tests {
             "lemonade-qwen",
             LEMONADE_ASSISTANT_MODEL_ID,
             "127.0.0.1",
-            11435,
+            lemonade_server.port(),
             "managed",
             124,
             None,
@@ -2076,11 +2191,67 @@ mod tests {
 
         let selected = select_local_chat_service(&paths, None)?;
         let status = provider_status(&paths, "local")?;
+        let served = lemonade_server.stop()?;
         fs::remove_dir_all(root).ok();
 
         assert_eq!(selected.service_id, "svc-lemonade-qwen");
         assert_eq!(selected.canonical_model_id, LEMONADE_ASSISTANT_MODEL_ID);
         assert_eq!(status.auth_status, "ready");
+        assert!(served > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_prefers_lemonade_over_stale_builtin_services() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-prefers-lemonade");
+        paths.ensure()?;
+        let stale_bootstrap_server = spawn_models_only_server("not-the-bootstrap-model")?;
+        let lemonade_server = spawn_models_only_server(LEMONADE_ASSISTANT_MODEL_ID)?;
+
+        let mut bootstrap = ManagedServiceRecord::new(
+            &paths,
+            "svc-bootstrap-qwen",
+            "llamafile-bootstrap",
+            "Qwen3.5-0.8B-Q8_0.llamafile",
+            BOOTSTRAP_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            stale_bootstrap_server.port(),
+            "bootstrap",
+            124,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        bootstrap.status = "ready".to_owned();
+        bootstrap.write()?;
+
+        let mut lemonade = ManagedServiceRecord::new(
+            &paths,
+            "svc-lemonade-qwen",
+            "lemonade",
+            "lemonade-qwen",
+            LEMONADE_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            lemonade_server.port(),
+            "managed",
+            125,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        lemonade.status = "ready".to_owned();
+        lemonade.write()?;
+
+        let selected = select_local_chat_service(&paths, None)?;
+        let stale_served = stale_bootstrap_server.stop()?;
+        let lemonade_served = lemonade_server.stop()?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(selected.service_id, "svc-lemonade-qwen");
+        assert_eq!(selected.engine, "lemonade");
+        assert_eq!(selected.canonical_model_id, LEMONADE_ASSISTANT_MODEL_ID);
+        assert!(stale_served > 0);
+        assert!(lemonade_served > 0);
         Ok(())
     }
 
@@ -2090,32 +2261,20 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                let request = String::from_utf8_lossy(&request_bytes);
-                if request_complete(&request) {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let body = r#"{"choices":[{"message":{"content":"I will check first.","tool_calls":[{"id":"call-1","type":"function","function":{"name":"doctor","arguments":"{}"}}]}}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(request)
-        });
+        let server = spawn_local_provider_test_server(
+            listener,
+            "tiny.gguf",
+            move |stream, _request| {
+                let body = r#"{"choices":[{"message":{"content":"I will check first.","tool_calls":[{"id":"call-1","type":"function","function":{"name":"doctor","arguments":"{}"}}]}}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                Ok(())
+            },
+        );
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -2165,32 +2324,20 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                let request = String::from_utf8_lossy(&request_bytes);
-                if request_complete(&request) {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(request)
-        });
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                Ok(())
+            },
+        );
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -2270,42 +2417,30 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (first_seen_tx, first_seen_rx) = mpsc::channel();
-        let server = thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                let request = String::from_utf8_lossy(&request_bytes);
-                if request_complete(&request) {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
-            )?;
-            write!(
-                stream,
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hel\"}}}}]}}\n\n"
-            )?;
-            stream.flush()?;
-            first_seen_rx
-                .recv_timeout(Duration::from_secs(2))
-                .context("first SSE event was not observed before connection close")?;
-            write!(
-                stream,
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"lo\"}}}}]}}\n\ndata: [DONE]\n\n"
-            )?;
-            stream.flush()?;
-            Ok(request)
-        });
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                )?;
+                write!(
+                    stream,
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hel\"}}}}]}}\n\n"
+                )?;
+                stream.flush()?;
+                first_seen_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .context("first SSE event was not observed before connection close")?;
+                write!(
+                    stream,
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"lo\"}}}}]}}\n\ndata: [DONE]\n\n"
+                )?;
+                stream.flush()?;
+                Ok(())
+            },
+        );
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -2375,34 +2510,22 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                let request = String::from_utf8_lossy(&request_bytes);
-                if request_complete(&request) {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            )?;
-            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
-            write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
-            let done = "data: [DONE]\n\n";
-            write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", done.len(), done)?;
-            stream.flush()?;
-            Ok(request)
-        });
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )?;
+                let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
+                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
+                let done = "data: [DONE]\n\n";
+                write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", done.len(), done)?;
+                stream.flush()?;
+                Ok(())
+            },
+        );
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -2655,6 +2778,126 @@ mod tests {
                 }
             ]
         );
+        Ok(())
+    }
+
+    struct ModelsOnlyServer {
+        port: u16,
+        stop_tx: mpsc::Sender<()>,
+        handle: thread::JoinHandle<Result<usize>>,
+    }
+
+    impl ModelsOnlyServer {
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn stop(self) -> Result<usize> {
+            let _ = self.stop_tx.send(());
+            match self.handle.join() {
+                Ok(result) => result,
+                Err(_) => bail!("models server thread panicked"),
+            }
+        }
+    }
+
+    fn spawn_models_only_server(model_id: impl Into<String>) -> Result<ModelsOnlyServer> {
+        let model_id = model_id.into();
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = thread::spawn(move || -> Result<usize> {
+            let mut served = 0;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    return Ok(served);
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        let request = read_http_request(&mut stream)?;
+                        if request.starts_with("GET /v1/models ") {
+                            write_models_response(&mut stream, &model_id)?;
+                        } else {
+                            write_not_found_response(&mut stream)?;
+                        }
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error).context("models server accept failed"),
+                }
+            }
+        });
+        Ok(ModelsOnlyServer {
+            port,
+            stop_tx,
+            handle,
+        })
+    }
+
+    fn spawn_local_provider_test_server<F>(
+        listener: TcpListener,
+        model_id: impl Into<String>,
+        mut responder: F,
+    ) -> thread::JoinHandle<Result<String>>
+    where
+        F: FnMut(&mut TcpStream, &str) -> Result<()> + Send + 'static,
+    {
+        let model_id = model_id.into();
+        thread::spawn(move || -> Result<String> {
+            loop {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let request = read_http_request(&mut stream)?;
+                if request.starts_with("GET /v1/models ") {
+                    write_models_response(&mut stream, &model_id)?;
+                    continue;
+                }
+                responder(&mut stream, &request)?;
+                return Ok(request);
+            }
+        })
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+        let mut request_bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request_bytes.extend_from_slice(&buffer[..read]);
+            let request = String::from_utf8_lossy(&request_bytes);
+            if request_complete(&request) {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&request_bytes).into_owned())
+    }
+
+    fn write_models_response(stream: &mut TcpStream, model_id: &str) -> Result<()> {
+        let body = serde_json::json!({ "data": [{ "id": model_id }] }).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        Ok(())
+    }
+
+    fn write_not_found_response(stream: &mut TcpStream) -> Result<()> {
+        let body = r#"{"error":"not found"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
         Ok(())
     }
 

@@ -71,6 +71,14 @@ def main() -> int:
             state_root = resolve_path(args.state_root, repo_root)
             apply_state_root(env, state_root)
             print_step(f"Using ROCm CLI state under {state_root}.")
+        if args.copy_runtime_state_from:
+            if "ROCM_CLI_CONFIG_DIR" not in env or "ROCM_CLI_DATA_DIR" not in env:
+                raise RuntimeError(
+                    "--copy-runtime-state-from requires --temp-state or --state-root"
+                )
+            source_state = resolve_path(args.copy_runtime_state_from, repo_root)
+            copy_runtime_state(source_state, env)
+            print_step(f"Copied ROCm runtime registry from {source_state}.")
 
         comfyui_root: Path | None = None
         if not args.skip_install:
@@ -86,7 +94,9 @@ def main() -> int:
                 comfyui_root = resolve_path(args.comfyui_root, repo_root)
             if comfyui_root is None:
                 status_for_folder = run_text(
-                    [str(rocm), "comfyui", "status"], env=env, timeout=args.timeout
+                    build_rocm_command(args, rocm, "comfyui", "status"),
+                    env=env,
+                    timeout=args.timeout,
                 )
                 comfyui_root = parse_comfyui_root(status_for_folder)
             if comfyui_root is None:
@@ -110,13 +120,15 @@ def main() -> int:
         assert_comfyui_reports_gpu(system_stats)
 
         status_output = run_text(
-            [str(rocm), "comfyui", "status"], env=env, timeout=args.timeout
+            build_rocm_command(args, rocm, "comfyui", "status"),
+            env=env,
+            timeout=args.timeout,
         )
         print(status_output, end="" if status_output.endswith("\n") else "\n")
         assert_status_output(status_output, args.host, args.port)
 
         logs_output = run_text(
-            [str(rocm), "comfyui", "logs", "--lines", "80"],
+            build_rocm_command(args, rocm, "comfyui", "logs", "--lines", "80"),
             env=env,
             timeout=args.timeout,
         )
@@ -162,6 +174,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--timeout", type=int, default=360)
+    parser.add_argument(
+        "--rocm-launch-prefix",
+        nargs="+",
+        default=[],
+        help="prefix used to launch rocm, for example `sh` for WSL APE validation",
+    )
     parser.add_argument("--runtime-id", help="exact managed TheRock runtime key")
     parser.add_argument("--reinstall", action="store_true")
     parser.add_argument(
@@ -184,6 +202,15 @@ def parse_args() -> argparse.Namespace:
         "--keep-state",
         action="store_true",
         help="keep the temporary state root created by --temp-state",
+    )
+    parser.add_argument(
+        "--copy-runtime-state-from",
+        help=(
+            "copy only config.json and runtimes/ from an existing ROCm CLI state "
+            "root into the isolated state before the test starts; useful with "
+            "--temp-state so ComfyUI installs are isolated but can reuse an "
+            "already installed managed TheRock runtime"
+        ),
     )
     parser.add_argument(
         "--skip-install",
@@ -263,8 +290,60 @@ def apply_state_root(env: dict[str, str], state_root: Path) -> None:
     env["ROCM_CLI_CACHE_DIR"] = str(state_root / "cache")
 
 
+def copy_runtime_state(source_root: Path, env: dict[str, str]) -> None:
+    if not source_root.exists():
+        raise RuntimeError(f"runtime state root does not exist: {source_root}")
+    config_dir = Path(env["ROCM_CLI_CONFIG_DIR"])
+    data_dir = Path(env["ROCM_CLI_DATA_DIR"])
+    config_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_first_existing_file(
+        [
+            source_root / "config.json",
+            source_root / "config" / "config.json",
+        ],
+        config_dir / "config.json",
+    )
+    copied_runtime_dir = copy_first_existing_dir(
+        [
+            source_root / "runtimes",
+            source_root / "data" / "runtimes",
+        ],
+        data_dir / "runtimes",
+    )
+    if not copied_runtime_dir:
+        raise RuntimeError(
+            f"no runtimes directory found under {source_root}; "
+            "install TheRock first or pass a state root with runtimes/"
+        )
+
+
+def copy_first_existing_file(candidates: list[Path], destination: Path) -> bool:
+    for source in candidates:
+        if source.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            return True
+    return False
+
+
+def copy_first_existing_dir(candidates: list[Path], destination: Path) -> bool:
+    for source in candidates:
+        if source.is_dir():
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(source, destination)
+            return True
+    return False
+
+
+def build_rocm_command(args: argparse.Namespace, rocm: Path, *parts: str) -> list[str]:
+    return [*args.rocm_launch_prefix, str(rocm), *parts]
+
+
 def build_install_command(args: argparse.Namespace, rocm: Path) -> list[str]:
-    command = [str(rocm), "comfyui", "install"]
+    command = build_rocm_command(args, rocm, "comfyui", "install")
     if args.runtime_id:
         command.extend(["--runtime-id", args.runtime_id])
     if args.reinstall:
@@ -273,8 +352,9 @@ def build_install_command(args: argparse.Namespace, rocm: Path) -> list[str]:
 
 
 def build_start_command(args: argparse.Namespace, rocm: Path) -> list[str]:
-    return [
-        str(rocm),
+    return build_rocm_command(
+        args,
+        rocm,
         "comfyui",
         "start",
         "--host",
@@ -282,7 +362,7 @@ def build_start_command(args: argparse.Namespace, rocm: Path) -> list[str]:
         "--port",
         str(args.port),
         "--no-open-browser",
-    ]
+    )
 
 
 def run_text(
@@ -781,7 +861,8 @@ def assert_install_output(output: str) -> None:
 
 
 def assert_start_output(output: str, host: str, port: int) -> None:
-    require_contains(output, "status: starting", "start output")
+    if "status: running" not in output:
+        require_contains(output, "status: starting", "start output")
     require_contains(output, "AMD GPU check: ready", "start output")
     require_contains(output, f"url: http://{host}:{port}", "start output")
     require_contains(output, "browser: not opened", "start output")
@@ -840,17 +921,18 @@ def run_self_test() -> int:
     args = argparse.Namespace(
         host="127.0.0.1",
         port=18188,
+        rocm_launch_prefix=["sh"],
         runtime_id="release-pip-gfx120x-all-7-14-0a20260601",
         reinstall=True,
     )
     install = build_install_command(args, fake_rocm)
-    assert install[:3] == [str(fake_rocm), "comfyui", "install"]
+    assert install[:4] == ["sh", str(fake_rocm), "comfyui", "install"]
     assert "--runtime-id" in install
     assert "--reinstall" in install
     assert "cpu" not in " ".join(install).lower()
 
     start = build_start_command(args, fake_rocm)
-    assert start[:3] == [str(fake_rocm), "comfyui", "start"]
+    assert start[:4] == ["sh", str(fake_rocm), "comfyui", "start"]
     assert "--no-open-browser" in start
     assert "--port" in start and "18188" in start
 
@@ -898,6 +980,24 @@ def run_self_test() -> int:
         raise AssertionError("CPU fallback output was incorrectly accepted")
 
     assert parse_comfyui_root("ComfyUI\n  folder: /tmp/ComfyUI\n") == Path("/tmp/ComfyUI")
+    with tempfile.TemporaryDirectory(
+        prefix="rocm-cli-comfyui-copy-source-"
+    ) as src_text, tempfile.TemporaryDirectory(
+        prefix="rocm-cli-comfyui-copy-dest-"
+    ) as dst_text:
+        source = Path(src_text)
+        dest = Path(dst_text)
+        (source / "runtimes" / "registry").mkdir(parents=True)
+        (source / "runtimes" / "active.json").write_text("{}", encoding="utf-8")
+        (source / "config.json").write_text(
+            json.dumps({"active_runtime_key": "runtime-a"}),
+            encoding="utf-8",
+        )
+        env = {}
+        apply_state_root(env, dest)
+        copy_runtime_state(source, env)
+        assert (dest / "config" / "config.json").is_file()
+        assert (dest / "data" / "runtimes" / "active.json").is_file()
     assert DEFAULT_CHECKPOINT_URL.endswith("/sd-v1-5-tiny.safetensors")
     assert format_bytes(DEFAULT_CHECKPOINT_SIZE_BYTES).endswith("GB")
 

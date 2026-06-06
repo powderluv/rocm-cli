@@ -2,14 +2,17 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_therock_family,
-    detect_managed_therock_family, normalize_therock_family, unix_time_millis,
+    detect_managed_therock_family, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
+    runtime_os_name, runtime_python_bin_dir_name, runtime_python_executable_name, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 const THEROCK_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
@@ -255,6 +258,46 @@ pub(crate) struct InstalledRuntimeManifest {
     pub installed_at_unix_ms: u128,
 }
 
+impl InstalledRuntimeManifest {
+    fn normalize_host_paths(mut self) -> Self {
+        self.install_root = normalize_manifest_path(self.install_root);
+        self.python_launcher = self
+            .python_launcher
+            .map(|value| normalize_runtime_path_text_for_host(&value));
+        self.python_executable = self
+            .python_executable
+            .map(|value| normalize_runtime_path_text_for_host(&value));
+        self.pip_cache_dir = self.pip_cache_dir.map(normalize_manifest_path);
+        self.imported_from = self.imported_from.map(normalize_manifest_path);
+        if let Some(probe) = self.rocm_sdk.as_mut() {
+            probe.normalize_host_paths();
+        }
+        self
+    }
+
+    pub(crate) fn normalize_storage_paths(mut self) -> Self {
+        self.install_root = normalize_storage_manifest_path(&self.install_root);
+        self.python_launcher = self
+            .python_launcher
+            .map(|value| normalize_runtime_path_text_for_storage(&value));
+        self.python_executable = self
+            .python_executable
+            .map(|value| normalize_runtime_path_text_for_storage(&value));
+        self.pip_cache_dir = self
+            .pip_cache_dir
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        self.imported_from = self
+            .imported_from
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        if let Some(probe) = self.rocm_sdk.as_mut() {
+            probe.normalize_storage_paths();
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RocmSdkPythonProbe {
     #[serde(default)]
@@ -289,6 +332,82 @@ pub(crate) struct RocmSdkPythonProbe {
     pub resolved_libraries: Vec<RocmSdkLibraryProbe>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl RocmSdkPythonProbe {
+    fn normalize_host_paths(&mut self) {
+        self.site_packages = self.site_packages.take().map(normalize_manifest_path);
+        self.root_path = self.root_path.take().map(normalize_manifest_path);
+        self.bin_path = self.bin_path.take().map(normalize_manifest_path);
+        self.cmake_path = self.cmake_path.take().map(normalize_manifest_path);
+        self.runtime_roots = std::mem::take(&mut self.runtime_roots)
+            .into_iter()
+            .map(normalize_manifest_path)
+            .collect();
+        self.bin_paths = std::mem::take(&mut self.bin_paths)
+            .into_iter()
+            .map(normalize_manifest_path)
+            .collect();
+        self.library_paths = std::mem::take(&mut self.library_paths)
+            .into_iter()
+            .map(normalize_manifest_path)
+            .collect();
+        for library in &mut self.resolved_libraries {
+            library.paths = std::mem::take(&mut library.paths)
+                .into_iter()
+                .map(normalize_manifest_path)
+                .collect();
+        }
+    }
+
+    fn normalize_storage_paths(&mut self) {
+        self.site_packages = self
+            .site_packages
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        self.root_path = self
+            .root_path
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        self.bin_path = self
+            .bin_path
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        self.cmake_path = self
+            .cmake_path
+            .as_deref()
+            .map(normalize_storage_manifest_path);
+        self.runtime_roots = self
+            .runtime_roots
+            .iter()
+            .map(|path| normalize_storage_manifest_path(path))
+            .collect();
+        self.bin_paths = self
+            .bin_paths
+            .iter()
+            .map(|path| normalize_storage_manifest_path(path))
+            .collect();
+        self.library_paths = self
+            .library_paths
+            .iter()
+            .map(|path| normalize_storage_manifest_path(path))
+            .collect();
+        for library in &mut self.resolved_libraries {
+            library.paths = library
+                .paths
+                .iter()
+                .map(|path| normalize_storage_manifest_path(path))
+                .collect();
+        }
+    }
+}
+
+fn normalize_manifest_path(path: PathBuf) -> PathBuf {
+    normalize_runtime_path_for_host(&path)
+}
+
+fn normalize_storage_manifest_path(path: &Path) -> PathBuf {
+    normalize_runtime_path_for_storage(path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,7 +467,7 @@ pub(crate) fn install_sdk(
 }
 
 fn ensure_install_format_supported(format: &str) -> Result<()> {
-    ensure_install_format_supported_for_platform(format, cfg!(windows))
+    ensure_install_format_supported_for_platform(format, runtime_is_windows())
 }
 
 fn ensure_install_format_supported_for_platform(format: &str, windows: bool) -> Result<()> {
@@ -650,10 +769,24 @@ fn install_pip_runtime(
         managed_python_version()
     ));
     let python_launcher = resolve_python_launcher(paths)?;
-    progress_line(format!(
-        "Using Python from {}.",
-        python_launcher.executable.display()
-    ));
+    progress_line(match python_launcher.source {
+        "path" => format!(
+            "Using Python from PATH: {}.",
+            python_launcher.executable.display()
+        ),
+        "env" => format!(
+            "Using Python from ROCM_CLI_PYTHON: {}.",
+            python_launcher.executable.display()
+        ),
+        "managed" => format!(
+            "Using ROCm CLI's portable Python: {}.",
+            python_launcher.executable.display()
+        ),
+        _ => format!(
+            "Using Python from {}.",
+            python_launcher.executable.display()
+        ),
+    });
     let wheel_compatibility = wheel_compatibility_for_python(&python_launcher.executable)?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",
@@ -1471,28 +1604,18 @@ fn parse_simple_index_version_candidate(
 }
 
 fn wheel_compatibility_for_python(python_executable: &Path) -> Result<WheelCompatibility> {
-    let output = Command::new(python_executable)
-        .args([
-            "-c",
-            "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')",
-        ])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to inspect Python wheel tag via {}",
-                python_executable.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "failed to inspect Python wheel tag: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let python_tag = String::from_utf8(output.stdout)
-        .context("failed to decode Python wheel tag")?
-        .trim()
-        .to_owned();
+    let python_tag = capture_python_stdout(
+        python_executable,
+        "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')",
+        "inspect Python wheel tag",
+    )
+    .with_context(|| {
+        format!(
+            "failed to inspect Python wheel tag via {}",
+            python_executable.display()
+        )
+    })?;
+    let python_tag = python_tag.trim().to_owned();
     if python_tag.is_empty() {
         bail!("Python did not report a wheel tag");
     }
@@ -1503,7 +1626,7 @@ fn wheel_compatibility_for_python(python_executable: &Path) -> Result<WheelCompa
 }
 
 fn current_platform_wheel_tags() -> Result<Vec<String>> {
-    let platform_tag = match (std::env::consts::OS, std::env::consts::ARCH) {
+    let platform_tag = match (runtime_os_name(), std::env::consts::ARCH) {
         ("windows", "x86_64") => "win_amd64",
         ("linux", "x86_64") => "linux_x86_64",
         ("linux", "aarch64") => "linux_aarch64",
@@ -1737,8 +1860,9 @@ fn verify_signature_with_openssl(
     signature_path: &Path,
     public_key_path: &Path,
 ) -> Result<()> {
-    let output = Command::new("openssl")
-        .args([
+    let output = capture_command_output(
+        Path::new("openssl"),
+        &[
             "dgst",
             "-sha256",
             "-verify",
@@ -1746,9 +1870,9 @@ fn verify_signature_with_openssl(
             "-signature",
             signature_path.to_string_lossy().as_ref(),
             payload_path.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .context("failed to launch openssl for metadata signature verification")?;
+        ],
+    )
+    .context("failed to launch openssl for metadata signature verification")?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         bail!(
@@ -1902,6 +2026,12 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
+    if use_curl_http() {
+        return download_file_windows_curl(url, destination, None);
+    }
+    if use_windows_powershell_http() {
+        return download_file_windows_powershell(url, destination, None);
+    }
     let response = http_get(url, &[], None)?;
     if response.status != 200 {
         bail!("HTTP {} while fetching {url}", response.status);
@@ -1914,6 +2044,12 @@ fn http_get(
     headers: &[(&str, &str)],
     max_time_secs: Option<u64>,
 ) -> Result<HttpResponseBody> {
+    if use_curl_http() {
+        return http_get_windows_curl(url, headers, max_time_secs);
+    }
+    if use_windows_powershell_http() {
+        return http_get_windows_powershell(url, headers, max_time_secs);
+    }
     let timeout = max_time_secs
         .filter(|value| *value > 0)
         .map(Duration::from_secs)
@@ -1949,6 +2085,444 @@ fn http_get(
         headers,
         body,
     })
+}
+
+fn use_curl_http() -> bool {
+    cfg!(target_vendor = "cosmo")
+}
+
+fn use_windows_powershell_http() -> bool {
+    runtime_is_windows() && !cfg!(target_vendor = "cosmo")
+}
+
+#[derive(Deserialize)]
+struct WindowsHttpMetadata {
+    #[serde(rename = "StatusCode")]
+    status_code: u16,
+    #[serde(rename = "Headers")]
+    headers: String,
+}
+
+fn http_get_windows_curl(
+    url: &str,
+    headers: &[(&str, &str)],
+    max_time_secs: Option<u64>,
+) -> Result<HttpResponseBody> {
+    let temp_dir = windows_http_temp_dir()?;
+    let body_path = temp_dir.join("body.bin");
+    let headers_path = temp_dir.join("headers.txt");
+    let status_path = temp_dir.join("status.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    run_windows_curl_request(
+        url,
+        headers,
+        max_time_secs,
+        &body_path,
+        &headers_path,
+        &status_path,
+        &stderr_path,
+    )?;
+    let headers = fs::read_to_string(&headers_path).unwrap_or_default();
+    let status = read_curl_status(&status_path, &headers)?;
+    let body = fs::read(&body_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(HttpResponseBody {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn download_file_windows_curl(
+    url: &str,
+    destination: &Path,
+    max_time_secs: Option<u64>,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("download destination has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temp_dir = windows_http_temp_dir()?;
+    let download_path = temp_dir.join("download.bin");
+    let headers_path = temp_dir.join("headers.txt");
+    let status_path = temp_dir.join("status.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    run_windows_curl_request(
+        url,
+        &[],
+        max_time_secs,
+        &download_path,
+        &headers_path,
+        &status_path,
+        &stderr_path,
+    )?;
+    let headers = fs::read_to_string(&headers_path).unwrap_or_default();
+    let status = read_curl_status(&status_path, &headers)?;
+    if status != 200 {
+        let _ = fs::remove_dir_all(&temp_dir);
+        bail!("HTTP {status} while fetching {url}");
+    }
+    fs::copy(&download_path, destination).with_context(|| {
+        format!(
+            "failed to copy downloaded file to {}",
+            destination.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+fn run_windows_curl_request(
+    url: &str,
+    headers: &[(&str, &str)],
+    max_time_secs: Option<u64>,
+    body_path: &Path,
+    headers_path: &Path,
+    status_path: &Path,
+    stderr_path: &Path,
+) -> Result<()> {
+    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
+    let stdout_file = fs::File::create(status_path)
+        .with_context(|| format!("failed to create {}", status_path.display()))?;
+    let stderr_file = fs::File::create(stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let curl_command = if runtime_is_windows() {
+        "curl.exe"
+    } else {
+        "curl"
+    };
+    let mut command = Command::new(curl_command);
+    command
+        .args(["-sS", "-L", "--max-time", &timeout.to_string()])
+        .args(["-A", "rocm-cli"])
+        .arg("-D")
+        .arg(curl_child_path(headers_path))
+        .arg("-o")
+        .arg(curl_child_path(body_path))
+        .args(["-w", "%{http_code}"]);
+    for (name, value) in headers {
+        command.arg("-H").arg(format!("{name}: {value}"));
+    }
+    let status = command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("failed to launch curl HTTP request for {url}"))?;
+    if !windows_child_status_success(status) {
+        let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+        bail!(
+            "curl HTTP request failed for {url} (status {status}): {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn read_curl_status(path: &Path, headers: &str) -> Result<u16> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read curl status {}", path.display()))?;
+    let text = text.trim();
+    if !text.is_empty() {
+        return text
+            .parse::<u16>()
+            .with_context(|| format!("failed to parse curl HTTP status from {text}"));
+    }
+    parse_final_http_status(headers).context("failed to parse curl HTTP status from headers")
+}
+
+fn parse_final_http_status(headers: &str) -> Option<u16> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("HTTP/") {
+                return None;
+            }
+            line.split_whitespace().nth(1)?.parse::<u16>().ok()
+        })
+        .last()
+}
+
+fn http_get_windows_powershell(
+    url: &str,
+    headers: &[(&str, &str)],
+    max_time_secs: Option<u64>,
+) -> Result<HttpResponseBody> {
+    let temp_dir = windows_http_temp_dir()?;
+    let body_path = temp_dir.join("body.bin");
+    let meta_path = temp_dir.join("meta.json");
+    let script_path = temp_dir.join("http-get.ps1");
+    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
+    fs::write(&script_path, windows_http_get_script())
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(windows_child_path(&script_path))
+        .args(["-Url", url])
+        .arg("-BodyPath")
+        .arg(windows_child_path(&body_path))
+        .arg("-MetaPath")
+        .arg(windows_child_path(&meta_path))
+        .args(["-TimeoutSec", &timeout.to_string()]);
+    for (name, value) in headers {
+        command.arg("-Header").arg(format!("{name}={value}"));
+    }
+    let stdout_path = temp_dir.join("stdout.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("failed to launch PowerShell HTTP request for {url}"))?;
+    if !windows_child_status_success(status) {
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let temp_note = windows_http_failure_temp_note(&temp_dir);
+        if !windows_http_keep_temp() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        bail!(
+            "PowerShell HTTP request failed for {url} (status {status}): {}{}{}",
+            stdout.trim(),
+            stderr.trim(),
+            temp_note
+        );
+    }
+    let metadata_bytes = fs::read(&meta_path)
+        .with_context(|| format!("failed to read HTTP metadata {}", meta_path.display()))?;
+    let metadata: WindowsHttpMetadata = serde_json::from_slice(strip_utf8_bom(&metadata_bytes))
+        .context("failed to parse PowerShell HTTP metadata")?;
+    let body = fs::read(&body_path)
+        .with_context(|| format!("failed to read HTTP response body {}", body_path.display()))?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(HttpResponseBody {
+        status: metadata.status_code,
+        headers: metadata.headers,
+        body,
+    })
+}
+
+fn download_file_windows_powershell(
+    url: &str,
+    destination: &Path,
+    max_time_secs: Option<u64>,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("download destination has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temp_dir = windows_http_temp_dir()?;
+    let script_path = temp_dir.join("download-file.ps1");
+    let meta_path = temp_dir.join("meta.json");
+    let timeout = max_time_secs.filter(|value| *value > 0).unwrap_or(600);
+    fs::write(&script_path, windows_http_get_script())
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+    let stdout_path = temp_dir.join("stdout.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(windows_child_path(&script_path))
+        .args(["-Url", url])
+        .arg("-BodyPath")
+        .arg(windows_child_path(destination))
+        .arg("-MetaPath")
+        .arg(windows_child_path(&meta_path))
+        .args(["-TimeoutSec", &timeout.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("failed to launch PowerShell download for {url}"))?;
+    if !windows_child_status_success(status) {
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let temp_note = windows_http_failure_temp_note(&temp_dir);
+        if !windows_http_keep_temp() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        bail!(
+            "PowerShell download failed for {url} (status {status}): {}{}{}",
+            stdout.trim(),
+            stderr.trim(),
+            temp_note
+        );
+    }
+    let metadata_bytes = fs::read(&meta_path)
+        .with_context(|| format!("failed to read HTTP metadata {}", meta_path.display()))?;
+    let metadata: WindowsHttpMetadata = serde_json::from_slice(strip_utf8_bom(&metadata_bytes))
+        .context("failed to parse PowerShell HTTP metadata")?;
+    if metadata.status_code != 200 {
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_file(destination);
+        bail!("HTTP {} while fetching {url}", metadata.status_code);
+    }
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+fn windows_http_temp_dir() -> Result<PathBuf> {
+    if !runtime_is_windows() {
+        return linux_temp_dir("rocm-cli-http");
+    }
+    windows_temp_dir("rocm-cli-http")
+}
+
+fn linux_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let root = std::env::temp_dir();
+    let base = format!("{prefix}-{}-{}", std::process::id(), unix_time_millis());
+    for attempt in 0..100 {
+        let dir = root.join(format!("{base}-{attempt}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", dir.display()));
+            }
+        }
+    }
+    bail!(
+        "failed to create a unique temporary directory under {}",
+        root.display()
+    )
+}
+
+fn windows_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let root = windows_runtime_temp_root().unwrap_or_else(std::env::temp_dir);
+    let base = format!("{prefix}-{}-{}", std::process::id(), unix_time_millis());
+    for attempt in 0..100 {
+        let dir = root.join(format!("{base}-{attempt}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", dir.display()));
+            }
+        }
+    }
+    bail!(
+        "failed to create a unique temporary directory under {}",
+        root.display()
+    )
+}
+
+fn windows_runtime_temp_root() -> Option<PathBuf> {
+    for name in ["TEMP", "TMP", "LOCALAPPDATA"] {
+        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(value);
+            return Some(if name == "LOCALAPPDATA" {
+                path.join("Temp")
+            } else {
+                path
+            });
+        }
+    }
+    None
+}
+
+fn windows_child_status_success(status: std::process::ExitStatus) -> bool {
+    status.success() || status.code() == Some(0)
+}
+
+fn windows_http_keep_temp() -> bool {
+    std::env::var("ROCM_CLI_DEBUG_WINDOWS_HTTP")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn windows_http_failure_temp_note(temp_dir: &Path) -> String {
+    if windows_http_keep_temp() {
+        format!("; temp files kept at {}", curl_child_path(temp_dir))
+    } else {
+        String::new()
+    }
+}
+
+fn windows_http_get_script() -> &'static str {
+    r#"
+param(
+  [Parameter(Mandatory=$true)][string]$Url,
+  [Parameter(Mandatory=$true)][string]$BodyPath,
+  [Parameter(Mandatory=$true)][string]$MetaPath,
+  [int]$TimeoutSec = 600,
+  [string[]]$Header = @()
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$headers = @{}
+foreach ($entry in $Header) {
+  $index = $entry.IndexOf('=')
+  if ($index -gt 0) {
+    $headers[$entry.Substring(0, $index)] = $entry.Substring($index + 1)
+  }
+}
+$response = Invoke-WebRequest -Uri $Url -UseBasicParsing -Headers $headers -OutFile $BodyPath -PassThru -TimeoutSec $TimeoutSec
+$headerLines = @()
+foreach ($key in $response.Headers.Keys) {
+  $headerLines += "${key}: $($response.Headers[$key])"
+}
+$metadata = [pscustomobject]@{
+  StatusCode = [int]$response.StatusCode
+  Headers = ($headerLines -join "`n")
+}
+$json = $metadata | ConvertTo-Json -Compress
+[System.IO.File]::WriteAllText($MetaPath, $json, [System.Text.UTF8Encoding]::new($false))
+"#
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
+
+fn windows_child_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let normalized = raw.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = normalized[3..].replace('/', "\\");
+        return format!("{drive}:\\{rest}");
+    }
+    if bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        return format!("{drive}:\\");
+    }
+    raw
+}
+
+fn curl_child_path(path: &Path) -> String {
+    if runtime_is_windows() {
+        windows_child_path(path)
+    } else {
+        path.display().to_string()
+    }
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2011,7 +2585,7 @@ fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()>
 
 fn python_venv_args(install_root: &Path) -> Vec<String> {
     let mut args = vec!["-m".to_owned(), "venv".to_owned()];
-    if !cfg!(windows) {
+    if !runtime_is_windows() {
         args.push("--copies".to_owned());
     }
     args.push(install_root.to_string_lossy().to_string());
@@ -2019,23 +2593,17 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
 }
 
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    let output = Command::new(python_executable)
-        .args(["-c", ROCM_SDK_PROBE_SCRIPT])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to launch rocm_sdk probe via {}",
-                python_executable.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "rocm_sdk probe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let text =
-        String::from_utf8(output.stdout).context("failed to decode rocm_sdk probe output")?;
+    let text = capture_python_stdout(
+        python_executable,
+        ROCM_SDK_PROBE_SCRIPT,
+        "launch rocm_sdk probe",
+    )
+    .with_context(|| {
+        format!(
+            "failed to launch rocm_sdk probe via {}",
+            python_executable.display()
+        )
+    })?;
     parse_rocm_sdk_probe(&text)
 }
 
@@ -2213,11 +2781,123 @@ fn progress_line(message: impl AsRef<str>) {
     let _ = std::io::stdout().flush();
 }
 
-fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
-    let output = Command::new(program)
+fn capture_command_output(program: &Path, args: &[&str]) -> Result<Output> {
+    if runtime_is_windows() {
+        return capture_command_output_with_temp_files(program, args);
+    }
+    Command::new(program)
         .args(args)
         .output()
+        .with_context(|| format!("failed to launch {}", program.display()))
+}
+
+fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Result<Output> {
+    let temp_dir = windows_temp_dir("rocm-cli-command")?;
+    let stdout_path = temp_dir.join("stdout.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
         .with_context(|| format!("failed to launch {}", program.display()))?;
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn capture_python_stdout(
+    python_executable: &Path,
+    script: &str,
+    context_text: &str,
+) -> Result<String> {
+    if !runtime_is_windows() {
+        let output = capture_command_output(python_executable, &["-c", script])?;
+        if !output.status.success() {
+            bail!(
+                "{context_text}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return String::from_utf8(output.stdout)
+            .with_context(|| format!("{context_text}: failed to decode Python output"));
+    }
+
+    let temp_dir = windows_temp_dir("rocm-cli-python")?;
+    let script_path = temp_dir.join("probe.py");
+    let wrapper_path = temp_dir.join("wrapper.py");
+    let output_path = temp_dir.join("stdout.txt");
+    let stderr_path = temp_dir.join("stderr.txt");
+    fs::write(&script_path, script)
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+    fs::write(
+        &wrapper_path,
+        r#"import contextlib
+import pathlib
+import runpy
+import sys
+
+out = pathlib.Path(sys.argv[1])
+script = pathlib.Path(sys.argv[2])
+with out.open("w", encoding="utf-8") as f:
+    with contextlib.redirect_stdout(f):
+        runpy.run_path(str(script), run_name="__main__")
+"#,
+    )
+    .with_context(|| format!("failed to write {}", wrapper_path.display()))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let status = Command::new(python_executable)
+        .arg(windows_child_path(&wrapper_path))
+        .arg(windows_child_path(&output_path))
+        .arg(windows_child_path(&script_path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .with_context(|| format!("failed to launch {}", python_executable.display()))?;
+    let text = fs::read_to_string(&output_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&temp_dir);
+    if status.success() {
+        Ok(text)
+    } else {
+        let stderr = stderr.trim().to_owned();
+        let detail = if stderr.is_empty() {
+            format!("command exited with status {status}")
+        } else {
+            stderr
+        };
+        bail!("{context_text}: {detail}")
+    }
+}
+
+fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
+    if runtime_is_windows() {
+        let status = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to launch {}", program.display()))?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("{context_text}: command exited with status {status}");
+    }
+
+    let output = capture_command_output(program, args)?;
     if output.status.success() {
         return Ok(());
     }
@@ -2508,7 +3188,7 @@ fn managed_python_asset_version_prefix() -> String {
 }
 
 fn python_standalone_platform_triple() -> Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    match (runtime_os_name(), std::env::consts::ARCH) {
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
@@ -2542,7 +3222,7 @@ fn extract_managed_python_archive(archive_path: &Path, install_dir: &Path) -> Re
 }
 
 fn find_python_executable(root: &Path) -> Option<PathBuf> {
-    let candidates = if cfg!(windows) {
+    let candidates = if runtime_is_windows() {
         vec![
             root.join("python").join("python.exe"),
             root.join("python.exe"),
@@ -2573,7 +3253,7 @@ fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf
                 .file_name()
                 .and_then(|value| value.to_str())
                 .is_some_and(|name| {
-                    if cfg!(windows) {
+                    if runtime_is_windows() {
                         name.eq_ignore_ascii_case("python.exe")
                     } else {
                         name == "python" || name == "python3"
@@ -2593,7 +3273,7 @@ fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf
 
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok()
-        && command_succeeds(Path::new(&value), &["--version"])
+        && python_launcher_is_compatible(Path::new(&value))
     {
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
@@ -2601,28 +3281,28 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
         });
     }
 
-    if let Some(manifest) = load_managed_python_manifest(paths)?
-        && manifest.executable.is_file()
-        && command_succeeds(&manifest.executable, &["--version"])
-    {
-        return Ok(PythonLauncher {
-            executable: manifest.executable,
-            source: "managed",
-        });
-    }
-
-    let candidates: &[&str] = if cfg!(windows) {
-        &["python", "py"]
+    let candidates: &[&str] = if runtime_is_windows() {
+        &["python", "python3", "py"]
     } else {
         &["python3", "python"]
     };
     for candidate in candidates {
-        if command_succeeds(Path::new(candidate), &["--version"]) {
+        if python_launcher_is_compatible(Path::new(candidate)) {
             return Ok(PythonLauncher {
                 executable: PathBuf::from(candidate),
                 source: "path",
             });
         }
+    }
+
+    if let Some(manifest) = load_managed_python_manifest(paths)?
+        && manifest.executable.is_file()
+        && python_launcher_is_compatible(&manifest.executable)
+    {
+        return Ok(PythonLauncher {
+            executable: manifest.executable,
+            source: "managed",
+        });
     }
 
     if managed_python_bootstrap_disabled() {
@@ -2633,11 +3313,20 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
     ensure_managed_python(paths)
 }
 
+fn python_launcher_is_compatible(program: &Path) -> bool {
+    wheel_compatibility_for_python(program)
+        .map(|compatibility| compatibility.python_tag == "cp312")
+        .unwrap_or(false)
+}
+
 fn command_succeeds(program: &Path, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
-        .output()
-        .map(|output| output.status.success())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -2704,7 +3393,11 @@ fn therock_index_url(family: &str) -> String {
 }
 
 fn platform_tarball_token() -> &'static str {
-    if cfg!(windows) { "windows" } else { "linux" }
+    if runtime_is_windows() {
+        "windows"
+    } else {
+        "linux"
+    }
 }
 
 fn runtime_key(
@@ -2738,6 +3431,7 @@ fn runtime_manifest_path(paths: &AppPaths, runtime_key: &str) -> PathBuf {
 }
 
 fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) -> Result<()> {
+    let manifest = manifest.clone().normalize_storage_paths();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
     fs::create_dir_all(
         registry_path
@@ -2746,14 +3440,14 @@ fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) 
     )?;
     fs::write(
         &registry_path,
-        serde_json::to_vec_pretty(manifest).context("failed to serialize runtime manifest")?,
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize runtime manifest")?,
     )
     .with_context(|| format!("failed to write {}", registry_path.display()))?;
 
     let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
     fs::write(
         &local_manifest_path,
-        serde_json::to_vec_pretty(manifest)
+        serde_json::to_vec_pretty(&manifest)
             .context("failed to serialize local runtime manifest")?,
     )
     .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
@@ -2778,7 +3472,7 @@ pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRu
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
-            manifests.push(manifest);
+            manifests.push(manifest.normalize_host_paths());
         }
     }
     manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
@@ -2803,11 +3497,9 @@ fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
 }
 
 fn venv_python_path(install_root: &Path) -> PathBuf {
-    if cfg!(windows) {
-        install_root.join("Scripts").join("python.exe")
-    } else {
-        install_root.join("bin").join("python")
-    }
+    install_root
+        .join(runtime_python_bin_dir_name())
+        .join(runtime_python_executable_name())
 }
 
 fn slugify(value: &str) -> String {
@@ -3122,6 +3814,78 @@ mod tests {
     }
 
     #[test]
+    fn python_launcher_prefers_path_python_before_saved_managed_python() -> Result<()> {
+        let (root, paths) = test_paths("python-prefers-path");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        let path_python = write_fake_python(&bin_dir, "python")?;
+        let managed_python = paths
+            .data_dir
+            .join("tools")
+            .join("python")
+            .join("python.exe");
+        fs::create_dir_all(managed_python.parent().expect("managed python parent"))?;
+        fs::write(&managed_python, "not used")?;
+        let manifest = ManagedPythonManifest {
+            executable: managed_python,
+            source_url: "https://example.invalid/python.tar.gz".to_owned(),
+            release_tag: "20260510".to_owned(),
+            asset_name: "python.tar.gz".to_owned(),
+            version: "3.12.10".to_owned(),
+            installed_at_unix_ms: 123,
+        };
+        save_managed_python_manifest(&paths, &manifest)?;
+        let old_path = std::env::var_os("PATH");
+        let old_rocm_cli_python = std::env::var_os("ROCM_CLI_PYTHON");
+        let mut path_entries = vec![bin_dir.clone()];
+        if let Some(old_path) = old_path.as_ref() {
+            path_entries.extend(std::env::split_paths(old_path));
+        }
+        let joined_path = std::env::join_paths(path_entries)?;
+        unsafe {
+            std::env::set_var("PATH", joined_path);
+            std::env::remove_var("ROCM_CLI_PYTHON");
+        }
+        let launcher = resolve_python_launcher(&paths)?;
+        unsafe {
+            match old_path {
+                Some(old_path) => std::env::set_var("PATH", old_path),
+                None => std::env::remove_var("PATH"),
+            }
+            match old_rocm_cli_python {
+                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
+                None => std::env::remove_var("ROCM_CLI_PYTHON"),
+            }
+        }
+        assert_eq!(launcher.source, "path");
+        assert_eq!(launcher.executable, PathBuf::from("python"));
+        assert!(path_python.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_fake_python(dir: &Path, name: &str) -> Result<PathBuf> {
+        let path = dir.join(if cfg!(windows) {
+            format!("{name}.cmd")
+        } else {
+            name.to_owned()
+        });
+        let script = if cfg!(windows) {
+            "@echo off\r\nif \"%1\"==\"-c\" (echo cp312) else (echo Python 3.12.10)\r\n".to_owned()
+        } else {
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo cp312; else echo Python 3.12.10; fi\n"
+                .to_owned()
+        };
+        fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(path)
+    }
+
+    #[test]
     fn display_command_quotes_package_extras() {
         assert_eq!(quote_display_arg("package[extra]"), "\"package[extra]\"");
         assert_eq!(
@@ -3323,6 +4087,37 @@ mod tests {
             http_header_value(headers, "last-modified").as_deref(),
             Some("today")
         );
+    }
+
+    #[test]
+    fn parse_final_http_status_uses_last_header_block() {
+        let headers =
+            "HTTP/1.1 200 OK\r\netag: old\r\n\r\nHTTP/1.1 304 Not Modified\r\netag: new\r\n";
+
+        assert_eq!(parse_final_http_status(headers), Some(304));
+    }
+
+    #[test]
+    fn windows_child_path_maps_ape_drive_paths() {
+        assert_eq!(
+            windows_child_path(Path::new("/D/jam/rocm-cli/file.ps1")),
+            r"D:\jam\rocm-cli\file.ps1"
+        );
+        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
+    }
+
+    #[test]
+    fn cosmopolitan_build_uses_direct_http_not_windows_shell_http() {
+        if cfg!(target_vendor = "cosmo") {
+            assert!(use_curl_http());
+            assert!(!use_windows_powershell_http());
+        } else if runtime_is_windows() {
+            assert!(!use_curl_http());
+            assert!(use_windows_powershell_http());
+        } else {
+            assert!(!use_curl_http());
+            assert!(!use_windows_powershell_http());
+        }
     }
 
     #[test]

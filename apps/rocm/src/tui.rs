@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -34,10 +34,12 @@ use rocm_core::{
     AppPaths, AuditEventRecord, AutomationProposalRecord, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT,
     HostGpuSummary, ManagedServiceRecord, ModelRecipeRecord, PERMISSIONS_MODE_ASK,
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
-    WatcherMode, append_audit_event, builtin_watcher, builtin_watchers, daemon_binary_path,
-    default_engine_for_platform, detect_host_gpu_summary, find_automation_proposal,
-    format_host_for_url, format_host_port, format_http_base_url, load_model_recipe_registry,
-    load_recent_automation_proposals, replace_automation_proposal, sanitize_component,
+    WatcherMode, append_audit_event, builtin_watcher, builtin_watchers, current_executable_path,
+    daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary,
+    find_automation_proposal, format_host_for_url, format_host_port, format_http_base_url,
+    load_model_recipe_registry, load_recent_automation_proposals,
+    managed_service_endpoint_model_ready, replace_automation_proposal, runtime_is_windows,
+    runtime_python_bin_dir_name, runtime_python_executable_name, sanitize_component,
     unix_time_millis, update_automation_proposal_status,
 };
 use serde::Deserialize;
@@ -62,6 +64,7 @@ const GPU_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const GPU_AMD_SMI_TIMEOUT: Duration = Duration::from_millis(1_500);
 const TUI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(75);
+const TUI_SERVICE_READY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_COMMAND_OUTPUT_LINES: usize = 240;
 const MAX_COMPLETION_MENU_ITEMS: usize = 8;
 const MAX_ACTIVITY_LOG_ITEMS: usize = 3;
@@ -77,7 +80,7 @@ const CHAT_SESSION_MAX_TURNS: usize = 20;
 const CHAT_SESSION_FOLLOW_SCROLL: u16 = 10_000;
 const ACTIVE_SCREEN_RECENT_OUTPUT_LINES: usize = 120;
 const RUNNING_JOB_OUTPUT_LINES: usize = 1000;
-const VALIDATED_LOCAL_ASSISTANT_MODEL: &str = "Qwen/Qwen2.5-1.5B-Instruct";
+const VALIDATED_LOCAL_ASSISTANT_MODEL: &str = "Qwen3-0.6B-GGUF";
 const THEME_BG: Color = Color::Rgb(13, 15, 18);
 const THEME_PANEL: Color = Color::Rgb(19, 20, 22);
 const THEME_PANEL_2: Color = Color::Rgb(29, 31, 35);
@@ -331,6 +334,7 @@ struct App {
     onboarding_show_log_location: bool,
     onboarding_cancel_install_confirm: bool,
     onboarding_cancel_install_selection: usize,
+    onboarding_success_modal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2086,6 +2090,7 @@ impl App {
             onboarding_show_log_location: false,
             onboarding_cancel_install_confirm: false,
             onboarding_cancel_install_selection: 0,
+            onboarding_success_modal: false,
         };
         app.push_default_intro();
         if app.should_show_onboarding() {
@@ -3908,7 +3913,7 @@ impl App {
         };
         if state.model_source == ServeModelSource::BuiltInRecipe {
             state.message = Some(format!(
-                "Recommended model is fixed.\n\nROCm CLI uses {VALIDATED_LOCAL_ASSISTANT_MODEL} because it is the low-VRAM assistant path for TheRock PyTorch."
+                "Recommended model is fixed.\n\nROCm CLI uses {VALIDATED_LOCAL_ASSISTANT_MODEL} because it is the validated low-VRAM Lemonade assistant path."
             ));
             self.status =
                 "Recommended model is fixed. Use Model type for a custom file.".to_owned();
@@ -5921,7 +5926,7 @@ impl App {
         if let Some(model) = model {
             self.open_serve_wizard_from_plan(ServeCommandPlan {
                 model: Some(model),
-                engine: Some("pytorch".to_owned()),
+                engine: Some(default_engine_for_platform().to_owned()),
                 device: Some("gpu_required".to_owned()),
                 managed: true,
                 ..ServeCommandPlan::default()
@@ -6255,6 +6260,7 @@ impl App {
         self.pending_approval = None;
         self.onboarding_selection = 0;
         self.onboarding_path_editing = false;
+        self.onboarding_success_modal = false;
         self.clear_input();
         self.status = "Setup closed.".to_owned();
     }
@@ -6281,11 +6287,13 @@ impl App {
                 self.pending_approval = None;
                 self.onboarding_selection = 0;
                 self.onboarding_path_editing = false;
+                self.onboarding_success_modal = false;
                 self.clear_input();
                 self.reset_main_transcript();
                 self.status = "Setup complete. ROCm CLI is ready.".to_owned();
             }
             Err(error) => {
+                self.onboarding_success_modal = false;
                 self.set_onboarding_setup_error(&format!(
                     "Setup completion could not be saved: {error}"
                 ));
@@ -7393,8 +7401,12 @@ impl App {
         let Some(state) = self.folder_browser.as_mut() else {
             return;
         };
+        let path = normalize_runtime_folder_path(path);
         if !path.is_dir() {
-            state.message = Some(format!("That is not a folder: {}", path.display()));
+            state.message = Some(format!(
+                "That is not a folder: {}",
+                display_runtime_folder_path(&path)
+            ));
             self.status = "Choose a folder.".to_owned();
             return;
         }
@@ -7429,6 +7441,7 @@ impl App {
     }
 
     fn use_folder_browser_path(&mut self, folder: PathBuf) {
+        let folder = normalize_runtime_folder_path(folder);
         let folder_text = folder.display().to_string();
         let folder = match validate_onboarding_install_folder(&folder_text) {
             Ok(folder) => folder,
@@ -8349,15 +8362,15 @@ impl App {
                 "Serve",
                 vec![
                     "serve".to_owned(),
-                    "qwen".to_owned(),
+                    VALIDATED_LOCAL_ASSISTANT_MODEL.to_owned(),
                     "--engine".to_owned(),
-                    "pytorch".to_owned(),
+                    "lemonade".to_owned(),
                     "--device".to_owned(),
                     "gpu_required".to_owned(),
                     "--managed".to_owned(),
                 ],
-                "Sure. I can start the recommended local assistant on your AMD GPU. Nothing launches until you approve it.",
-                "Start the recommended low-VRAM local assistant.",
+                "Sure. I can start the recommended Lemonade assistant on your AMD GPU. Nothing launches until you approve it.",
+                "Start the recommended low-VRAM Lemonade assistant.",
             ))
         } else {
             None
@@ -8399,6 +8412,16 @@ impl App {
                 "No problem. I cancelled the ROCm install request. Nothing changed.",
             );
             self.status = "Install request cancelled.".to_owned();
+            return true;
+        }
+        if pending_install_folder_prompt_wants_picker(&normalized) {
+            self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
+            self.push_chat_session_turn(
+                ChatSessionRole::Assistant,
+                "Sure. Choose the install folder in the picker. I will show the install card after that, before anything downloads.",
+            );
+            self.open_install_folder_browser_for_args(args.clone());
+            self.status = "Choose the install folder. Nothing downloads yet.".to_owned();
             return true;
         }
         let Some(folder) = crate::chat_install_folder_from_prompt(prompt) else {
@@ -9537,7 +9560,7 @@ impl App {
                 CommandScreenAction::Back,
             ],
         );
-        self.status = "Hi. Choose an option, or type what you want ROCm CLI to do.".to_owned();
+        self.status = "Hi. Choose an option with the arrows or mouse.".to_owned();
     }
 
     fn open_unclear_plain_input_screen(&mut self, input: &str) {
@@ -11688,6 +11711,7 @@ impl App {
             self.onboarding_cancel_install_confirm = false;
             self.reset_onboarding_selection();
             if advance_onboarding_after_job {
+                self.onboarding_success_modal = true;
                 self.status = "ROCm installed. Press Enter to continue.".to_owned();
             }
         }
@@ -12040,22 +12064,34 @@ impl App {
                         state.message = None;
                         state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.status = "Approval cancelled. You can keep chatting.".to_owned();
                 } else if self.runtime_manager.is_none()
+                    && !self.onboarding_active
                     && self.install_manager.is_none()
                     && self.engine_manager.is_none()
                     && self.model_picker.is_none()
+                    && self.serve_wizard.is_none()
                     && self.update_manager.is_none()
                     && self.automations_manager.is_none()
                     && self.provider_manager.is_none()
                     && self.config_manager.is_none()
                     && self.services_manager.is_none()
-                    && self.command_screen.is_none()
+                    && (self.command_screen.is_none() || !self.command_screen_is_chat_session())
                 {
-                    self.push_block("Approval", &format!("cancelled: {}", pending.title));
+                    self.open_home_dashboard();
+                    self.status = format!("{} cancelled. Back at the main menu.", pending.title);
                 } else {
                     self.set_active_screen_message(format!("{} cancelled.", pending.title));
+                    if self.serve_wizard.is_some() {
+                        self.status =
+                            "Serve cancelled. Choose Start when you are ready.".to_owned();
+                    } else if self.onboarding_active {
+                        self.status =
+                            format!("{} cancelled. You're still in setup.", pending.title);
+                    } else {
+                        self.status = "Approval cancelled.".to_owned();
+                    }
                 }
-                self.status = "Approval cancelled.".to_owned();
                 self.record_activity(format!("cancelled: {}", pending.title));
             }
             ApprovalAction::EnableFullAccess => {
@@ -13011,7 +13047,7 @@ fn flag_without_value(option_name: &str, inline_value: Option<&str>) -> Result<(
 }
 
 fn serve_usage_text() -> &'static str {
-    "Usage: /serve <model> [--engine <engine>] [--device gpu|gpu_required] [--managed]\n\nExamples:\n  /serve qwen with pytorch --managed\n  /serve qwen --engine pytorch --device gpu_required"
+    "Usage: /serve <model> [--engine <engine>] [--device gpu|gpu_required] [--managed]\n\nExamples:\n  /serve qwen with lemonade --managed\n  /serve qwen --engine lemonade --device gpu_required"
 }
 
 #[cfg(test)]
@@ -13495,6 +13531,7 @@ fn push_onboarding_folder_preset(presets: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn folder_browser_existing_dir(path: PathBuf) -> PathBuf {
+    let path = normalize_runtime_folder_path(path);
     if path.is_dir() {
         return path;
     }
@@ -13508,59 +13545,68 @@ fn folder_browser_existing_dir(path: PathBuf) -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+        .map(normalize_runtime_folder_path)
         .filter(|path| path.is_dir())
-        .or_else(|| std::env::current_dir().ok().filter(|path| path.is_dir()))
-        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(normalize_runtime_folder_path)
+                .filter(|path| path.is_dir())
+        })
+        .unwrap_or_else(|| PathBuf::from(if runtime_is_windows() { "C:/" } else { "/" }))
 }
 
 fn folder_browser_entries(current_dir: &Path) -> (Vec<FolderBrowserEntry>, Option<String>) {
+    let current_dir = normalize_runtime_folder_path(current_dir.to_path_buf());
     let mut entries = vec![FolderBrowserEntry {
         label: "Use current folder".to_owned(),
-        path: current_dir.to_path_buf(),
+        path: current_dir.clone(),
         kind: FolderBrowserEntryKind::UseCurrent,
     }];
     entries.push(FolderBrowserEntry {
         label: "+ therock_venvs".to_owned(),
-        path: current_dir.join("therock_venvs"),
+        path: normalize_runtime_folder_path(current_dir.join("therock_venvs")),
         kind: FolderBrowserEntryKind::NewChild,
     });
     entries.push(FolderBrowserEntry {
         label: "+ rocm_venvs".to_owned(),
-        path: current_dir.join("rocm_venvs"),
+        path: normalize_runtime_folder_path(current_dir.join("rocm_venvs")),
         kind: FolderBrowserEntryKind::NewChild,
     });
-    if let Some(parent) = current_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+    if !windows_drive_path_is_root(&current_dir)
+        && let Some(parent) = current_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
     {
         entries.push(FolderBrowserEntry {
             label: "..".to_owned(),
-            path: parent.to_path_buf(),
+            path: normalize_runtime_folder_path(parent.to_path_buf()),
             kind: FolderBrowserEntryKind::Parent,
         });
     }
     for drive in folder_browser_drive_roots() {
-        if onboarding_folder_preset_key(&drive) == onboarding_folder_preset_key(current_dir) {
+        if onboarding_folder_preset_key(&drive) == onboarding_folder_preset_key(&current_dir) {
             continue;
         }
         entries.push(FolderBrowserEntry {
-            label: drive.display().to_string(),
+            label: display_runtime_folder_path(&drive),
             path: drive,
             kind: FolderBrowserEntryKind::Drive,
         });
     }
 
     let mut message = None;
-    match fs::read_dir(current_dir) {
+    match fs::read_dir(&current_dir) {
         Ok(read_dir) => {
             let mut dirs = read_dir
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .filter(|path| path.is_dir())
-                .filter(|path| folder_browser_should_show_directory(current_dir, path))
+                .filter(|path| folder_browser_should_show_directory(&current_dir, path))
                 .collect::<Vec<_>>();
             dirs.sort_by_key(|path| folder_browser_sort_key(path));
             for path in dirs {
+                let path = normalize_runtime_folder_path(path);
                 entries.push(FolderBrowserEntry {
                     label: folder_browser_directory_label(&path),
                     path,
@@ -13603,20 +13649,20 @@ fn folder_browser_should_show_directory(current_dir: &Path, path: &Path) -> bool
 }
 
 fn folder_browser_drive_roots() -> Vec<PathBuf> {
-    if !cfg!(windows) {
+    if !runtime_is_windows() {
         return Vec::new();
     }
     ('A'..='Z')
-        .map(|letter| PathBuf::from(format!("{letter}:\\")))
+        .map(|letter| PathBuf::from(format!("{letter}:/")))
         .filter(|path| path.is_dir())
         .collect()
 }
 
 fn folder_browser_drive_root_for_key(ch: char) -> Option<PathBuf> {
-    if !cfg!(windows) || !ch.is_ascii_alphabetic() {
+    if !runtime_is_windows() || !ch.is_ascii_alphabetic() {
         return None;
     }
-    let path = PathBuf::from(format!("{}:\\", ch.to_ascii_uppercase()));
+    let path = PathBuf::from(format!("{}:/", ch.to_ascii_uppercase()));
     path.is_dir().then_some(path)
 }
 
@@ -13638,7 +13684,7 @@ fn folder_browser_directory_label(path: &Path) -> String {
 
 fn folder_browser_sort_key(path: &Path) -> String {
     let key = folder_browser_name(path);
-    if cfg!(windows) {
+    if runtime_is_windows() {
         key.to_ascii_lowercase()
     } else {
         key
@@ -13706,8 +13752,10 @@ fn wrap_plain_line(value: &str, width: usize) -> Vec<String> {
 }
 
 fn onboarding_folder_preset_key(path: &Path) -> String {
-    let value = path.display().to_string();
-    if cfg!(windows) {
+    let value = normalize_runtime_folder_path(path.to_path_buf())
+        .display()
+        .to_string();
+    if runtime_is_windows() {
         value
             .replace('/', "\\")
             .trim_end_matches('\\')
@@ -13726,8 +13774,8 @@ fn validate_onboarding_install_folder(input: &str) -> Result<PathBuf> {
         bail!("Folder cannot be empty.");
     }
 
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
+    let path = normalize_runtime_folder_path(PathBuf::from(value));
+    if !runtime_folder_path_is_absolute(&path) {
         bail!("Use a full folder path.");
     }
     if onboarding_path_is_system_folder(&path) {
@@ -13760,6 +13808,82 @@ fn validate_onboarding_install_folder(input: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn normalize_runtime_folder_path(path: PathBuf) -> PathBuf {
+    if !runtime_is_windows() {
+        return path;
+    }
+    PathBuf::from(windows_runtime_drive_path_storage_text(
+        &path.display().to_string(),
+    ))
+}
+
+fn normalize_windows_drive_path_text(value: &str) -> String {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let rest = value[2..].replace('\\', "/");
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return format!("{drive}:/");
+        }
+        return format!("{drive}:/{rest}");
+    }
+    value.to_owned()
+}
+
+fn windows_runtime_drive_path_storage_text(value: &str) -> String {
+    let value = normalize_windows_drive_path_text(value);
+    if std::path::MAIN_SEPARATOR == '\\' && windows_drive_path_is_absolute_text(&value) {
+        value.replace('/', "\\")
+    } else {
+        value
+    }
+}
+
+fn display_runtime_folder_path(path: &Path) -> String {
+    let value = normalize_runtime_folder_path(path.to_path_buf())
+        .display()
+        .to_string();
+    if runtime_is_windows() && windows_drive_path_is_absolute_text(&value) {
+        value.replace('/', "\\")
+    } else {
+        value
+    }
+}
+
+fn runtime_folder_path_is_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        || (runtime_is_windows() && windows_path_is_absolute_text(&path.display().to_string()))
+}
+
+fn windows_path_is_absolute_text(value: &str) -> bool {
+    let value = normalize_windows_drive_path_text(value);
+    windows_drive_path_is_absolute_text(&value) || windows_unc_path_is_absolute_text(&value)
+}
+
+fn windows_drive_path_is_absolute_text(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn windows_drive_path_is_root(path: &Path) -> bool {
+    if !runtime_is_windows() {
+        return false;
+    }
+    let value = normalize_windows_drive_path_text(&path.display().to_string());
+    windows_drive_path_is_absolute_text(&value) && value[3..].is_empty()
+}
+
+fn windows_unc_path_is_absolute_text(value: &str) -> bool {
+    let normalized = value.replace('\\', "/");
+    let mut parts = normalized.split('/').filter(|part| !part.is_empty());
+    normalized.starts_with("//") && parts.next().is_some() && parts.next().is_some()
+}
+
 fn ensure_onboarding_folder_writable(dir: &Path) -> Result<()> {
     let probe_path = dir.join(format!(
         ".rocm-cli-write-test-{}",
@@ -13789,7 +13913,7 @@ fn onboarding_path_is_system_folder(path: &Path) -> bool {
 
 fn system_folder_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if cfg!(windows) {
+    if runtime_is_windows() {
         for key in [
             "SystemRoot",
             "WINDIR",
@@ -13820,7 +13944,7 @@ fn system_folder_candidates() -> Vec<PathBuf> {
 }
 
 fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         let normalize = |value: &Path| {
             value
                 .display()
@@ -13842,11 +13966,9 @@ fn setup_pip_cache_dir(paths: &AppPaths, config: &RocmCliConfig) -> PathBuf {
 }
 
 fn venv_python_path(venv_path: &std::path::Path) -> PathBuf {
-    if cfg!(windows) {
-        venv_path.join("Scripts").join("python.exe")
-    } else {
-        venv_path.join("bin").join("python")
-    }
+    venv_path
+        .join(runtime_python_bin_dir_name())
+        .join(runtime_python_executable_name())
 }
 
 fn quote_tui_arg(value: &str) -> String {
@@ -15836,6 +15958,7 @@ fn chat_input_cursor_position(
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let mut fallback_events: Option<Receiver<Event>> = None;
     while !app.should_quit {
         app.refresh_sidebar_state();
         terminal
@@ -15847,63 +15970,278 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
         } else {
             TUI_IDLE_POLL_INTERVAL
         };
-        if !event::poll(poll_interval).context("failed to poll terminal events")? {
-            continue;
-        }
+        let next_event = match event::poll(poll_interval) {
+            Ok(false) => None,
+            Ok(true) => match event::read() {
+                Ok(event) => Some(event),
+                Err(error) => fallback_terminal_event(
+                    &mut fallback_events,
+                    poll_interval,
+                    &mut app.status,
+                    error,
+                )?,
+            },
+            Err(error) => fallback_terminal_event(
+                &mut fallback_events,
+                poll_interval,
+                &mut app.status,
+                error,
+            )?,
+        };
 
-        match event::read().context("failed to read terminal event")? {
-            Event::Key(key) => handle_key(app, key),
-            Event::Mouse(mouse) => handle_mouse(app, mouse),
-            Event::Paste(text) if app.onboarding_active && app.onboarding_path_editing => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.install_manager_editing_text() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.logs_view_editing_text() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.runtime_manager_editing_text() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.serve_wizard_editing_text() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.automations_manager_editing_text() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) if app.config_manager_editing_secret() => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for ch in normalized.chars().filter(|ch| *ch != '\n') {
-                    app.insert_input_char(ch);
-                }
-            }
-            Event::Paste(text) => app.paste_text(&text),
-            _ => {}
+        if let Some(event) = next_event {
+            handle_terminal_event(app, event);
         }
     }
     Ok(())
 }
 
+fn fallback_terminal_event(
+    receiver: &mut Option<Receiver<Event>>,
+    poll_interval: Duration,
+    status: &mut String,
+    error: std::io::Error,
+) -> Result<Option<Event>> {
+    if receiver.is_none() {
+        *status = "Terminal input is using the portable fallback. Arrow keys and Enter still work."
+            .to_owned();
+        *receiver = Some(spawn_fallback_terminal_reader());
+        let _ = error;
+    }
+    let Some(receiver) = receiver else {
+        return Ok(None);
+    };
+    match receiver.recv_timeout(poll_interval) {
+        Ok(event) => Ok(Some(event)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("portable terminal input reader stopped")
+        }
+    }
+}
+
+fn spawn_fallback_terminal_reader() -> Receiver<Event> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        while let Some(event) = read_fallback_terminal_event(&mut stdin) {
+            if sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn read_fallback_terminal_event<R: Read>(reader: &mut R) -> Option<Event> {
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte).ok()?;
+    match byte[0] {
+        b'\r' | b'\n' => Some(fallback_key(KeyCode::Enter)),
+        b'\t' => Some(fallback_key(KeyCode::Tab)),
+        0x08 | 0x7f => Some(fallback_key(KeyCode::Backspace)),
+        0x03 => Some(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))),
+        0x1b => read_fallback_escape_sequence(reader).or_else(|| Some(fallback_key(KeyCode::Esc))),
+        value if value.is_ascii_control() => None,
+        value => Some(fallback_key(KeyCode::Char(value as char))),
+    }
+}
+
+fn read_fallback_escape_sequence<R: Read>(reader: &mut R) -> Option<Event> {
+    let mut second = [0u8; 1];
+    reader.read_exact(&mut second).ok()?;
+    if second[0] != b'[' {
+        return Some(fallback_key(KeyCode::Esc));
+    }
+    let mut third = [0u8; 1];
+    reader.read_exact(&mut third).ok()?;
+    match third[0] {
+        b'A' => Some(fallback_key(KeyCode::Up)),
+        b'B' => Some(fallback_key(KeyCode::Down)),
+        b'C' => Some(fallback_key(KeyCode::Right)),
+        b'D' => Some(fallback_key(KeyCode::Left)),
+        b'<' => read_fallback_sgr_mouse_sequence(reader),
+        b'M' => read_fallback_x10_mouse_sequence(reader),
+        b'5' => {
+            let _ = reader.read_exact(&mut [0u8; 1]);
+            Some(fallback_key(KeyCode::PageUp))
+        }
+        b'6' => {
+            let _ = reader.read_exact(&mut [0u8; 1]);
+            Some(fallback_key(KeyCode::PageDown))
+        }
+        _ => Some(fallback_key(KeyCode::Esc)),
+    }
+}
+
+fn read_fallback_sgr_mouse_sequence<R: Read>(reader: &mut R) -> Option<Event> {
+    let mut bytes = Vec::new();
+    let final_byte = loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).ok()?;
+        if matches!(byte[0], b'M' | b'm') {
+            break byte[0];
+        }
+        if bytes.len() > 64 {
+            return Some(fallback_noop_event());
+        }
+        bytes.push(byte[0]);
+    };
+    let text = String::from_utf8(bytes).ok()?;
+    let mut parts = text.split(';');
+    let code = parts.next()?.parse::<u16>().ok()?;
+    let column = parts.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let row = parts.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    fallback_mouse_event(code, column, row, final_byte)
+}
+
+fn read_fallback_x10_mouse_sequence<R: Read>(reader: &mut R) -> Option<Event> {
+    let mut bytes = [0u8; 3];
+    reader.read_exact(&mut bytes).ok()?;
+    let code = bytes[0].saturating_sub(32) as u16;
+    let column = u16::from(bytes[1].saturating_sub(33));
+    let row = u16::from(bytes[2].saturating_sub(33));
+    fallback_mouse_event(code, column, row, b'M')
+}
+
+fn fallback_mouse_event(code: u16, column: u16, row: u16, final_byte: u8) -> Option<Event> {
+    let kind = match code & 0b11_1111 {
+        64 => MouseEventKind::ScrollUp,
+        65 => MouseEventKind::ScrollDown,
+        _ => return Some(fallback_noop_event()),
+    };
+    if final_byte == b'm' {
+        return Some(fallback_noop_event());
+    }
+    Some(Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: fallback_mouse_modifiers(code),
+    }))
+}
+
+fn fallback_mouse_modifiers(code: u16) -> KeyModifiers {
+    let mut modifiers = KeyModifiers::empty();
+    if code & 4 != 0 {
+        modifiers.insert(KeyModifiers::SHIFT);
+    }
+    if code & 8 != 0 {
+        modifiers.insert(KeyModifiers::ALT);
+    }
+    if code & 16 != 0 {
+        modifiers.insert(KeyModifiers::CONTROL);
+    }
+    modifiers
+}
+
+fn fallback_noop_event() -> Event {
+    Event::FocusGained
+}
+
+fn fallback_key(code: KeyCode) -> Event {
+    Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn handle_terminal_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) => handle_key(app, key),
+        Event::Mouse(mouse) => handle_mouse(app, mouse),
+        Event::Paste(text) if app.onboarding_active && app.onboarding_path_editing => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.install_manager_editing_text() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.logs_view_editing_text() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.runtime_manager_editing_text() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.serve_wizard_editing_text() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.automations_manager_editing_text() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if app.config_manager_editing_secret() => {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            for ch in normalized.chars().filter(|ch| *ch != '\n') {
+                app.insert_input_char(ch);
+            }
+        }
+        Event::Paste(text) if should_draw_prompt_box(app) => app.paste_text(&text),
+        Event::Paste(_) => {
+            app.status =
+                "Use the visible choices here; there is no text box on this screen.".to_owned();
+        }
+        _ => {}
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.onboarding_success_modal {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            app.finish_onboarding();
+        }
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let (terminal_width, terminal_height) = size().unwrap_or((0, 0));
+            if app.folder_browser.is_some()
+                && click_folder_browser(
+                    app,
+                    mouse.column,
+                    mouse.row,
+                    terminal_width,
+                    terminal_height,
+                )
+            {
+                return;
+            }
+            if app.should_draw_home_dashboard()
+                && click_home_dashboard(
+                    app,
+                    mouse.column,
+                    mouse.row,
+                    terminal_width,
+                    terminal_height,
+                )
+            {
+                return;
+            }
+        }
+        MouseEventKind::Drag(_) | MouseEventKind::Moved | MouseEventKind::Up(_) => {
+            return;
+        }
+        _ => {}
+    }
+
     let lines = match mouse.kind {
         MouseEventKind::ScrollUp => -MOUSE_SCROLL_LINES,
         MouseEventKind::ScrollDown => MOUSE_SCROLL_LINES,
@@ -15982,12 +16320,158 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+fn click_home_dashboard(app: &mut App, column: u16, row: u16, width: u16, height: u16) -> bool {
+    let area = main_content_area(app, width, height);
+    let Some(list_inner) = home_dashboard_list_inner_rect(app, area) else {
+        return false;
+    };
+    if !rect_contains(list_inner, column, row) {
+        return false;
+    }
+    let index = usize::from(row.saturating_sub(list_inner.y));
+    let actions = home_dashboard_actions(app);
+    if index >= actions.len() {
+        return false;
+    }
+    app.home_selection = index;
+    app.perform_home_dashboard_action();
+    true
+}
+
+fn click_folder_browser(app: &mut App, column: u16, row: u16, width: u16, height: u16) -> bool {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let Some(list_inner) = folder_browser_list_inner_rect(area) else {
+        return false;
+    };
+    if !rect_contains(list_inner, column, row) {
+        return false;
+    }
+    let Some(state) = app.folder_browser.as_ref() else {
+        return false;
+    };
+    let (visible_start, visible_end) =
+        folder_browser_visible_range(state, usize::from(list_inner.height));
+    let index = visible_start.saturating_add(usize::from(row.saturating_sub(list_inner.y)));
+    if index >= visible_end || index >= state.entries.len() {
+        return false;
+    }
+    if let Some(state) = app.folder_browser.as_mut() {
+        state.selected = index;
+    }
+    app.perform_folder_browser_selection();
+    true
+}
+
+fn main_content_area(app: &App, width: u16, height: u16) -> Rect {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let prompt_box_visible = should_draw_prompt_box(app);
+    let completion_height = if prompt_box_visible {
+        app.slash_completion_menu()
+            .as_ref()
+            .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let input_height = if prompt_box_visible {
+        chat_input_area_height(app, width, height)
+    } else {
+        0
+    };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(completion_height),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let sidebar_width = if app.command_screen_is_chat_session() {
+        0
+    } else {
+        status_sidebar_width(layout[0].width)
+    };
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(60), Constraint::Length(sidebar_width)])
+        .split(layout[0]);
+    body[0]
+}
+
+fn home_dashboard_list_inner_rect(app: &App, area: Rect) -> Option<Rect> {
+    let overview_text = render_home_dashboard_overview_text(app);
+    let overview_height = (overview_text.lines().count() as u16).saturating_add(2);
+    let action_height = (home_dashboard_actions(app).len() as u16).saturating_add(2);
+    if area.width < 78 || area.height < overview_height.saturating_add(action_height) {
+        return None;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(overview_height), Constraint::Min(8)])
+        .split(area);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Min(40)])
+        .split(rows[1]);
+    Some(rect_inner(panes[0]))
+}
+
+fn folder_browser_list_inner_rect(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let modal = centered_rect(92, 86, area);
+    let inner = rect_inner(modal);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Min(28)])
+        .split(rows[1]);
+    Some(rect_inner(panes[0]))
+}
+
+fn rect_inner(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.y.saturating_add(1),
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
 
     clear_prompt_for_active_surface_action(app, key);
+
+    if app.onboarding_success_modal {
+        app.finish_onboarding();
+        return;
+    }
 
     if app.pending_approval.is_some() {
         if app.onboarding_active {
@@ -16087,6 +16571,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.should_draw_home_dashboard() && handle_home_dashboard_key(app, key) {
+        return;
+    }
+
+    if !should_draw_prompt_box(app) && handle_hidden_prompt_key(app, key) {
         return;
     }
 
@@ -16240,8 +16728,33 @@ fn handle_home_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (_, KeyCode::Esc | KeyCode::Backspace) => {
-            app.home_dashboard_visible = false;
-            app.status = "Home closed. Type /home to return.".to_owned();
+            app.status = "Main menu is open. Use arrows, mouse, or Ctrl-C to quit.".to_owned();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_hidden_prompt_key(app: &mut App, key: KeyEvent) -> bool {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('c')) => false,
+        (_, KeyCode::Esc) => {
+            app.open_home_dashboard();
+            true
+        }
+        (_, KeyCode::Char('?')) if app.input.is_empty() => {
+            app.handle_command("?");
+            true
+        }
+        (modifiers, KeyCode::Char(_))
+            if !modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            app.status = "Use the menu. Press Esc for the main menu.".to_owned();
+            true
+        }
+        (_, KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right) => {
+            app.status = "Use the menu. Press Esc for the main menu.".to_owned();
             true
         }
         _ => false,
@@ -16367,6 +16880,9 @@ fn handle_pending_approval_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (_, KeyCode::Esc) => {
             app.cancel_focused_action();
+            if !app.onboarding_active {
+                app.open_home_dashboard();
+            }
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
@@ -18240,7 +18756,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     frame.render_widget(Clear, frame.area());
 
-    let completion_menu = if app.overlay_card.is_some()
+    let prompt_box_visible = should_draw_prompt_box(app);
+    let completion_menu = if !prompt_box_visible
+        || app.overlay_card.is_some()
         || app.folder_browser.is_some()
         || should_draw_running_job_modal(app)
     {
@@ -18255,7 +18773,11 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .as_ref()
         .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
         .unwrap_or(0);
-    let input_height = chat_input_area_height(app, frame.area().width, frame.area().height);
+    let input_height = if prompt_box_visible {
+        chat_input_area_height(app, frame.area().width, frame.area().height)
+    } else {
+        0
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -18367,67 +18889,71 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
 
     let input_area = layout[2];
-    let input_inner_width = input_area.width.saturating_sub(2);
-    let input_inner_height = input_area.height.saturating_sub(2).max(1);
-    let display_input = if app.config_manager_editing_secret() {
-        "*".repeat(app.input_len_chars())
-    } else {
-        app.input.clone()
-    };
-    let chat_input_mode = app.command_screen_is_chat_session();
-    let chat_input_scroll = if chat_input_mode {
-        bounded_chat_input_scroll(
-            &display_input,
-            app.input_cursor,
-            input_inner_width,
-            input_inner_height,
-            app.chat_input_scroll,
-        )
-    } else {
-        0
-    };
-    let (input_text, cursor_position) = if chat_input_mode {
-        (
-            display_input.clone(),
-            chat_input_cursor_position(
+    let mut cursor_position = None;
+    if prompt_box_visible && input_area.height > 0 {
+        let input_inner_width = input_area.width.saturating_sub(2);
+        let input_inner_height = input_area.height.saturating_sub(2).max(1);
+        let display_input = if app.config_manager_editing_secret() {
+            "*".repeat(app.input_len_chars())
+        } else {
+            app.input.clone()
+        };
+        let chat_input_mode = app.command_screen_is_chat_session();
+        let chat_input_scroll = if chat_input_mode {
+            bounded_chat_input_scroll(
                 &display_input,
                 app.input_cursor,
                 input_inner_width,
-                chat_input_scroll,
                 input_inner_height,
-            ),
-        )
-    } else {
-        let (visible_input, visible_cursor) =
-            input_viewport(&display_input, app.input_cursor, input_inner_width);
-        (visible_input, Some((visible_cursor, 0)))
-    };
-    let input = Paragraph::new(input_text)
-        .block(surface_block(input_title(app), THEME_ACCENT))
-        .style(Style::default().fg(THEME_TEXT))
-        .wrap(Wrap { trim: false })
-        .scroll((chat_input_scroll, 0));
-    frame.render_widget(input, layout[2]);
-    if chat_input_mode {
-        let line_count = chat_input_visual_line_count(
-            &display_input,
-            app.input_cursor,
-            usize::from(input_inner_width.max(1)),
-        );
-        if line_count > usize::from(input_inner_height) {
-            let scrollbar_area = Rect {
-                x: input_area.right().saturating_sub(1),
-                y: input_area.y.saturating_add(1),
-                width: 1,
-                height: input_area.height.saturating_sub(2),
-            };
-            let mut scrollbar_state =
-                ScrollbarState::new(line_count).position(usize::from(chat_input_scroll));
-            frame.render_stateful_widget(
-                Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
-                scrollbar_area,
-                &mut scrollbar_state,
+                app.chat_input_scroll,
+            )
+        } else {
+            0
+        };
+        let (input_text, input_cursor_position) = if chat_input_mode {
+            (
+                display_input.clone(),
+                chat_input_cursor_position(
+                    &display_input,
+                    app.input_cursor,
+                    input_inner_width,
+                    chat_input_scroll,
+                    input_inner_height,
+                ),
+            )
+        } else {
+            let (visible_input, visible_cursor) =
+                input_viewport(&display_input, app.input_cursor, input_inner_width);
+            (visible_input, Some((visible_cursor, 0)))
+        };
+        cursor_position = input_cursor_position;
+        let input = Paragraph::new(input_text)
+            .block(surface_block(input_title(app), THEME_ACCENT))
+            .style(Style::default().fg(THEME_TEXT))
+            .wrap(Wrap { trim: false })
+            .scroll((chat_input_scroll, 0));
+        frame.render_widget(input, input_area);
+        if chat_input_mode {
+            let line_count = chat_input_visual_line_count(
+                &display_input,
+                app.input_cursor,
+                usize::from(input_inner_width.max(1)),
             );
+            if line_count > usize::from(input_inner_height) {
+                let scrollbar_area = Rect {
+                    x: input_area.right().saturating_sub(1),
+                    y: input_area.y.saturating_add(1),
+                    width: 1,
+                    height: input_area.height.saturating_sub(2),
+                };
+                let mut scrollbar_state =
+                    ScrollbarState::new(line_count).position(usize::from(chat_input_scroll));
+                frame.render_stateful_widget(
+                    Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+                    scrollbar_area,
+                    &mut scrollbar_state,
+                );
+            }
         }
     }
 
@@ -18541,6 +19067,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         && app.overlay_card.is_none()
         && app.folder_browser.is_none()
         && !running_modal
+        && prompt_box_visible
         && let Some(cursor) = cursor
     {
         frame.set_cursor_position(cursor);
@@ -18579,6 +19106,36 @@ fn input_title(app: &App) -> &'static str {
     } else {
         "Prompt"
     }
+}
+
+fn should_draw_prompt_box(app: &App) -> bool {
+    if app.onboarding_active {
+        return false;
+    }
+    if app.config_manager_editing_secret()
+        || app.install_manager_editing_text()
+        || app.logs_view_editing_text()
+        || app.runtime_manager_editing_text()
+        || app.serve_wizard_editing_text()
+        || app.automations_manager_editing_text()
+        || app.command_screen_is_chat_session()
+    {
+        return true;
+    }
+    app.doctor_manager.is_none()
+        && app.logs_view.is_none()
+        && app.runtime_manager.is_none()
+        && app.install_manager.is_none()
+        && app.engine_manager.is_none()
+        && app.model_picker.is_none()
+        && app.serve_wizard.is_none()
+        && app.update_manager.is_none()
+        && app.automations_manager.is_none()
+        && app.provider_manager.is_none()
+        && app.config_manager.is_none()
+        && app.services_manager.is_none()
+        && app.command_screen.is_none()
+        && !app.should_draw_home_dashboard()
 }
 
 fn transcript_title(app: &App) -> &'static str {
@@ -18735,6 +19292,7 @@ fn render_home_dashboard_overview_text(app: &App) -> String {
         .unwrap_or(default_engine_for_platform());
     let default_engine_label = match default_engine {
         "pytorch" => "PyTorch",
+        "lemonade" => "Lemonade",
         "llama.cpp" => "llama.cpp",
         other => other,
     };
@@ -18765,10 +19323,7 @@ fn render_home_dashboard_overview_text(app: &App) -> String {
 
     let mut output = String::new();
     let _ = writeln!(output, "Local AI on your AMD GPU");
-    let _ = writeln!(
-        output,
-        "  Use the arrows to choose, or type a plain request below."
-    );
+    let _ = writeln!(output, "  Use the arrows or mouse to choose.");
     let _ = writeln!(output);
     let _ = writeln!(output, "At a glance");
     let _ = writeln!(output, "  [{setup_badge}] AMD GPU setup - {setup_line}");
@@ -18795,7 +19350,7 @@ fn render_home_dashboard_detail_text(app: &App) -> String {
             "Check your GPU, ROCm install, model runner, driver, and useful folders.\n\nThis does not change your computer."
         }
         HomeDashboardAction::Serve => {
-            "Pick a model and start a local llama.cpp server on your AMD GPU.\n\nYou will see a review card before it starts."
+            "Start the recommended Lemonade local model server on your AMD GPU.\n\nYou will see a review card before it starts."
         }
         HomeDashboardAction::Chat => {
             "Talk to a local assistant inside this TUI.\n\nThe assistant can ask to use rocm commands, and you approve changes first."
@@ -18807,7 +19362,7 @@ fn render_home_dashboard_detail_text(app: &App) -> String {
             "See local model servers, open their logs, stop them, or restart them.\n\nOnly real running or starting servers are counted."
         }
         HomeDashboardAction::Engine => {
-            "Choose how local models run.\n\nOn Windows, PyTorch is the default simple chat runner. Use llama.cpp for local model files through llama-server."
+            "Choose how local models run.\n\nLemonade is the default local assistant runner. Use llama.cpp for local model files through llama-server."
         }
         HomeDashboardAction::Permissions => {
             "Choose whether rocm-cli asks before changes or can run with full access.\n\nYou can reset this whenever you want."
@@ -19085,6 +19640,7 @@ fn draw_folder_browser_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(state) = app.folder_browser.as_ref() else {
         return;
     };
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(THEME_BG)), area);
     let modal = centered_rect(92, 86, area);
     draw_modal_clear(frame, modal, area);
@@ -19163,7 +19719,7 @@ fn folder_browser_header_text(state: &FolderBrowserState) -> Text<'static> {
         Line::from(vec![
             Span::styled("Current  ", Style::default().fg(THEME_MUTED)),
             Span::styled(
-                state.current_dir.display().to_string(),
+                display_runtime_folder_path(&state.current_dir),
                 Style::default().fg(THEME_ACCENT),
             ),
         ]),
@@ -19191,7 +19747,7 @@ fn folder_browser_detail_text(state: &FolderBrowserState) -> Text<'static> {
     let selected = state.entries.get(state.selected);
     let mut lines = Vec::new();
     if let Some(entry) = selected {
-        for line in wrap_plain_line(&entry.path.display().to_string(), 54) {
+        for line in wrap_plain_line(&display_runtime_folder_path(&entry.path), 54) {
             lines.push(Line::from(line));
         }
         match &state.context {
@@ -20488,9 +21044,9 @@ fn serve_wizard_row_label(app: &App, choice: ServeWizardChoice) -> String {
             "{:<10} {}",
             "Mode",
             if state.managed {
-                "keep running in ROCm CLI"
+                "managed"
             } else {
-                "show command only"
+                "command only"
             }
         ),
         ServeWizardChoice::Review => "Start".to_owned(),
@@ -24356,6 +24912,8 @@ fn active_screen_message_text(app: &App) -> Option<String> {
 fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
     let action_height = if should_draw_running_job_modal(app) {
         0
+    } else if app.onboarding_success_modal {
+        0
     } else if app.onboarding_path_editing || app.running_job.is_some() {
         3
     } else {
@@ -24498,6 +25056,26 @@ fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
     if app.folder_browser.is_some() {
         draw_folder_browser_modal(frame, app, frame.area());
     }
+    if app.onboarding_success_modal {
+        draw_onboarding_success_modal(frame, app, frame.area());
+    }
+}
+
+fn draw_onboarding_success_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let modal = centered_rect(58, 36, area);
+    draw_modal_clear(frame, modal, area);
+    let block = surface_block(" Installed ", THEME_GOOD);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    let folder = setup_install_root(&app.paths, &app.config);
+    let text = format!(
+        "ROCm installed successfully.\n\nFolder\n  {}\n\nPress any key to continue to ROCm CLI.",
+        display_runtime_folder_path(&folder)
+    );
+    let details = Paragraph::new(text)
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(details, inner);
 }
 
 fn draw_onboarding_cancel_install_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -24545,7 +25123,7 @@ fn run_cli_command_streaming(
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<CommandOutput> {
     let current_exe =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+        current_executable_path().context("failed to resolve current rocm executable path")?;
     let output = run_process_streaming(&current_exe, args, sender, cancel_requested, Some(paths))
         .with_context(|| {
         format!(
@@ -24746,6 +25324,29 @@ fn pending_install_folder_chat_reply(prompt: &str) -> Option<&'static str> {
         );
     }
     None
+}
+
+fn pending_install_folder_prompt_wants_picker(lower: &str) -> bool {
+    matches!(
+        lower,
+        "yes" | "y" | "ok" | "okay" | "sure" | "go ahead" | "continue"
+    ) || any_substring(
+        lower,
+        &[
+            "let me choose",
+            "let me pick",
+            "choose folder",
+            "choose a folder",
+            "pick folder",
+            "pick a folder",
+            "open picker",
+            "open folder picker",
+            "folder picker",
+            "ask me",
+            "show picker",
+            "use picker",
+        ],
+    )
 }
 
 fn chat_session_install_review_text(args: &[String]) -> String {
@@ -25315,6 +25916,7 @@ fn chat_rocm_cli_summary_text(body: &str) -> Option<String> {
 
 fn managed_service_is_chat_ready(record: &ManagedServiceRecord) -> bool {
     matches!(record.status.as_str(), "ready" | "running")
+        && managed_service_endpoint_model_ready(record, TUI_SERVICE_READY_TIMEOUT).unwrap_or(false)
 }
 
 fn tui_service_is_builtin_assistant(record: &ManagedServiceRecord) -> bool {
@@ -26395,7 +26997,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use rocm_core::{
         AppPaths, AutomationProposalRecord, HostGpuSummary, ManagedServiceRecord,
         PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
@@ -26955,6 +27557,7 @@ mod tests {
     #[test]
     fn completion_menu_does_not_show_activity_pane() {
         let mut app = test_app();
+        app.home_dashboard_visible = false;
         app.input = "/".to_owned();
         app.input_cursor = app.input.len();
         app.record_activity("event-new");
@@ -27012,6 +27615,7 @@ mod tests {
     #[test]
     fn ctrl_j_submits_prompt() {
         let mut app = test_app();
+        app.home_dashboard_visible = false;
         app.input = "/quit".to_owned();
         handle_key(
             &mut app,
@@ -27764,7 +28368,8 @@ mod tests {
         );
         handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pending_approval.is_none());
-        assert!(app.install_manager.is_some());
+        assert!(app.install_manager.is_none());
+        assert!(app.home_dashboard_visible);
         assert!(app.transcript.is_empty());
         Ok(())
     }
@@ -28274,7 +28879,7 @@ mod tests {
         assert!(help.contains("/edit"));
         assert!(help.contains("/serve MODEL   open a guided local model server setup"));
         assert!(help.contains("/quit, /exit"));
-        assert!(help.contains("/engine install pytorch --reinstall"));
+        assert!(help.contains("/engine install lemonade --reinstall"));
         assert!(help.contains("/runtimes"));
         assert!(help.contains("adopt"));
         assert!(help.contains("read-only"));
@@ -28323,9 +28928,11 @@ mod tests {
         let app = test_app();
 
         assert!(app.should_draw_home_dashboard());
+        assert!(!super::should_draw_prompt_box(&app));
         let rendered = render_test_terminal(&app, 120, 30);
 
         assert!(rendered.contains("Local AI on your AMD GPU"));
+        assert!(rendered.contains("Use the arrows or mouse to choose."));
         assert!(rendered.contains("At a glance"));
         assert!(rendered.contains("[SETUP NEEDED] AMD GPU setup"));
         assert!(rendered.contains("[PERMISSIONS] Changes"));
@@ -28337,10 +28944,66 @@ mod tests {
         assert!(!rendered.contains("active_runtime_key"));
         assert!(!rendered.contains("manifest"));
         assert!(!rendered.contains("amd-smi"));
+        assert!(!rendered.contains("Prompt"));
+        assert!(!rendered.contains("Message"));
 
         let compact = render_test_terminal(&app, 120, 24);
         assert!(compact.contains("[PERMISSIONS] Changes"));
         assert!(compact.contains("> Set up ROCm"));
+    }
+
+    #[test]
+    fn home_dashboard_hides_prompt_box_and_ignores_text_input() {
+        let mut app = test_app();
+
+        handle_key(&mut app, key_event(KeyCode::Char('h'), KeyModifiers::NONE));
+
+        assert!(app.input.is_empty());
+        assert!(app.should_draw_home_dashboard());
+        assert_eq!(app.status, "Use the menu. Press Esc for the main menu.");
+        assert!(!super::should_draw_prompt_box(&app));
+        let rendered = render_test_terminal(&app, 120, 30);
+        assert!(!rendered.contains("Prompt"));
+        assert!(!rendered.contains("Message"));
+    }
+
+    #[test]
+    fn home_dashboard_ignores_paste_when_prompt_is_hidden() {
+        let mut app = test_app();
+
+        super::handle_terminal_event(&mut app, crossterm::event::Event::Paste("hello".to_owned()));
+
+        assert!(app.input.is_empty());
+        assert!(app.should_draw_home_dashboard());
+        assert_eq!(
+            app.status,
+            "Use the visible choices here; there is no text box on this screen."
+        );
+    }
+
+    #[test]
+    fn home_dashboard_left_click_opens_selected_action() {
+        let mut app = test_app();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
+        let list = super::home_dashboard_list_inner_rect(&app, area).expect("home list");
+        let doctor_row = 1;
+
+        assert!(super::click_home_dashboard(
+            &mut app,
+            list.x,
+            list.y + doctor_row,
+            area.width,
+            area.height,
+        ));
+
+        assert!(app.doctor_manager.is_some());
+        assert!(!app.should_draw_home_dashboard());
+        assert!(app.transcript.is_empty());
     }
 
     #[test]
@@ -30307,10 +30970,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} should have a selected row", command.name));
 
             handle_key(&mut app, key_event(KeyCode::Char('z'), KeyModifiers::NONE));
-            if command.name == "setup" || overlay_command_name(command.name) {
-                assert!(app.input.is_empty(), "{}", command.name);
-            } else {
+            let prompt_visible = super::should_draw_prompt_box(&app);
+            if prompt_visible {
                 assert_eq!(app.input, "z", "{}", command.name);
+            } else {
+                assert!(app.input.is_empty(), "{}", command.name);
             }
             handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
 
@@ -30324,9 +30988,9 @@ mod tests {
             );
             if before.row_count > 1 {
                 if command.name == "home" {
-                    assert_eq!(
+                    assert_ne!(
                         before.selected, after.selected,
-                        "home should let typed prompt text own arrow/history behavior"
+                        "home should keep arrow focus because no prompt is visible"
                     );
                 } else {
                     assert_ne!(
@@ -30336,10 +31000,10 @@ mod tests {
                     );
                 }
             }
-            if command.name == "setup" || overlay_command_name(command.name) {
-                assert!(app.input.is_empty(), "{}", command.name);
-            } else {
+            if prompt_visible {
                 assert_eq!(app.input, "z", "{}", command.name);
+            } else {
+                assert!(app.input.is_empty(), "{}", command.name);
             }
             assert!(app.transcript.is_empty(), "{}", command.name);
 
@@ -30388,8 +31052,13 @@ mod tests {
             } else if command.name == "home" {
                 assert_eq!(
                     active_tui_surface_count(&app),
-                    0,
-                    "home should close with Esc"
+                    1,
+                    "home should stay visible with Esc because no prompt screen is behind it"
+                );
+                assert_eq!(
+                    active_surface_selection(&app).unwrap().surface,
+                    "home",
+                    "home should stay focused with Esc"
                 );
             } else {
                 assert_eq!(
@@ -31128,6 +31797,10 @@ mod tests {
     #[test]
     fn services_manager_enter_opens_ready_service_chat() -> anyhow::Result<()> {
         let mut app = test_app();
+        let (port, _request_receiver) = spawn_fake_local_chat_server_for_model(
+            "ROCm is ready for local work.",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-qwen-ready",
@@ -31135,7 +31808,7 @@ mod tests {
             "qwen",
             "Qwen/Qwen2.5-1.5B-Instruct",
             "127.0.0.1",
-            11435,
+            port,
             "managed",
             123,
             None,
@@ -31376,6 +32049,8 @@ mod tests {
     #[test]
     fn services_manager_chat_action_opens_local_tools_chat() -> anyhow::Result<()> {
         let mut app = test_app();
+        let (port, _request_receiver) =
+            spawn_fake_local_chat_server("ROCm is ready for local work.")?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-qwen",
@@ -31383,7 +32058,7 @@ mod tests {
             "qwen",
             super::VALIDATED_LOCAL_ASSISTANT_MODEL,
             "127.0.0.1",
-            11435,
+            port,
             "managed",
             123,
             None,
@@ -31562,7 +32237,7 @@ mod tests {
             assistant_content.contains("Here is what I found on this computer.")
                 && (assistant_content.contains("AMD Radeon RX 9070 XT")
                     || assistant_content.contains("WSL DXCore and ROCDXG plumbing detected"))
-                && assistant_content.contains("active runtime status is unset"),
+                && assistant_content.contains("ROCm/TheRock:"),
             "{assistant_content}"
         );
         let assistant = session
@@ -31678,8 +32353,10 @@ mod tests {
     #[test]
     fn bootstrap_assistant_starts_in_conversation_first_chat() -> anyhow::Result<()> {
         let mut app = test_app();
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("Hi. Where should I install ROCm/TheRock?")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
+            "Hi. Where should I install ROCm/TheRock?",
+            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-bootstrap-qwen",
@@ -31853,8 +32530,10 @@ mod tests {
     fn bootstrap_chat_hello_stays_friendly_without_rocm_checks_or_server_start()
     -> anyhow::Result<()> {
         let mut app = test_app();
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("Hi. Where should I install ROCm/TheRock?")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
+            "Hi. Where should I install ROCm/TheRock?",
+            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-bootstrap-qwen",
@@ -31908,8 +32587,10 @@ mod tests {
     #[test]
     fn bootstrap_chat_blocks_after_setup_actions_without_approval() -> anyhow::Result<()> {
         let mut app = test_app();
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("Hi. Where should I install ROCm/TheRock?")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
+            "Hi. Where should I install ROCm/TheRock?",
+            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-bootstrap-qwen",
@@ -31959,8 +32640,10 @@ mod tests {
         write_test_runtime_with_key(&app.paths, runtime_key, "therock-release:gfx120X-all", 20)?;
         app.config.active_runtime_key = Some(runtime_key.to_owned());
         app.config.save(&app.paths)?;
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("I found an existing ROCm setup.")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
+            "I found an existing ROCm setup.",
+            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-bootstrap-qwen",
@@ -32171,7 +32854,7 @@ mod tests {
                             .is_some_and(|content| {
                                 content.contains("ROCm CLI guidance")
                                     && content.contains("which GPU is on this machine")
-                                    && content.contains("Qwen/Qwen2.5-1.5B-Instruct")
+                                    && content.contains("Qwen3-0.6B-GGUF")
                                     && content.contains("ComfyUI")
                                     && content.contains(prompt)
                             })
@@ -32308,8 +32991,10 @@ mod tests {
         );
 
         let mut app = test_app();
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("This non-assistant model should not be used.")?;
+        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
+            "This non-assistant model should not be used.",
+            "Qwen/Qwen3.5",
+        )?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-other-ready",
@@ -32482,14 +33167,14 @@ mod tests {
                                 "type": "function",
                                 "function": {
                                     "name": "launch_server",
-                                    "arguments": "{\"model\":\"qwen\",\"engine\":\"pytorch\",\"device\":\"gpu_required\"}"
+                                    "arguments": "{\"model\":\"qwen\",\"engine\":\"lemonade\",\"device\":\"gpu_required\"}"
                                 }
                             }]
                         }
                     }]
                 }),
                 "Start local model server",
-                "rocm serve qwen --managed --engine pytorch --device gpu_required",
+                "rocm serve Qwen3-0.6B-GGUF --engine lemonade --device gpu_required --managed",
             ),
             (
                 "install this specific TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
@@ -32865,6 +33550,16 @@ mod tests {
         assert!(rendered.contains("Not yet"), "{rendered}");
         assert!(!rendered.contains("I checked ROCm"), "{rendered}");
         assert!(!rendered.contains("Choose ROCm result"), "{rendered}");
+
+        app.set_input("let me choose".to_owned());
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.folder_browser.is_some());
+        assert!(app.command_screen_is_chat_session());
+        let rendered = render_test_terminal(&app, 120, 32);
+        assert!(rendered.contains("Choose ROCm Folder"), "{rendered}");
+        assert!(rendered.contains("Use current folder"), "{rendered}");
         Ok(())
     }
 
@@ -32872,7 +33567,7 @@ mod tests {
     fn chat_prompt_with_ready_non_assistant_server_opens_guided_start() -> anyhow::Result<()> {
         let mut app = test_app();
         let (port, request_receiver) =
-            spawn_fake_local_chat_server("ROCm is installed and ready.")?;
+            spawn_fake_local_chat_server_for_model("ROCm is installed and ready.", "Qwen/Qwen3.5")?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-qwen",
@@ -33093,6 +33788,8 @@ ROCm checks used
 ROCm CLI summary
   GPU: AMD Radeon RX 9070 XT
   ROCm/TheRock: installed and active for ROCm CLI (gfx120X-all), 7.13.0a20260511
+  Install folder: D:\\jam\\temp\\therock_venvs
+  Downloads/cache: D:\\jam\\temp\\therock_venvs\\pip-cache
   Note: no global legacy ROCm install was found; ROCm CLI is using its managed TheRock runtime.";
 
         let display = super::chat_session_display_text(rendered);
@@ -33100,6 +33797,8 @@ ROCm CLI summary
         assert!(display.contains("Here is what I found on this computer."));
         assert!(display.contains("AMD Radeon RX 9070 XT"));
         assert!(display.contains("installed and active for ROCm CLI"));
+        assert!(display.contains("D:\\jam\\temp\\therock_venvs"));
+        assert!(display.contains("D:\\jam\\temp\\therock_venvs\\pip-cache"));
         assert!(!display.contains("I checked ROCm"));
         assert!(!display.contains("provider:"));
         assert!(!display.contains("data_dir:"));
@@ -33311,7 +34010,7 @@ Full log
                 && turn.content.contains("Nothing changed")
         }));
         assert!(app.transcript.is_empty());
-        assert_eq!(app.status, "Approval cancelled.");
+        assert_eq!(app.status, "Approval cancelled. You can keep chatting.");
 
         let prompt = app.chat_session_request_prompt("what now?");
         assert!(prompt.contains("ROCm command result: User cancelled Install ROCm."));
@@ -33512,6 +34211,8 @@ Full log
     fn managed_serve_completion_opens_local_tools_chat_when_ready() -> anyhow::Result<()> {
         let mut app = test_app();
         app.open_serve_wizard();
+        let (port, _request_receiver) =
+            spawn_fake_local_chat_server("ROCm is ready for local work.")?;
         let mut record = ManagedServiceRecord::new(
             &app.paths,
             "svc-qwen",
@@ -33519,7 +34220,7 @@ Full log
             "qwen",
             super::VALIDATED_LOCAL_ASSISTANT_MODEL,
             "127.0.0.1",
-            11435,
+            port,
             "managed",
             123,
             None,
@@ -33533,7 +34234,9 @@ Full log
         finish_running_job(
             &mut app,
             sender,
-            "managed service launched\n  service_id: svc-qwen\n  endpoint: http://127.0.0.1:11435/v1\n  readiness: ready\n",
+            &format!(
+                "managed service launched\n  service_id: svc-qwen\n  endpoint: http://127.0.0.1:{port}/v1\n  readiness: ready\n"
+            ),
         );
 
         let state = app
@@ -35325,6 +36028,41 @@ Full log
     }
 
     #[test]
+    fn onboarding_folder_picker_click_uses_visible_folder_choice() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.onboarding_active = true;
+        let start_parent = app.paths.data_dir.join("folder-picker-start");
+        fs::create_dir_all(&start_parent)?;
+        app.config.setup.therock_venv = Some(start_parent.join("default-rocm"));
+        app.config.save(&app.paths)?;
+
+        app.open_onboarding_install_folder_browser();
+        let area = super::Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 32,
+        };
+        let list = super::folder_browser_list_inner_rect(area).expect("folder browser list");
+
+        assert!(super::click_folder_browser(
+            &mut app,
+            list.x,
+            list.y + 1,
+            area.width,
+            area.height,
+        ));
+
+        assert!(app.folder_browser.is_none());
+        assert_eq!(
+            app.config.setup.therock_venv.as_deref(),
+            Some(start_parent.join("therock_venvs").as_path())
+        );
+        assert_eq!(app.status, "ROCm folder saved. Press Enter to install.");
+        Ok(())
+    }
+
+    #[test]
     fn onboarding_arrows_cycle_folder_and_install_rows() {
         let mut app = test_app();
         app.onboarding_active = true;
@@ -35410,7 +36148,8 @@ Full log
 
         super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.pending_approval.is_none());
-        assert_eq!(app.status, "Approval cancelled.");
+        assert!(app.onboarding_active);
+        assert_eq!(app.status, "Install cancelled. You're still in setup.");
     }
 
     #[test]
@@ -36280,6 +37019,29 @@ Full log
     }
 
     #[test]
+    fn onboarding_success_modal_blocks_setup_menu_until_key_press() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.paths.ensure()?;
+        app.onboarding_active = true;
+        app.onboarding_success_modal = true;
+        app.config.setup.therock_venv = Some(app.paths.data_dir.join("envs").join("ready-rocm"));
+
+        let rendered = render_test_terminal(&app, 120, 32);
+
+        assert!(rendered.contains("ROCm installed successfully."));
+        assert!(rendered.contains("Press any key to continue to ROCm CLI."));
+        assert!(!rendered.contains("> Start ROCm CLI"));
+
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.onboarding_active);
+        assert!(!app.onboarding_success_modal);
+        assert!(app.should_draw_home_dashboard());
+        assert_eq!(app.status, "Setup complete. ROCm CLI is ready.");
+        Ok(())
+    }
+
+    #[test]
     fn setup_venv_ready_rejects_python_only_folder() -> anyhow::Result<()> {
         let (_root, paths) = test_paths("setup-python-only");
         let install_root = paths.data_dir.join("envs").join("python-only");
@@ -36637,6 +37399,7 @@ Full log
     #[test]
     fn prompt_supports_midline_editing() {
         let mut app = test_app();
+        app.home_dashboard_visible = false;
         app.set_input("/dctor".to_owned());
         app.input_cursor = 2;
 
@@ -36659,6 +37422,7 @@ Full log
     #[test]
     fn prompt_supports_line_and_word_shortcuts() {
         let mut app = test_app();
+        app.home_dashboard_visible = false;
         app.set_input("serve qwen with llama.cpp".to_owned());
 
         handle_key(
@@ -37966,6 +38730,38 @@ Full log
     }
 
     #[test]
+    fn folder_picker_accepts_mixed_windows_drive_paths() -> anyhow::Result<()> {
+        if !super::runtime_is_windows() {
+            return Ok(());
+        }
+        let (root, _paths) = test_paths("folder-picker-mixed-drive");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+
+        let slash_root = root.display().to_string().replace('\\', "/");
+        let mixed_root = slash_root.replacen(":/", r":\/", 1);
+        let (entries, _) = super::folder_browser_entries(Path::new(&mixed_root));
+        let selected = entries
+            .iter()
+            .find(|entry| entry.label == "+ therock_venvs")
+            .expect("therock_venvs row should be pinned");
+        let display = super::display_runtime_folder_path(&selected.path);
+        assert!(!display.contains('/'), "{display}");
+
+        let chosen =
+            super::validate_onboarding_install_folder(&selected.path.display().to_string())?;
+        assert!(super::runtime_folder_path_is_absolute(&chosen));
+        assert!(
+            super::onboarding_folder_preset_key(&chosen).ends_with(r"\therock_venvs"),
+            "{}",
+            chosen.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
     fn folder_picker_drive_letter_opens_drive_directly() {
         let Some(drive) = super::folder_browser_drive_root_for_key('d') else {
             return;
@@ -38726,7 +39522,15 @@ Full log
 
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Model"));
-        assert!(rendered.contains("fixed Qwen2.5"));
+        let model_row = super::serve_wizard_row_label(&app, super::ServeWizardChoice::Model);
+        assert!(model_row.contains("fixed"));
+        assert_eq!(
+            app.serve_wizard
+                .as_ref()
+                .and_then(super::selected_serve_wizard_recipe)
+                .map(|recipe| recipe.canonical_model_id.as_str()),
+            Some(super::VALIDATED_LOCAL_ASSISTANT_MODEL)
+        );
         assert!(
             super::serve_wizard_row_label(&app, super::ServeWizardChoice::LocalPath)
                 .contains("custom model only")
@@ -38755,6 +39559,7 @@ Full log
             20,
         )?;
         assert!(app.handle_command("serve"));
+        set_serve_wizard_engine(&mut app, "pytorch");
         move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -38804,6 +39609,7 @@ Full log
             &app.config
         ));
         assert!(app.handle_command("serve"));
+        set_serve_wizard_engine(&mut app, "pytorch");
         move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -38833,9 +39639,35 @@ Full log
     }
 
     #[test]
-    fn serve_wizard_start_without_runtime_opens_install_setup_path() {
+    fn serve_wizard_default_lemonade_starts_without_therock_runtime() {
         let mut app = test_app();
         assert!(app.handle_command("serve"));
+        move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
+
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.serve_wizard.is_some());
+        assert!(app.install_manager.is_none());
+        assert!(app.pending_approval.is_some());
+        assert!(app.running_job.is_none());
+        assert!(app.transcript.is_empty());
+        assert!(matches!(
+            app.pending_approval.as_ref().map(|pending| &pending.action),
+            Some(super::ApprovalAction::CliCommand { args, .. })
+                if args.windows(2).any(|pair| pair == ["--engine", "lemonade"])
+                    && !args.iter().any(|arg| arg == "--runtime-id")
+        ));
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Lemonade manages its own ROCm runtime"));
+        assert!(!rendered.contains("Set up ROCm first"));
+        assert!(!rendered.contains("Serve failed"));
+    }
+
+    #[test]
+    fn serve_wizard_explicit_pytorch_without_runtime_opens_install_setup_path() {
+        let mut app = test_app();
+        assert!(app.handle_command("serve"));
+        set_serve_wizard_engine(&mut app, "pytorch");
         move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -38851,6 +39683,48 @@ Full log
         assert!(rendered.contains("Set up ROCm first"));
         assert!(rendered.contains("Local AI needs a usable ROCm install"));
         assert!(!rendered.contains("Serve failed"));
+    }
+
+    #[test]
+    fn serve_wizard_approval_n_stays_on_wizard_without_transcript_dump() {
+        let mut app = test_app();
+        assert!(app.handle_command("serve"));
+        move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_approval.is_some());
+
+        handle_key(&mut app, key_event(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert!(app.serve_wizard.is_some());
+        assert!(app.pending_approval.is_none());
+        assert!(app.transcript.is_empty());
+        assert_eq!(
+            app.status,
+            "Serve cancelled. Choose Start when you are ready."
+        );
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Start"));
+        assert!(!rendered.contains("[Approval]"));
+        assert!(!rendered.contains("cancelled: Serve"));
+    }
+
+    #[test]
+    fn serve_wizard_approval_esc_returns_to_main_menu() {
+        let mut app = test_app();
+        assert!(app.handle_command("serve"));
+        move_serve_wizard_to_choice(&mut app, super::ServeWizardChoice::Review);
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_approval.is_some());
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.serve_wizard.is_none());
+        assert!(app.should_draw_home_dashboard());
+        assert!(app.transcript.is_empty());
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Local AI on your AMD GPU"));
+        assert!(!rendered.contains("Prompt"));
     }
 
     #[test]
@@ -39185,6 +40059,24 @@ Full log
     }
 
     #[test]
+    fn cancelled_non_chat_approval_returns_home_without_prompt_box() {
+        let mut app = test_app();
+        app.open_command_screen_target(super::CommandScreenTarget::Gpu);
+        app.request_cli_approval("Serve", vec!["version".to_owned()], "test approval");
+
+        handle_key(&mut app, key_event(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.command_screen.is_none());
+        assert!(app.should_draw_home_dashboard());
+        assert!(!super::should_draw_prompt_box(&app));
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("ROCm CLI"));
+        assert!(!rendered.contains("Prompt"));
+        assert!(app.status.contains("Back at the main menu"));
+    }
+
+    #[test]
     fn approval_card_is_arrow_key_navigable_and_scrollable() -> anyhow::Result<()> {
         let mut app = test_app();
         fs::create_dir_all(app.paths.data_dir.join("envs"))?;
@@ -39349,9 +40241,9 @@ Full log
         assert!(app.serve_wizard.is_none());
         assert!(app.transcript.is_empty());
         let selected = app.selected_model_recipe().expect("qwen model selected");
-        assert_eq!(selected.canonical_model_id, "Qwen/Qwen2.5-1.5B-Instruct");
+        assert_eq!(selected.canonical_model_id, "Qwen3-0.6B-GGUF");
         let rendered = render_test_terminal(&app, 120, 28);
-        assert!(rendered.contains("Qwen/Qwen2.5-1.5B-Instruct"));
+        assert!(rendered.contains("Qwen3-0.6B-GGUF"));
         assert!(rendered.contains("Enter: review a local serve plan"));
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
@@ -39364,7 +40256,7 @@ Full log
                 .as_ref()
                 .expect("model should plan")
                 .detail
-                .contains("Qwen/Qwen2.5-1.5B-Instruct")
+                .contains("Qwen3-0.6B-GGUF")
         );
     }
 
@@ -40660,8 +41552,9 @@ Full log
         let proposal = find_automation_proposal(&app.paths, "proposal-esc-back")?;
         assert_eq!(proposal.status, "pending");
         assert!(app.pending_approval.is_none());
-        assert!(app.automations_manager.is_some());
-        assert_eq!(app.status, "Review unchanged.");
+        assert!(app.automations_manager.is_none());
+        assert!(app.home_dashboard_visible);
+        assert_eq!(active_surface_selection(&app).unwrap().surface, "home");
         Ok(())
     }
 
@@ -41279,6 +42172,7 @@ Full log
             onboarding_show_log_location: false,
             onboarding_cancel_install_confirm: false,
             onboarding_cancel_install_selection: 0,
+            onboarding_success_modal: false,
         }
     }
 
@@ -41296,6 +42190,18 @@ Full log
             handle_key(app, key_event(KeyCode::Down, KeyModifiers::NONE));
         }
         panic!("serve wizard choice {choice:?} was not reachable");
+    }
+
+    fn set_serve_wizard_engine(app: &mut App, engine: &str) {
+        let engines = super::serve_wizard_engine_names();
+        let index = engines
+            .iter()
+            .position(|candidate| candidate == engine)
+            .unwrap_or_else(|| panic!("{engine} engine option"));
+        app.serve_wizard
+            .as_mut()
+            .expect("serve wizard")
+            .engine_index = index;
     }
 
     fn open_hidden_doctor_refresh_from_prompt(app: &mut App) {
@@ -41318,12 +42224,31 @@ Full log
     fn spawn_fake_local_chat_server(
         content: &'static str,
     ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
-        spawn_fake_local_chat_server_repeated(content, 1)
+        spawn_fake_local_chat_server_for_model(content, super::VALIDATED_LOCAL_ASSISTANT_MODEL)
+    }
+
+    fn spawn_fake_local_chat_server_for_model(
+        content: &'static str,
+        model_id: &'static str,
+    ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
+        spawn_fake_local_chat_server_repeated_for_model(content, 1, model_id)
     }
 
     fn spawn_fake_local_chat_server_repeated(
         content: &'static str,
         response_count: usize,
+    ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
+        spawn_fake_local_chat_server_repeated_for_model(
+            content,
+            response_count,
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+        )
+    }
+
+    fn spawn_fake_local_chat_server_repeated_for_model(
+        content: &'static str,
+        response_count: usize,
+        model_id: &'static str,
     ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
         spawn_fake_local_chat_server_with_response_repeated(
             serde_json::json!({
@@ -41335,24 +42260,37 @@ Full log
                 }]
             }),
             response_count,
+            model_id,
         )
     }
 
     fn spawn_fake_local_chat_server_with_response(
         response: Value,
     ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
-        spawn_fake_local_chat_server_with_response_repeated(response, 1)
+        spawn_fake_local_chat_server_with_response_for_model(
+            response,
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+        )
+    }
+
+    fn spawn_fake_local_chat_server_with_response_for_model(
+        response: Value,
+        model_id: &'static str,
+    ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
+        spawn_fake_local_chat_server_with_response_repeated(response, 1, model_id)
     }
 
     fn spawn_fake_local_chat_server_with_response_repeated(
         response: Value,
         response_count: usize,
+        model_id: &'static str,
     ) -> anyhow::Result<(u16, mpsc::Receiver<Value>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            for _ in 0..response_count.max(1) {
+            let mut served_chat_responses = 0;
+            while served_chat_responses < response_count.max(1) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
@@ -41373,6 +42311,17 @@ Full log
                     }
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]);
+                let request_line = headers.lines().next().unwrap_or_default();
+                if request_line.starts_with("GET /v1/models ") {
+                    let response = serde_json::json!({ "data": [{ "id": model_id }] }).to_string();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        response.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(response.as_bytes());
+                    continue;
+                }
                 let content_length = headers
                     .lines()
                     .find_map(|line| {
@@ -41396,6 +42345,7 @@ Full log
                 if let Some(value) = request_value.as_ref() {
                     let _ = sender.send(value.clone());
                 };
+                served_chat_responses += 1;
                 if request_value
                     .as_ref()
                     .and_then(|value| value.get("stream"))
@@ -41503,10 +42453,6 @@ Full log
             app.transcript.is_empty(),
             "{command} should remain a navigable screen, not a transcript dump"
         );
-    }
-
-    fn overlay_command_name(command: &str) -> bool {
-        matches!(command, "help" | "?" | "clear" | "quit" | "exit")
     }
 
     fn active_tui_surface_count(app: &App) -> usize {

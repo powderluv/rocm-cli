@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{IsTerminal, stdin, stdout};
-use std::net::IpAddr;
+use std::io::{IsTerminal, Read, Write, stdin, stdout};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+#[cfg(all(target_vendor = "cosmo", not(windows)))]
+use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -23,6 +25,14 @@ use windows_sys::Win32::System::Registry::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessW, DETACHED_PROCESS, GetExitCodeProcess, INFINITE, OpenProcess,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    WaitForSingleObject,
+};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
@@ -47,6 +57,596 @@ pub fn format_http_base_url(host: &str, port: u16) -> String {
     format!("http://{}", format_host_port(host, port))
 }
 
+pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
+    let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
+    let authority = without_scheme.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = rest[..end].to_owned();
+        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_owned(), port.parse().ok()?))
+}
+
+pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
+    if cfg!(target_vendor = "cosmo") {
+        return download_file_with_curl(url, destination, timeout);
+    }
+    let response = ureq::get(url)
+        .timeout(timeout)
+        .call()
+        .with_context(|| format!("failed to download {url}"))?;
+    if response.status() != 200 {
+        bail!("HTTP {} while downloading {url}", response.status());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    std::io::copy(&mut reader, &mut file)
+        .with_context(|| format!("failed to write {}", destination.display()))?;
+    Ok(())
+}
+
+fn download_file_with_curl(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let stderr_path = destination.with_extension("curl-stderr.txt");
+    let max_time = timeout.as_secs().max(1).to_string();
+    let curl_command = if runtime_is_windows() {
+        "curl.exe"
+    } else {
+        "curl"
+    };
+    let status = Command::new(curl_command)
+        .args(["-fL", "--retry", "3", "--connect-timeout", "30"])
+        .args(["--max-time", &max_time])
+        .arg("--stderr")
+        .arg(runtime_path_for_child_process(&stderr_path))
+        .arg("-o")
+        .arg(runtime_path_for_child_process(destination))
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to launch curl download for {url}"))?;
+    if status.success() {
+        let _ = fs::remove_file(stderr_path);
+        return Ok(());
+    }
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_file(stderr_path);
+    bail!(
+        "curl download failed for {url} with status {status}: {}",
+        stderr.trim()
+    )
+}
+
+fn runtime_path_for_child_process(path: &Path) -> String {
+    if runtime_is_windows() {
+        runtime_path_for_windows_child(path)
+    } else {
+        path.display().to_string()
+    }
+}
+
+pub fn runtime_path_for_windows_child(path: &Path) -> String {
+    normalize_runtime_path_text_for_storage(&path.display().to_string())
+}
+
+pub fn runtime_is_cosmopolitan_windows() -> bool {
+    runtime_is_windows() && std::path::MAIN_SEPARATOR == '/'
+}
+
+pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
+    let (host, port) = parse_http_endpoint(endpoint_url)
+        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
+    let mut stream = connect_tcp_stream(&host, port, timeout)?;
+    let host_header = format_host_port(&host, port);
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    write_all_tcp_stream(&mut stream, request.as_bytes())
+        .with_context(|| format!("failed to write HTTP GET {path}"))?;
+    let response = read_tcp_stream_to_string(&mut stream)
+        .with_context(|| format!("failed to read HTTP GET {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("HTTP response was missing a body")?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    if !status_line.contains(" 200 ") {
+        bail!("HTTP endpoint returned {status_line}");
+    }
+    Ok(body.to_owned())
+}
+
+pub fn openai_models_endpoint_has_model(
+    endpoint_url: &str,
+    expected_model: Option<&str>,
+    timeout: Duration,
+) -> Result<bool> {
+    let body = http_get_text(endpoint_url, "/v1/models", timeout)?;
+    let value = serde_json::from_str::<serde_json::Value>(body.trim())
+        .context("failed to parse /v1/models JSON")?;
+    let loaded_models = openai_loaded_model_ids(&value);
+    if loaded_models.is_empty() {
+        return Ok(false);
+    }
+    let Some(expected_model) = expected_model.filter(|value| !value.trim().is_empty()) else {
+        return Ok(true);
+    };
+    Ok(loaded_models
+        .iter()
+        .any(|loaded| model_refs_match(loaded, expected_model)))
+}
+
+pub fn managed_service_endpoint_model_ready(
+    record: &ManagedServiceRecord,
+    timeout: Duration,
+) -> Result<bool> {
+    if record.endpoint_url.trim().is_empty() {
+        return Ok(false);
+    }
+    let expected = if !record.canonical_model_id.trim().is_empty() {
+        Some(record.canonical_model_id.as_str())
+    } else if !record.model_ref.trim().is_empty() {
+        Some(record.model_ref.as_str())
+    } else {
+        None
+    };
+    openai_models_endpoint_has_model(&record.endpoint_url, expected, timeout)
+}
+
+fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            ["id", "model", "name"]
+                .into_iter()
+                .filter_map(|field| item.get(field).and_then(serde_json::Value::as_str))
+                .find(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn model_refs_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.eq_ignore_ascii_case(right) || model_ref_basename(left).eq_ignore_ascii_case(right) {
+        return true;
+    }
+    if model_ref_basename(right).eq_ignore_ascii_case(left)
+        || model_ref_basename(left).eq_ignore_ascii_case(model_ref_basename(right))
+    {
+        return true;
+    }
+    builtin_model_recipes().into_iter().any(|recipe| {
+        (recipe.matches_ref(left) || recipe.matches_ref(right))
+            && (recipe.matches_ref(left) && recipe.matches_ref(right))
+    })
+}
+
+fn model_ref_basename(value: &str) -> &str {
+    value
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value.trim())
+}
+
+pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {host}:{port}"))?
+        .next()
+        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
+    let stream =
+        TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
+    if !(runtime_is_windows() && std::path::MAIN_SEPARATOR == '/') {
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+    }
+    Ok(stream)
+}
+
+pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    #[cfg(all(target_vendor = "cosmo", not(windows)))]
+    {
+        if runtime_is_windows() {
+            return cosmo_send_all(stream, bytes);
+        }
+    }
+    stream
+        .write_all(bytes)
+        .context("failed to write to TCP stream")
+}
+
+pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
+    #[cfg(all(target_vendor = "cosmo", not(windows)))]
+    {
+        if runtime_is_windows() {
+            return cosmo_recv_to_string(stream);
+        }
+    }
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read TCP stream")?;
+    Ok(response)
+}
+
+#[cfg(all(target_vendor = "cosmo", not(windows)))]
+fn cosmo_send_all(stream: &TcpStream, mut bytes: &[u8]) -> Result<()> {
+    let fd = stream.as_raw_fd();
+    while !bytes.is_empty() {
+        let sent = unsafe { libc::send(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len(), 0) };
+        if sent < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("failed to send TCP request");
+        }
+        if sent == 0 {
+            bail!("TCP send returned 0 bytes");
+        }
+        bytes = &bytes[sent as usize..];
+    }
+    Ok(())
+}
+
+#[cfg(all(target_vendor = "cosmo", not(windows)))]
+fn cosmo_recv_to_string(stream: &TcpStream) -> Result<String> {
+    let fd = stream.as_raw_fd();
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let received = unsafe {
+            libc::recv(
+                fd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+                0,
+            )
+        };
+        if received < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("failed to receive TCP response");
+        }
+        if received == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..received as usize]);
+    }
+    String::from_utf8(response).context("TCP response was not valid UTF-8")
+}
+
+#[cfg(windows)]
+pub fn spawn_detached_no_inherit(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+) -> Result<u32> {
+    spawn_windows_no_inherit(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        None,
+    )
+}
+
+#[cfg(windows)]
+pub fn spawn_hidden_console_no_inherit(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+) -> Result<u32> {
+    spawn_windows_no_inherit(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        None,
+    )
+}
+
+#[cfg(windows)]
+pub fn spawn_hidden_console_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+) -> Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let current_process = unsafe { GetCurrentProcess() };
+    let source = log_file.as_raw_handle() as HANDLE;
+    let mut stdout_handle: HANDLE = null_mut();
+    let mut stderr_handle: HANDLE = null_mut();
+    unsafe {
+        if DuplicateHandle(
+            current_process,
+            source,
+            current_process,
+            &mut stdout_handle,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            bail!(
+                "failed to duplicate stdout log handle for {}: {}",
+                log_path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        if DuplicateHandle(
+            current_process,
+            source,
+            current_process,
+            &mut stderr_handle,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            CloseHandle(stdout_handle);
+            bail!(
+                "failed to duplicate stderr log handle for {}: {}",
+                log_path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    let result = spawn_windows_no_inherit(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        Some((stdout_handle, stderr_handle)),
+    );
+    unsafe {
+        CloseHandle(stdout_handle);
+        CloseHandle(stderr_handle);
+    }
+    result
+}
+
+#[cfg(windows)]
+pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        bail!(
+            "failed to open process {pid} for wait: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe {
+        WaitForSingleObject(handle, INFINITE);
+        let mut exit_code = 0;
+        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+            CloseHandle(handle);
+            bail!(
+                "failed to read process {pid} exit code: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        CloseHandle(handle);
+        Ok(exit_code)
+    }
+}
+
+#[cfg(windows)]
+pub fn terminate_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        bail!(
+            "failed to open process {pid} for termination: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if terminated == 0 {
+        bail!(
+            "failed to terminate process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn terminate_process(pid: u32) -> Result<()> {
+    let status = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to terminate process {pid}"))
+    }
+}
+
+#[cfg(windows)]
+fn spawn_windows_no_inherit(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    creation_flags: u32,
+    hide_window: bool,
+    std_handles: Option<(
+        windows_sys::Win32::Foundation::HANDLE,
+        windows_sys::Win32::Foundation::HANDLE,
+    )>,
+) -> Result<u32> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let mut command_line = windows_command_line(program.as_os_str(), args);
+    let application_name = nul_terminated_wide(program.as_os_str());
+    let mut environment = windows_environment_block(env_overrides);
+    let mut startup_info = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    if hide_window {
+        const SW_HIDE: u16 = 0;
+        startup_info.dwFlags |= STARTF_USESHOWWINDOW;
+        startup_info.wShowWindow = SW_HIDE;
+    }
+    if let Some((stdout_handle, stderr_handle)) = std_handles {
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdInput = null_mut();
+        startup_info.hStdOutput = stdout_handle;
+        startup_info.hStdError = stderr_handle;
+    }
+    let mut process_info = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application_name.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            if std_handles.is_some() { 1 } else { 0 },
+            creation_flags,
+            environment.as_mut_ptr().cast(),
+            null(),
+            &mut startup_info,
+            &mut process_info,
+        )
+    };
+    if created == 0 {
+        bail!(
+            "failed to launch detached process {}: {}",
+            program.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe {
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+    }
+    Ok(process_info.dwProcessId)
+}
+
+#[cfg(windows)]
+fn nul_terminated_wide(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn windows_command_line(program: &OsStr, args: &[String]) -> Vec<u16> {
+    let mut command = quote_windows_arg(&program.to_string_lossy());
+    for arg in args {
+        command.push(' ');
+        command.push_str(&quote_windows_arg(arg));
+    }
+    OsStr::new(&command)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'))
+    {
+        return arg.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(windows)]
+fn windows_environment_block(env_overrides: &[(&str, &Path)]) -> Vec<u16> {
+    let mut env = BTreeMap::<String, OsString>::new();
+    for (key, value) in std::env::vars_os() {
+        let key_string = key.to_string_lossy().to_string();
+        env.insert(
+            key_string.to_ascii_uppercase(),
+            OsString::from(format!("{}={}", key_string, value.to_string_lossy())),
+        );
+    }
+    for (key, value) in env_overrides {
+        env.insert(
+            key.to_ascii_uppercase(),
+            OsString::from(format!("{}={}", key, value.display())),
+        );
+    }
+    let mut block = Vec::new();
+    for entry in env.values() {
+        block.extend(entry.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -56,20 +656,42 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn discover() -> Result<Self> {
-        let project_dirs = ProjectDirs::from("com", "powderluv", "rocm-cli")
-            .context("unable to determine project directories for rocm-cli")?;
+        let project_dirs = ProjectDirs::from("com", "powderluv", "rocm-cli");
         let home_rocm = home_rocm_dir();
         Ok(Self {
             config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
                 .or_else(|| home_rocm.clone())
-                .unwrap_or_else(|| project_dirs.config_dir().to_path_buf()),
+                .or_else(|| {
+                    project_dirs
+                        .as_ref()
+                        .map(|dirs| dirs.config_dir().to_path_buf())
+                })
+                .context("unable to determine config directory for rocm-cli")?,
             data_dir: env_path_override("ROCM_CLI_DATA_DIR")
                 .or_else(|| home_rocm.clone())
-                .unwrap_or_else(|| project_dirs.data_dir().to_path_buf()),
+                .or_else(|| {
+                    project_dirs
+                        .as_ref()
+                        .map(|dirs| dirs.data_dir().to_path_buf())
+                })
+                .context("unable to determine data directory for rocm-cli")?,
             cache_dir: env_path_override("ROCM_CLI_CACHE_DIR")
                 .or_else(|| home_rocm.clone().map(|dir| dir.join("cache")))
-                .unwrap_or_else(|| project_dirs.cache_dir().to_path_buf()),
-        })
+                .or_else(|| {
+                    project_dirs
+                        .as_ref()
+                        .map(|dirs| dirs.cache_dir().to_path_buf())
+                })
+                .context("unable to determine cache directory for rocm-cli")?,
+        }
+        .normalize_for_host())
+    }
+
+    fn normalize_for_host(mut self) -> Self {
+        self.config_dir = normalize_runtime_path_for_host(&self.config_dir);
+        self.data_dir = normalize_runtime_path_for_host(&self.data_dir);
+        self.cache_dir = normalize_runtime_path_for_host(&self.cache_dir);
+        self
     }
 
     pub fn ensure(&self) -> Result<()> {
@@ -180,6 +802,22 @@ fn env_path_override(name: &str) -> Option<PathBuf> {
 }
 
 fn home_rocm_dir() -> Option<PathBuf> {
+    if runtime_is_windows() {
+        if let Some(profile) = std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            return Some(profile.join(".rocm"));
+        }
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
+        ) {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            return Some(home.join(".rocm"));
+        }
+    }
     BaseDirs::new().map(|dirs| dirs.home_dir().join(".rocm"))
 }
 
@@ -192,6 +830,102 @@ fn env_flag(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimePlatform {
+    Windows,
+    Linux,
+    Other(&'static str),
+}
+
+impl RuntimePlatform {
+    pub fn current() -> Self {
+        #[cfg(target_vendor = "cosmo")]
+        {
+            if cosmo_hostos_has(COSMO_HOST_WINDOWS) {
+                return Self::Windows;
+            }
+            if cosmo_hostos_has(COSMO_HOST_LINUX) {
+                return Self::Linux;
+            }
+        }
+
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Other(std::env::consts::OS)
+        }
+    }
+
+    pub fn os_name(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Linux => "linux",
+            Self::Other(os) => os,
+        }
+    }
+
+    pub fn is_windows(self) -> bool {
+        matches!(self, Self::Windows)
+    }
+
+    pub fn is_linux(self) -> bool {
+        matches!(self, Self::Linux)
+    }
+}
+
+pub fn runtime_is_windows() -> bool {
+    RuntimePlatform::current().is_windows()
+}
+
+pub fn runtime_is_linux() -> bool {
+    RuntimePlatform::current().is_linux()
+}
+
+pub fn runtime_os_name() -> &'static str {
+    RuntimePlatform::current().os_name()
+}
+
+pub fn runtime_exe_suffix() -> &'static str {
+    if runtime_is_windows() { ".exe" } else { "" }
+}
+
+pub fn runtime_python_bin_dir_name() -> &'static str {
+    if runtime_is_windows() {
+        "Scripts"
+    } else {
+        "bin"
+    }
+}
+
+pub fn runtime_python_executable_name() -> &'static str {
+    if runtime_is_windows() {
+        "python.exe"
+    } else {
+        "python"
+    }
+}
+
+#[cfg(target_vendor = "cosmo")]
+const COSMO_HOST_LINUX: i32 = 1;
+
+#[cfg(target_vendor = "cosmo")]
+const COSMO_HOST_WINDOWS: i32 = 4;
+
+#[cfg(target_vendor = "cosmo")]
+unsafe extern "C" {
+    static __hostos: i32;
+}
+
+#[cfg(target_vendor = "cosmo")]
+fn cosmo_hostos_has(mask: i32) -> bool {
+    // Cosmopolitan exposes the active host through libc/dce.h. Calling it
+    // directly keeps the Rust APE tied to Cosmopolitan's runtime instead of a
+    // repo-local C compatibility shim.
+    unsafe { (__hostos & mask) != 0 }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,7 +1206,7 @@ impl DoctorSummary {
             .and_then(normalize_therock_family);
         let detected_therock_family = detect_managed_therock_family(&paths);
         Ok(Self {
-            os: std::env::consts::OS.to_owned(),
+            os: runtime_os_name().to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             kernel: detect_kernel_version(),
             distro: detect_distro_name(),
@@ -576,19 +1310,11 @@ pub fn interactive_terminal() -> bool {
 }
 
 pub fn default_engine_for_platform() -> &'static str {
-    if cfg!(target_os = "windows") {
-        return "pytorch";
-    }
-
-    if sibling_binary_exists("rocm-engine-vllm") {
-        "vllm"
-    } else {
-        "pytorch"
-    }
+    "lemonade"
 }
 
 fn detect_kernel_version() -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         detect_windows_version_from_registry().or_else(|| {
             capture_optional_command("cmd", &["/C", "ver"])
                 .map(|value| value.trim().to_owned())
@@ -602,11 +1328,11 @@ fn detect_kernel_version() -> Option<String> {
 }
 
 fn detect_distro_name() -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return Some("Windows".to_owned());
     }
 
-    if cfg!(target_os = "linux") {
+    if runtime_is_linux() {
         return parse_os_release_pretty_name(&fs::read_to_string("/etc/os-release").ok()?)
             .or_else(|| Some("Linux".to_owned()));
     }
@@ -625,7 +1351,7 @@ fn parse_os_release_pretty_name(text: &str) -> Option<String> {
 fn detect_cpu_model_with_windows_inventory(
     windows_inventory: Option<&WindowsDoctorInventory>,
 ) -> Option<String> {
-    if cfg!(windows)
+    if runtime_is_windows()
         && let Some(inventory) = windows_inventory
     {
         return inventory.cpu_model.clone();
@@ -635,7 +1361,7 @@ fn detect_cpu_model_with_windows_inventory(
 }
 
 fn detect_cpu_model() -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return detect_windows_cpu_model_from_registry().or_else(|| {
             let script =
                 "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
@@ -645,7 +1371,7 @@ fn detect_cpu_model() -> Option<String> {
         });
     }
 
-    if cfg!(target_os = "linux")
+    if runtime_is_linux()
         && let Some(model) = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| {
             text.lines().find_map(|line| {
                 let value = line
@@ -669,7 +1395,7 @@ fn detect_cpu_model() -> Option<String> {
 fn detect_system_ram_gib_with_windows_inventory(
     windows_inventory: Option<&WindowsDoctorInventory>,
 ) -> Option<f64> {
-    if cfg!(windows)
+    if runtime_is_windows()
         && let Some(inventory) = windows_inventory
     {
         return inventory.system_ram_gib;
@@ -679,7 +1405,7 @@ fn detect_system_ram_gib_with_windows_inventory(
 }
 
 pub fn detect_system_ram_gib() -> Option<f64> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return detect_windows_system_ram_gib().or_else(|| {
             let script = "(Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory).TotalPhysicalMemory";
             capture_optional_command("powershell", &["-NoProfile", "-Command", script])
@@ -687,7 +1413,7 @@ pub fn detect_system_ram_gib() -> Option<f64> {
         });
     }
 
-    if cfg!(target_os = "linux")
+    if runtime_is_linux()
         && let Some(kib) = fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
             text.lines().find_map(|line| {
                 let value = line.strip_prefix("MemTotal:")?.trim();
@@ -785,7 +1511,7 @@ fn detect_windows_system_ram_gib() -> Option<f64> {
 }
 
 fn detect_wsl_summary() -> Option<WslSummary> {
-    if !cfg!(target_os = "linux") {
+    if !runtime_is_linux() {
         return None;
     }
 
@@ -839,7 +1565,7 @@ fn detect_driver_summary_with_windows_inventory(
     windows_inventory: Option<&WindowsDoctorInventory>,
     wsl: Option<&WslSummary>,
 ) -> DriverSummary {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         let detail = windows_inventory
             .and_then(WindowsDoctorInventory::amd_display_driver_detail)
             .or_else(|| {
@@ -860,12 +1586,12 @@ fn detect_driver_summary_with_windows_inventory(
 }
 
 fn detect_driver_summary() -> DriverSummary {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         let detail = detect_windows_amd_display_driver();
         return windows_driver_summary(detail);
     }
 
-    if cfg!(target_os = "linux") {
+    if runtime_is_linux() {
         let module_detected = Path::new("/sys/module/amdgpu").exists();
         return DriverSummary {
             policy: "linux_official_amd_dkms_wrapper".to_owned(),
@@ -927,7 +1653,7 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         candidates.push(PathBuf::from(path));
     }
 
-    if cfg!(windows) {
+    if runtime_is_windows() {
         candidates.push(PathBuf::from(r"C:\Program Files\AMD\ROCm"));
         candidates.push(PathBuf::from(r"C:\Program Files\ROCm"));
     } else {
@@ -993,15 +1719,18 @@ fn legacy_rocm_candidate_exists(candidate: &Path) -> bool {
         })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn detect_windows_amd_display_driver() -> Option<String> {
+    if !runtime_is_windows() {
+        return None;
+    }
     let script = "$gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' } | Select-Object -First 1 -Property Name,DriverVersion; if ($gpu) { \"$($gpu.Name) driver $($gpu.DriverVersion)\" }";
     capture_optional_command("powershell", &["-NoProfile", "-Command", script])
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_vendor = "cosmo")))]
 fn detect_windows_amd_display_driver() -> Option<String> {
     None
 }
@@ -1017,8 +1746,11 @@ fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
         .or_else(detect_windows_doctor_inventory_from_cim)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn detect_windows_doctor_inventory_from_cim() -> Option<WindowsDoctorInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
     let script = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }; $gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
     capture_optional_command(
         "powershell",
@@ -1126,12 +1858,21 @@ fn windows_registry_display_driver_version(driver_key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), target_vendor = "cosmo"))]
+fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
+    detect_windows_doctor_inventory_from_cim().filter(|inventory| {
+        inventory.cpu_model.is_some()
+            || inventory.system_ram_gib.is_some()
+            || !inventory.displays.is_empty()
+    })
+}
+
+#[cfg(all(not(windows), not(target_vendor = "cosmo")))]
 fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     None
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(all(not(windows), not(target_vendor = "cosmo")), allow(dead_code))]
 fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
     let mut inventory = WindowsDoctorInventory::default();
 
@@ -1224,6 +1965,21 @@ fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
 
 #[cfg(target_os = "linux")]
 fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
+    if runtime_is_windows() {
+        let windows_inventory = detect_windows_doctor_inventory();
+        let gfx_target =
+            detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
+        let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
+        let name = windows_inventory
+            .as_ref()
+            .and_then(WindowsDoctorInventory::amd_display_name);
+        return HostGpuSummary {
+            name,
+            gfx_target,
+            therock_family,
+        };
+    }
+
     let linux_gfx_target = detect_linux_sysfs_gfx_target();
     let linux_name = detect_linux_primary_gpu_name();
     let wsl_display_probe = if linux_gfx_target.is_none() || linux_name.is_none() {
@@ -1344,6 +2100,189 @@ fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
         .next()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ManagedRuntimeEnvironment {
+    pub rocm_root: Option<PathBuf>,
+    pub path_entries: Vec<PathBuf>,
+    pub library_entries: Vec<PathBuf>,
+}
+
+pub fn active_managed_therock_environment(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<ManagedRuntimeEnvironment>> {
+    let registry_dir = paths.data_dir.join("runtimes").join("registry");
+    let mut records = managed_therock_environment_records(&registry_dir);
+    if records.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(active_key) = config.active_runtime_key.as_deref() {
+        if let Some((_, record)) = records.iter().find(|(_, record)| {
+            record
+                .runtime_key
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case(active_key))
+                || record
+                    .runtime_id
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(active_key))
+        }) {
+            return Ok(Some(managed_therock_environment_from_record(record)));
+        }
+    }
+
+    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    Ok(records
+        .first()
+        .map(|(_, record)| managed_therock_environment_from_record(record)))
+}
+
+pub fn prepend_runtime_paths(
+    entries: &[PathBuf],
+    current: Option<OsString>,
+) -> Result<Option<OsString>> {
+    if runtime_is_cosmopolitan_windows() {
+        return Ok(prepend_cosmopolitan_windows_runtime_paths(entries, current));
+    }
+
+    let mut parts = Vec::new();
+    for entry in entries {
+        push_existing_runtime_path(&mut parts, entry.clone());
+    }
+    if let Some(current) = current
+        && !current.is_empty()
+    {
+        for entry in std::env::split_paths(&current) {
+            push_existing_runtime_path(&mut parts, entry);
+        }
+    }
+    if parts.is_empty() {
+        Ok(None)
+    } else {
+        std::env::join_paths(parts)
+            .map(Some)
+            .context("failed to join runtime environment paths")
+    }
+}
+
+fn prepend_cosmopolitan_windows_runtime_paths(
+    entries: &[PathBuf],
+    current: Option<OsString>,
+) -> Option<OsString> {
+    let mut parts = Vec::new();
+    for entry in entries {
+        if entry.exists() {
+            push_unique_text(
+                &mut parts,
+                normalize_runtime_path_text_for_storage(&entry.display().to_string()),
+            );
+        }
+    }
+    if let Some(current) = current.and_then(|value| value.into_string().ok()) {
+        for entry in current
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            push_unique_text(&mut parts, normalize_runtime_path_text_for_storage(entry));
+        }
+    }
+    (!parts.is_empty()).then(|| OsString::from(parts.join(";")))
+}
+
+fn push_unique_text(parts: &mut Vec<String>, value: String) {
+    if !value.is_empty()
+        && !parts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&value))
+    {
+        parts.push(value);
+    }
+}
+
+fn managed_therock_environment_records(
+    registry_dir: &Path,
+) -> Vec<(PathBuf, TheRockFamilyManifest)> {
+    let Ok(entries) = fs::read_dir(registry_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return None;
+            }
+            let record = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<TheRockFamilyManifest>(&bytes).ok())?;
+            (record.looks_like_therock()
+                && record.rocm_sdk.as_ref().is_some_and(|sdk| sdk.import_ok))
+            .then_some((path, record))
+        })
+        .collect()
+}
+
+fn managed_therock_environment_from_record(
+    record: &TheRockFamilyManifest,
+) -> ManagedRuntimeEnvironment {
+    let mut env = ManagedRuntimeEnvironment::default();
+    let sdk = record.rocm_sdk.as_ref();
+    env.rocm_root = sdk
+        .and_then(|sdk| sdk.root_path.clone())
+        .or_else(|| record.install_root.clone());
+
+    if let Some(sdk) = sdk {
+        if let Some(bin_path) = sdk.bin_path.as_ref() {
+            push_existing_runtime_path(&mut env.path_entries, bin_path.clone());
+        }
+        for path in &sdk.bin_paths {
+            push_existing_runtime_path(&mut env.path_entries, path.clone());
+        }
+        for path in &sdk.library_paths {
+            push_existing_runtime_path(&mut env.library_entries, path.clone());
+        }
+        if let Some(root_path) = sdk.root_path.as_ref() {
+            collect_runtime_environment_paths(root_path, &mut env);
+        }
+        for root_path in &sdk.runtime_roots {
+            collect_runtime_environment_paths(root_path, &mut env);
+        }
+    }
+    if let Some(install_root) = record.install_root.as_ref() {
+        collect_runtime_environment_paths(install_root, &mut env);
+    }
+    if runtime_is_linux() {
+        push_existing_runtime_path(&mut env.library_entries, PathBuf::from("/usr/lib/wsl/lib"));
+    }
+    env
+}
+
+fn collect_runtime_environment_paths(root: &Path, env: &mut ManagedRuntimeEnvironment) {
+    for path in [
+        root.join("bin"),
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ] {
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().and_then(|value| value.to_str()) == Some("bin") {
+            push_existing_runtime_path(&mut env.path_entries, path.clone());
+        }
+        push_existing_runtime_path(&mut env.library_entries, path);
+    }
+}
+
+fn push_existing_runtime_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() || paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
+}
+
 fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkProbeCandidate> {
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
@@ -1388,7 +2327,7 @@ fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkPr
 
 fn managed_sdk_tool_path(bin_path: &Path, tool: &str) -> Option<PathBuf> {
     let mut names = vec![tool.to_owned()];
-    if cfg!(windows) {
+    if runtime_is_windows() {
         names.push(format!("{tool}.exe"));
     }
     names.push(format!("{tool}.cmd"));
@@ -1460,6 +2399,8 @@ fn newer_therock_family(
 #[derive(Debug, Deserialize)]
 struct TheRockFamilyManifest {
     #[serde(default)]
+    runtime_key: Option<String>,
+    #[serde(default)]
     runtime_id: Option<String>,
     #[serde(default)]
     family: Option<String>,
@@ -1467,6 +2408,8 @@ struct TheRockFamilyManifest {
     therock_family: Option<String>,
     #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
+    #[serde(default)]
+    install_root: Option<PathBuf>,
     #[serde(default)]
     installed_at_unix_ms: Option<u128>,
 }
@@ -1502,6 +2445,12 @@ struct TheRockSdkProbeManifest {
     root_path: Option<PathBuf>,
     #[serde(default)]
     bin_path: Option<PathBuf>,
+    #[serde(default)]
+    runtime_roots: Vec<PathBuf>,
+    #[serde(default)]
+    bin_paths: Vec<PathBuf>,
+    #[serde(default)]
+    library_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1520,11 +2469,11 @@ pub fn detect_host_gfx_target() -> Option<String> {
 fn detect_doctor_gfx_target_fast(
     windows_inventory: Option<&WindowsDoctorInventory>,
 ) -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return detect_windows_display_gfx_target_with_inventory(windows_inventory);
     }
 
-    if cfg!(target_os = "linux") {
+    if runtime_is_linux() {
         return detect_linux_sysfs_gfx_target().or_else(detect_wsl_windows_display_gfx_target_fast);
     }
 
@@ -1537,7 +2486,7 @@ fn detect_host_gfx_target_with_context(
     wsl: Option<&WslSummary>,
     paths: Option<&AppPaths>,
 ) -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return detect_windows_display_gfx_target_with_inventory(windows_inventory)
             .or_else(|| {
                 capture_optional_command("rocm_agent_enumerator", &[])
@@ -1626,37 +2575,56 @@ fn capture_optional_command_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
-    let output_path = std::env::temp_dir().join(format!(
-        "rocm-cli-command-{}-{}.out",
-        std::process::id(),
-        unix_time_millis()
-    ));
-    let output_file = fs::File::create(&output_path).ok()?;
+    for candidate in tool_path_candidates(program) {
+        if let Some(output) =
+            capture_optional_command_candidate_with_timeout(Path::new(&candidate), args, timeout)
+        {
+            return Some(output);
+        }
+    }
+    None
+}
+
+fn capture_optional_command_candidate_with_timeout(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
     let mut child = match Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output_file))
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => {
-            let _ = fs::remove_file(&output_path);
+        Err(error) => {
+            debug_command_capture_failure(program, "spawn", &error.to_string());
             return None;
         }
     };
+    let mut stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
 
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let bytes = if status.success() {
-                    fs::read(&output_path).ok()
+                let bytes = stdout_reader
+                    .take()
+                    .map(|reader| reader.join().unwrap_or_default())
+                    .unwrap_or_default();
+                if status.success() {
+                    return String::from_utf8(bytes).ok();
                 } else {
-                    None
-                };
-                let _ = fs::remove_file(&output_path);
-                return bytes.and_then(|bytes| String::from_utf8(bytes).ok());
+                    debug_command_capture_failure(program, "exit", &format!("status {status}"));
+                    return None;
+                }
             }
             Ok(None) if start.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(25));
@@ -1664,17 +2632,33 @@ fn capture_optional_command_with_timeout(
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(&output_path);
+                if let Some(reader) = stdout_reader.take() {
+                    let _ = reader.join();
+                }
+                debug_command_capture_failure(program, "timeout", "timed out");
                 return None;
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(&output_path);
+                if let Some(reader) = stdout_reader.take() {
+                    let _ = reader.join();
+                }
+                debug_command_capture_failure(program, "wait", "failed to wait");
                 return None;
             }
         }
     }
+}
+
+fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
+    if !env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
+        return;
+    }
+    eprintln!(
+        "rocm debug: command capture {stage} failed for {}: {detail}",
+        program.display()
+    );
 }
 
 fn capture_optional_path_command_with_env(
@@ -1751,7 +2735,7 @@ fn tool_on_path(program: &str) -> bool {
 
 fn tool_path_candidates(program: &str) -> Vec<String> {
     let path = Path::new(program);
-    if path.extension().is_some() || !cfg!(windows) {
+    if path.extension().is_some() || !runtime_is_windows() {
         return vec![program.to_owned()];
     }
     let mut names = Vec::new();
@@ -1765,19 +2749,42 @@ fn tool_path_candidates(program: &str) -> Vec<String> {
         names.push(format!("{program}{ext}"));
         names.push(format!("{program}{}", ext.to_ascii_lowercase()));
     }
+    names.extend(windows_absolute_tool_candidates(program));
     names.sort();
     names.dedup();
     names
 }
 
-#[cfg(windows)]
+fn windows_absolute_tool_candidates(program: &str) -> Vec<String> {
+    if !runtime_is_windows() {
+        return Vec::new();
+    }
+    let program = program.trim().to_ascii_lowercase();
+    let system_root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_owned());
+    match program.as_str() {
+        "cmd" | "cmd.exe" => vec![format!(r"{system_root}\System32\cmd.exe")],
+        "powershell" | "powershell.exe" => vec![
+            format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "powershell.exe".to_owned(),
+        ],
+        "pwsh" | "pwsh.exe" => vec!["pwsh.exe".to_owned()],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(windows, target_vendor = "cosmo"))]
 fn detect_windows_display_gfx_target() -> Option<String> {
+    if !runtime_is_windows() {
+        return None;
+    }
     let script = "$gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { \"$($gpu.Name)`t$($gpu.PNPDeviceID)\" }";
     capture_optional_command("powershell", &["-NoProfile", "-Command", script])
         .and_then(|output| parse_windows_display_gfx_target(&output))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_vendor = "cosmo")))]
 fn detect_windows_display_gfx_target() -> Option<String> {
     None
 }
@@ -1785,7 +2792,7 @@ fn detect_windows_display_gfx_target() -> Option<String> {
 fn detect_windows_display_gfx_target_with_inventory(
     windows_inventory: Option<&WindowsDoctorInventory>,
 ) -> Option<String> {
-    if cfg!(windows) {
+    if runtime_is_windows() {
         return windows_inventory
             .and_then(WindowsDoctorInventory::display_gfx_target)
             .or_else(|| {
@@ -1801,7 +2808,7 @@ fn detect_windows_display_gfx_target_with_inventory(
 }
 
 fn detect_wsl_windows_display_gfx_target(wsl: Option<&WslSummary>) -> Option<String> {
-    if !cfg!(target_os = "linux") || wsl.is_none() {
+    if !runtime_is_linux() || wsl.is_none() {
         return None;
     }
 
@@ -1815,7 +2822,7 @@ fn detect_wsl_windows_display_gfx_target_fast() -> Option<String> {
 }
 
 fn detect_wsl_windows_display_name(wsl: Option<&WslSummary>) -> Option<String> {
-    if !cfg!(target_os = "linux") || !wsl.is_some_and(|summary| summary.is_wsl) {
+    if !runtime_is_linux() || !wsl.is_some_and(|summary| summary.is_wsl) {
         return None;
     }
 
@@ -1850,7 +2857,7 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
 }
 
 fn is_wsl_environment_fast() -> bool {
-    if !cfg!(target_os = "linux") {
+    if !runtime_is_linux() {
         return false;
     }
     Path::new("/dev/dxg").exists()
@@ -1861,6 +2868,10 @@ fn is_wsl_environment_fast() -> bool {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_primary_gpu_name() -> Option<String> {
+    if !runtime_is_linux() {
+        return None;
+    }
+
     let entries = fs::read_dir("/sys/class/drm").ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -2205,6 +3216,10 @@ fn marketing_name_contains(normalized_name: &str, pattern: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_sysfs_gfx_target() -> Option<String> {
+    if !runtime_is_linux() {
+        return None;
+    }
+
     detect_linux_kfd_gfx_target().or_else(detect_linux_drm_ip_discovery_gfx_target)
 }
 
@@ -3653,7 +4668,6 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
         ModelRecipeRecord {
             canonical_model_id: "Qwen/Qwen2.5-1.5B-Instruct".to_owned(),
             aliases: vec![
-                "qwen".to_owned(),
                 "qwen2.5".to_owned(),
                 "qwen2.5-1.5b".to_owned(),
                 "qwen2.5-1.5b-instruct".to_owned(),
@@ -3716,6 +4730,7 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
         ModelRecipeRecord {
             canonical_model_id: "Qwen3-0.6B-GGUF".to_owned(),
             aliases: vec![
+                "qwen".to_owned(),
                 "lemonade-qwen".to_owned(),
                 "qwen-gguf".to_owned(),
                 "qwen3-0.6b-gguf".to_owned(),
@@ -3987,18 +5002,93 @@ impl ManagedServiceRecord {
         }
     }
 
+    pub fn normalize_paths_for_host(&mut self) {
+        self.manifest_path = normalize_runtime_path_for_host(&self.manifest_path);
+        self.log_path = normalize_runtime_path_for_host(&self.log_path);
+        self.engine_state_path = normalize_runtime_path_for_host(&self.engine_state_path);
+    }
+
+    pub fn refresh_from_engine_state(&mut self) -> Result<bool> {
+        if !matches!(
+            self.status.as_str(),
+            "starting" | "running" | "recovering" | "ready"
+        ) {
+            return Ok(false);
+        }
+        self.normalize_paths_for_host();
+        if !self.engine_state_path.is_file() {
+            return Ok(false);
+        }
+        let bytes = fs::read(&self.engine_state_path)
+            .with_context(|| format!("failed to read {}", self.engine_state_path.display()))?;
+        let state = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .with_context(|| format!("failed to parse {}", self.engine_state_path.display()))?;
+        let Some(status) = state
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| matches!(*value, "ready" | "running" | "starting" | "failed"))
+        else {
+            return Ok(false);
+        };
+
+        let previous = self.status.clone();
+        self.status = status.to_owned();
+        if let Some(endpoint_url) = state
+            .get("endpoint_url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.endpoint_url = endpoint_url.to_owned();
+        }
+        if let Some(runtime_id) = state
+            .get("runtime_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.runtime_id = Some(runtime_id.to_owned());
+        }
+        if let Some(env_id) = state
+            .get("env_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.env_id = Some(env_id.to_owned());
+        }
+        if let Some(pid) = state
+            .get("server_pid")
+            .or_else(|| state.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            self.engine_pid = Some(pid);
+        }
+        Ok(self.status != previous)
+    }
+
+    fn with_storage_paths(&self) -> Self {
+        let mut record = self.clone();
+        record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);
+        record.log_path = normalize_runtime_path_for_storage(&record.log_path);
+        record.engine_state_path = normalize_runtime_path_for_storage(&record.engine_state_path);
+        record
+    }
+
     pub fn write(&self) -> Result<()> {
-        let parent = self
+        let mut host_record = self.clone();
+        host_record.normalize_paths_for_host();
+        let parent = host_record
             .manifest_path
             .parent()
             .context("service manifest path must have a parent directory")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
+        let storage_record = host_record.with_storage_paths();
         fs::write(
-            &self.manifest_path,
-            serde_json::to_vec_pretty(self).context("failed to serialize service record")?,
+            &host_record.manifest_path,
+            serde_json::to_vec_pretty(&storage_record)
+                .context("failed to serialize service record")?,
         )
-        .with_context(|| format!("failed to write {}", self.manifest_path.display()))?;
+        .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))?;
         Ok(())
     }
 }
@@ -4043,7 +5133,7 @@ pub struct CodexBridgeEngine {
 
 pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {
     require_nonempty(binary_name, "binary_name")?;
-    let current_exe = std::env::current_exe().context("failed to discover current executable")?;
+    let current_exe = current_executable_path()?;
     let candidates = sibling_binary_candidates(&current_exe, binary_name)?;
     for candidate in &candidates {
         if candidate.is_file() {
@@ -4064,7 +5154,7 @@ pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {
 }
 
 pub fn sibling_binary_exists(binary_name: &str) -> bool {
-    let Ok(current_exe) = std::env::current_exe() else {
+    let Ok(current_exe) = current_executable_path() else {
         return false;
     };
     let Ok(candidates) = sibling_binary_candidates(&current_exe, binary_name) else {
@@ -4107,15 +5197,247 @@ pub fn engine_binary_path(engine: &str) -> Result<PathBuf> {
 }
 
 pub fn daemon_binary_path() -> Result<PathBuf> {
-    sibling_binary_path("rocmd")
+    let current_exe = current_executable_path()?;
+    if current_exe
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("deps")
+        && let Ok(rocm) = sibling_binary_path("rocm")
+    {
+        return Ok(rocm);
+    }
+    Ok(current_exe)
+}
+
+pub fn current_executable_path() -> Result<PathBuf> {
+    match std::env::current_exe() {
+        Ok(path) if current_exe_is_cosmopolitan_loader(&path) => {
+            current_executable_path_from_argv0().or(Ok(path))
+        }
+        Ok(path) => Ok(path),
+        Err(current_exe_error) => current_executable_path_from_argv0()
+            .with_context(|| format!("failed to discover current executable: {current_exe_error}")),
+    }
+}
+
+fn current_exe_is_cosmopolitan_loader(path: &Path) -> bool {
+    if !cfg!(target_vendor = "cosmo") {
+        return false;
+    }
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| matches!(name, "ape" | "ape-x86_64.elf" | "ape-aarch64.elf"))
+        .unwrap_or(false)
+}
+
+fn current_executable_path_from_argv0() -> Result<PathBuf> {
+    let argv0 = std::env::args_os()
+        .next()
+        .context("current process argv[0] is unavailable")?;
+    let argv0_text = argv0.to_string_lossy().trim().to_owned();
+    if argv0_text.is_empty() {
+        bail!("current process argv[0] is empty");
+    }
+    if runtime_path_text_is_absolute(&argv0_text) {
+        return Ok(PathBuf::from(normalize_runtime_path_text(&argv0_text)));
+    }
+
+    let looks_path_like = argv0_text.contains('/')
+        || argv0_text.contains('\\')
+        || argv0_text.starts_with('.')
+        || argv0_text.starts_with('~');
+    if looks_path_like && let Ok(current_dir) = std::env::current_dir() {
+        return Ok(normalize_runtime_join_path(&current_dir, &argv0_text));
+    }
+
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        for candidate in runtime_executable_search_candidates(&dir, &argv0_text) {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        return Ok(normalize_runtime_join_path(&current_dir, &argv0_text));
+    }
+
+    bail!("unable to resolve current executable from argv[0]: {argv0_text}");
+}
+
+fn runtime_executable_search_candidates(dir: &Path, argv0: &str) -> Vec<PathBuf> {
+    let normalized = normalize_runtime_path_text(argv0);
+    let mut candidates = vec![normalize_runtime_join_path(dir, &normalized)];
+    if runtime_is_windows()
+        && Path::new(argv0).extension().is_none()
+        && !normalized.to_ascii_lowercase().ends_with(".exe")
+    {
+        candidates.push(normalize_runtime_join_path(
+            dir,
+            &format!("{normalized}.exe"),
+        ));
+    }
+    candidates
+}
+
+fn normalize_runtime_join_path(base: &Path, child: &str) -> PathBuf {
+    let child = normalize_runtime_path_text(child);
+    if runtime_path_text_is_absolute(&child) {
+        return PathBuf::from(child);
+    }
+    if runtime_is_windows() && std::path::MAIN_SEPARATOR == '/' {
+        let base = normalize_runtime_path_text(&base.display().to_string());
+        return PathBuf::from(format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            child.trim_start_matches('/')
+        ));
+    }
+    base.join(child)
+}
+
+fn normalize_runtime_path_text(value: &str) -> String {
+    if runtime_is_windows() {
+        normalize_windows_runtime_path_text(value)
+    } else {
+        value.to_owned()
+    }
+}
+
+pub fn normalize_runtime_path_for_host(path: &Path) -> PathBuf {
+    PathBuf::from(normalize_runtime_path_text(&path.display().to_string()))
+}
+
+pub fn normalize_runtime_path_text_for_host(value: &str) -> String {
+    normalize_runtime_path_text(value)
+}
+
+pub fn normalize_runtime_path_for_storage(path: &Path) -> PathBuf {
+    PathBuf::from(normalize_runtime_path_text_for_storage(
+        &path.display().to_string(),
+    ))
+}
+
+pub fn normalize_runtime_path_text_for_storage(value: &str) -> String {
+    if runtime_is_windows() {
+        normalize_windows_storage_path_text(value)
+    } else {
+        value.to_owned()
+    }
+}
+
+fn normalize_windows_runtime_path_text(value: &str) -> String {
+    let value = value.trim();
+    let forward = value.replace('\\', "/");
+    let forward_bytes = forward.as_bytes();
+    if forward_bytes.len() >= 2
+        && forward_bytes[0] == b'/'
+        && forward_bytes[1].is_ascii_alphabetic()
+        && (forward_bytes.len() == 2 || forward_bytes[2] == b'/')
+    {
+        let drive = (forward_bytes[1] as char).to_ascii_uppercase();
+        let rest = if forward_bytes.len() > 3 {
+            forward[3..].trim_start_matches('/')
+        } else {
+            ""
+        };
+        if std::path::MAIN_SEPARATOR == '\\' {
+            if rest.is_empty() {
+                return format!("{drive}:\\");
+            }
+            return format!("{drive}:\\{}", rest.replace('/', "\\"));
+        }
+        if rest.is_empty() {
+            return format!("{drive}:/");
+        }
+        return format!("{drive}:/{rest}");
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let rest = value[2..].replace('\\', "/");
+        let rest = rest.trim_start_matches('/');
+        if std::path::MAIN_SEPARATOR == '\\' {
+            if rest.is_empty() {
+                return format!("{drive}:\\");
+            }
+            return format!("{drive}:\\{}", rest.replace('/', "\\"));
+        }
+        if rest.is_empty() {
+            return format!("{drive}:/");
+        }
+        return format!("{drive}:/{rest}");
+    }
+    if std::path::MAIN_SEPARATOR == '/' {
+        return value.replace('\\', "/");
+    }
+    value.to_owned()
+}
+
+fn normalize_windows_storage_path_text(value: &str) -> String {
+    let value = value.trim();
+    let forward = value.replace('\\', "/");
+    let bytes = forward.as_bytes();
+    let drive_path = if bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes.len() == 2 || bytes[2] == b'/')
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = if bytes.len() > 3 {
+            forward[3..].trim_start_matches('/')
+        } else {
+            ""
+        };
+        Some((drive, rest))
+    } else if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let rest = forward[2..].trim_start_matches('/');
+        Some((drive, rest))
+    } else {
+        None
+    };
+    if let Some((drive, rest)) = drive_path {
+        if rest.is_empty() {
+            return format!("{drive}:\\");
+        }
+        return format!("{drive}:\\{}", rest.replace('/', "\\"));
+    }
+    if let Some(rest) = forward.strip_prefix("//") {
+        return format!(r"\\{}", rest.replace('/', "\\"));
+    }
+    value.to_owned()
+}
+
+fn runtime_path_text_is_absolute(value: &str) -> bool {
+    if Path::new(value).is_absolute() {
+        return true;
+    }
+    runtime_is_windows() && windows_runtime_path_text_is_absolute(value)
+}
+
+fn windows_runtime_path_text_is_absolute(value: &str) -> bool {
+    let normalized = normalize_windows_runtime_path_text(value);
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+    let unc = normalized.replace('\\', "/");
+    if !unc.starts_with("//") {
+        return false;
+    }
+    let mut parts = unc.split('/').filter(|part| !part.is_empty());
+    parts.next().is_some() && parts.next().is_some()
 }
 
 pub fn platform_binary_name(binary_name: &str) -> String {
-    if cfg!(windows) {
-        format!("{binary_name}.exe")
-    } else {
-        binary_name.to_owned()
-    }
+    format!("{binary_name}{}", runtime_exe_suffix())
 }
 
 pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
@@ -4154,6 +5476,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn openai_models_endpoint_has_model_checks_loaded_model_ids() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<String> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&buffer[..read]);
+                if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+            let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(request)
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert!(openai_models_endpoint_has_model(
+            &endpoint,
+            Some("qwen"),
+            Duration::from_secs(2)
+        )?);
+
+        let request = server.join().expect("server thread should not panic")?;
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
     fn platform_binary_name_adds_windows_suffix_only_on_windows() {
         let name = platform_binary_name("rocm");
         if cfg!(windows) {
@@ -4166,7 +5530,7 @@ mod tests {
     #[test]
     fn default_engine_is_always_usable_on_windows() {
         if cfg!(windows) {
-            assert_eq!(default_engine_for_platform(), "pytorch");
+            assert_eq!(default_engine_for_platform(), "lemonade");
         }
     }
 
@@ -4879,10 +6243,10 @@ mod tests {
     #[test]
     fn builtin_recipe_resolves_alias_and_canonical_model() {
         let qwen = resolve_builtin_model_recipe("qwen").expect("qwen alias should resolve");
-        assert_eq!(qwen.canonical_model_id, "Qwen/Qwen2.5-1.5B-Instruct");
-        assert_eq!(qwen.dtype, "float16");
+        assert_eq!(qwen.canonical_model_id, "Qwen3-0.6B-GGUF");
+        assert_eq!(qwen.dtype, "gguf");
         assert_eq!(qwen.device_policy, "gpu_required");
-        assert_eq!(qwen.preferred_engines, vec!["pytorch"]);
+        assert_eq!(qwen.preferred_engines, vec!["lemonade"]);
 
         let qwen35 = resolve_builtin_model_recipe("qwen3.5").expect("qwen3.5 alias should resolve");
         assert_eq!(qwen35.canonical_model_id, "Qwen/Qwen3.5-4B");
@@ -5423,6 +6787,85 @@ mod tests {
         assert_eq!(paths.cache_dir, home_rocm.join("cache"));
         assert_eq!(paths.config_path(), home_rocm.join("config.json"));
         Ok(())
+    }
+
+    #[test]
+    fn runtime_windows_paths_accept_mixed_drive_separators() {
+        if !runtime_is_windows() {
+            return;
+        }
+
+        let path = normalize_windows_runtime_path_text(r"D:\/jam/temp/therock_venvs");
+
+        assert!(windows_runtime_path_text_is_absolute(&path));
+        if std::path::MAIN_SEPARATOR == '\\' {
+            assert_eq!(path, r"D:\jam\temp\therock_venvs");
+        } else {
+            assert_eq!(path, "D:/jam/temp/therock_venvs");
+        }
+    }
+
+    #[test]
+    fn runtime_windows_paths_accept_universal_drive_prefixes() {
+        if !runtime_is_windows() {
+            return;
+        }
+
+        let path = normalize_windows_runtime_path_text("/D/jam/temp/therock_venvs");
+
+        assert!(windows_runtime_path_text_is_absolute(&path));
+        if std::path::MAIN_SEPARATOR == '\\' {
+            assert_eq!(path, r"D:\jam\temp\therock_venvs");
+        } else {
+            assert_eq!(path, "D:/jam/temp/therock_venvs");
+        }
+    }
+
+    #[test]
+    fn runtime_windows_storage_paths_use_native_drive_syntax() {
+        if !runtime_is_windows() {
+            return;
+        }
+
+        assert_eq!(
+            normalize_runtime_path_text_for_storage("/D/jam/temp/therock_venvs"),
+            r"D:\jam\temp\therock_venvs"
+        );
+        assert_eq!(
+            normalize_runtime_path_text_for_storage("D:/jam/temp/therock_venvs"),
+            r"D:\jam\temp\therock_venvs"
+        );
+    }
+
+    #[test]
+    fn cosmopolitan_windows_runtime_path_join_preserves_drive_colons() {
+        if !runtime_is_windows() {
+            return;
+        }
+
+        let joined = prepend_cosmopolitan_windows_runtime_paths(
+            &[],
+            Some(OsString::from(r"C:\Tools;D:\ROCm\bin")),
+        )
+        .expect("expected PATH text");
+        let joined = joined.to_string_lossy();
+
+        assert!(joined.contains(r"C:\Tools"));
+        assert!(joined.contains(r"D:\ROCm\bin"));
+        assert!(!joined.contains(r"C;\Tools"));
+        assert!(!joined.contains(r"D;\ROCm"));
+    }
+
+    #[test]
+    fn runtime_windows_paths_normalize_relative_backslashes_for_unix_separator_runtime() {
+        if !runtime_is_windows() || std::path::MAIN_SEPARATOR != '/' {
+            return;
+        }
+
+        assert_eq!(
+            normalize_windows_runtime_path_text(r".\rocm.exe"),
+            "./rocm.exe"
+        );
     }
 
     #[test]

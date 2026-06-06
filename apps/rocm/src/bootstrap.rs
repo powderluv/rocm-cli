@@ -2,8 +2,8 @@ use crate::providers;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord, format_http_base_url,
-    generate_service_id, interactive_terminal,
+    AppPaths, DEFAULT_LOCAL_HOST, DoctorSummary, ManagedServiceRecord, current_executable_path,
+    format_http_base_url, generate_service_id, interactive_terminal,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -167,7 +167,7 @@ fn bootstrap_cli_install(args: BootstrapInstallCliArgs) -> Result<BootstrapCliIn
         .context("failed to resolve the ROCm CLI install folder")?;
     let source_bin = match args.source_bin {
         Some(source_bin) => source_bin,
-        None => std::env::current_exe()
+        None => current_executable_path()
             .context("failed to find the running rocm executable")?
             .parent()
             .context("the running rocm executable does not have a parent folder")?
