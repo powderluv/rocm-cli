@@ -12,39 +12,46 @@ reason to add CPU fallback paths to PyTorch, llama.cpp, vLLM, SGLang, or ATOM.
 
 ## Current Implementation State
 
-Audited on 2026-06-03. The implementation has moved well beyond the original
+Audited on 2026-06-06. The implementation has moved well beyond the original
 greenfield plan. Use `plans/rocm-cli-remaining-implementation-plan.md` as the
 live tracker.
 
 - Implemented locally: the Rust CLI/TUI, first-time setup, TheRock managed
   `pip` venv installs, runtime activation/import/adopt/uninstall, bounded
   Doctor reports, service records/logs/actions, the model registry CLI/TUI,
-  provider adapters, PyTorch/llama.cpp/vLLM engine adapters, automation
-  proposals/sandbox runner, packaging scripts, installer verification, and
-  release-readiness self-tests.
-- Bootstrap installers now cover clean machines with no ROCm, Python, Rust, or
-  Cargo installed: they install the prebuilt bundle, seed minimal config, verify
-  checksum/signature before activation, and set PATH automatically. Windows
-  persists the user PATH and updates the current PowerShell process when the
-  quick-start command is run directly; Linux/WSL writes the shell profile and
-  tells users to open a new terminal after `curl | sh`.
+  provider adapters, PyTorch/llama.cpp/Lemonade/vLLM engine adapters,
+  automation proposals/sandbox runner, packaging scripts, installer
+  verification, release-readiness self-tests, and the Rust/Cosmopolitan
+  no-extract universal-binary path.
+- Bootstrap/setup now has two supported shapes:
+  - normal install scripts for clean machines with no ROCm, Python, Rust, or
+    Cargo installed; these seed minimal config, verify before activation, and
+    set PATH automatically.
+  - the experimental Rust/Cosmopolitan single-file artifact, which runs the
+    real rocm-cli program as one executable on Windows and WSL/Linux without
+    extracting sibling `rocm`, `rocm.exe`, `rocmd`, or `rocm-engine-*` files.
+    It still installs TheRock wheels, Python environments, models, ComfyUI, and
+    app caches on disk only after the user chooses a folder and approves setup.
 - TheRock installs now use a single pinned TheRock-index transaction for
   `rocm[libraries,devel]`, `torch`, `torchvision`, and `torchaudio`, with the
   exact ROCm wheel suffix selected for the current Python/platform.
 - Local Windows/WSL acceptance has passed for managed TheRock install,
-  PyTorch GPU smoke, llama.cpp GPU smoke, WSL ROCDXG readiness, and WSL vLLM
-  GPU smoke on the current local AMD GPU host.
+  PyTorch GPU smoke, Lemonade ROCm serving, llama.cpp GPU smoke, ComfyUI
+  start/stop plus HTTP smoke, WSL ROCDXG readiness, and WSL vLLM GPU smoke on
+  the current local AMD GPU host.
 - Current local serving caveat: saved historical `Qwen/Qwen3.5-4B` PyTorch
   service attempts fail because the managed Transformers package does not
   recognize the checkpoint's `qwen3_5` architecture. The short `qwen` alias now
-  resolves to the recommended `Qwen/Qwen2.5-1.5B-Instruct` PyTorch assistant
-  recipe for low-VRAM ROCm machines, with `qwen-tiny` kept as the explicit
-  Qwen2.5 0.5B smoke-test path. Explicit Qwen3.5 PyTorch requests are gated
-  before launch with a clear compatibility error.
+  resolves to the recommended low-VRAM assistant recipe. Lemonade is the
+  default local engine for assistant/server flows; PyTorch remains a supported
+  managed engine and explicit Qwen3.5 PyTorch requests are gated before launch
+  with a clear compatibility error.
 - Remaining gates are mostly owner/upstream/infrastructure items: production
-  signing keys and hosted indexes, privileged Linux driver acceptance, live
-  ATOM/SGLang acceptance on supported upstream GPU targets, broader GPU-family
-  CI, and a production AMD driver-update source.
+  signing keys and hosted indexes, native-Linux release validation beyond WSL,
+  privileged Linux driver acceptance, live ATOM/SGLang acceptance on supported
+  upstream GPU targets, broader GPU-family CI, a production AMD driver-update
+  source, and graduating the Rust/Cosmopolitan build from spike script to the
+  release pipeline.
 
 ### Done vs Left Snapshot
 
@@ -67,8 +74,12 @@ Done locally:
 - Local served-model chat can use ROCm command tools and approval-routed
   mutating actions. ComfyUI install/status/logs/start is available as a managed
   app surface.
+- Lemonade is the default managed local engine for assistant/server entry
+  points. PyTorch and llama.cpp remain explicit engine choices with GPU-required
+  validation.
 - Packaging, release-readiness checks, generated-key signature verification,
-  installer lifecycle acceptance, and first-install PATH setup acceptance.
+  installer lifecycle acceptance, first-install PATH setup acceptance, and the
+  true Rust/Cosmopolitan single-file artifact.
 
 Left or externally gated:
 
@@ -82,6 +93,8 @@ Left or externally gated:
   self-hosted adapter detect/capabilities coverage.
 - Define a production AMD driver-update feed before wiring real driver-update
   event detection.
+- Promote the Rust/Cosmopolitan universal-binary build and release gate from
+  workspace-local scripts into the production publishing pipeline.
 
 ## Summary
 - Build `rocm-cli` as the ROCm AI Command Center CLI for AMD systems. It should install and manage TheRock runtimes on Linux and Windows, optionally install Linux DKMS drivers through official AMD flows, run local model servers, and provide a chat-first terminal experience for ROCm/TheRock operations.
@@ -90,7 +103,7 @@ Left or externally gated:
   - `release`: latest stable TheRock release
   - `nightly`: latest nightly for the selected platform and GPU family
 - Default managed runtime installs to a user-owned `pip` virtual environment backed by TheRock wheels. Keep tarball installs as an explicit alternative, especially for system prefixes such as `/opt/rocm`.
-- On Windows, constrain V1 runtime management to `pip` venv installs and existing-driver validation. Use TheRock PyTorch wheels plus a managed `pytorch` serving engine as the default native Windows local serving path.
+- On Windows, constrain V1 runtime management to `pip` venv installs and existing-driver validation. Use a managed Lemonade serving path as the default native local assistant/server engine, with PyTorch and llama.cpp available as explicit GPU-required engines.
 - Use pluggable serving engines instead of hard-coding one runtime. V1 should support `pytorch`, `llama.cpp`, `vllm`, `sglang`, and `atom` through a common plugin contract.
 - Use pluggable chat providers:
   - `local`: talk to a locally served model
@@ -454,23 +467,26 @@ use these surfaces instead:
   - `reasoning_parser`
 
 ### Built-In Engine Priorities
+- `lemonade`
+  - default local assistant/server engine
+  - use ROCm GPU execution only; no CPU or Vulkan fallback
 - `pytorch`
-  - default Windows local serving engine
+  - explicit managed Windows/Linux serving engine
   - built on TheRock PyTorch wheels with a `rocm-cli` managed serving wrapper
   - should expose the same normalized endpoint contract as the other engines
 - `llama.cpp`
   - ROCm GPU path for quantized GGUF local models
   - fail loudly when ROCm GPU execution is unavailable
 - `vllm`
-  - default ROCm GPU serving path
+  - high-throughput ROCm GPU serving path on supported Linux/WSL hosts
 - `sglang`
   - reasoning- and router-friendly engine option
 - `atom`
   - AMD-optimized path for select hardware and recipes
   - treat as experimental until packaging and compatibility mature
 - Windows engine policy:
-  - default to a managed `pytorch` serving engine backed by TheRock PyTorch wheels
-  - keep `llama.cpp` available for quantized GGUF workflows with ROCm GPU execution
+  - default to managed `lemonade` serving with ROCm GPU required
+  - keep `pytorch` and `llama.cpp` available for explicit GPU-required workflows
   - use GPU execution through TheRock PyTorch on supported Windows systems when a usable AMD driver is present
   - do not make `vllm`, `sglang`, or `atom` native Windows GPU serving part of the V1 promise
 
@@ -643,7 +659,7 @@ mode = "propose"
 |------|-------|-------|
 | Linux x86_64 with AMD GPU | Full V1 target | TUI, TheRock runtime, drivers, serving, automations |
 | Linux x86_64 CPU-only | Supported non-serving host | TUI, provider chat, artifacts, no driver work, no local model serving fallback |
-| Windows x86_64 with AMD GPU | Supported in early phases | TUI, chat, TheRock `pip` runtime, driver validation, `pytorch` local serving, provider chat; assume driver already installed, no driver installer in V1 |
+| Windows x86_64 with AMD GPU | Supported in early phases | TUI, chat, TheRock `pip` runtime, driver validation, Lemonade default local serving, explicit PyTorch/llama.cpp local serving, provider chat; assume driver already installed, no driver installer in V1 |
 | Windows x86_64 CPU-only | Supported non-serving host | TUI, provider chat, TheRock wheel management where applicable, no local model serving fallback |
 | macOS | Deferred | Provider-backed chat only unless future TheRock/engine artifacts make more possible |
 
@@ -657,7 +673,8 @@ mode = "propose"
 | TheRock tarball install | Deferred | Do not target `Program Files`-style system installs in V1 |
 | Windows driver install/upgrade | Deferred | Assume driver already installed; report compatibility only |
 | Provider chat (`local`, `anthropic`, `openai`) | Supported | Same chat surface as Linux |
-| Local serving via TheRock PyTorch wheels | Supported | `pytorch` is the default native Windows engine |
+| Local serving via Lemonade | Supported | Default native local assistant/server engine with ROCm GPU required |
+| Local serving via TheRock PyTorch wheels | Supported | Explicit managed PyTorch engine; ROCm GPU required |
 | `llama.cpp` local serving | Supported GPU engine | Use for quantized GGUF workflows with ROCm GPU execution; no CPU fallback |
 | Native Windows ROCm GPU serving via `vllm` | Deferred | vLLM upstream is Linux-only today |
 | Native Windows ROCm GPU serving via `sglang` | Deferred | ROCm guidance is Linux and Docker oriented |

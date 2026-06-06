@@ -14,6 +14,9 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 
 - First-time setup must be a dedicated setup prompt/screen before the main TUI.
 - Do not require users to know or type slash commands to complete setup.
+- Do not use an LLM assistant for bootstrap/setup. Setup should be
+  deterministic: choose folder, review install, run install, show success, then
+  continue to the main TUI.
 - First-time setup should focus on one job: installing the TheRock ROCm Python
   wheels into a managed Python venv.
 - Prompt the user for the venv install location with a simple default.
@@ -61,6 +64,9 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
   yellow/orange for work in progress or caution, and AMD red only for real
   errors or destructive danger.
 - Do not show a persistent Activity pane by default.
+- Do not show a prompt/composer on screens where no assistant or server session
+  exists. Use a main menu with clickable/arrow-key rows until the user starts or
+  opens a chat session.
 - Treat slash commands as entry points into navigable screens, not as wrappers
   around non-TUI command output.
 - Typed slash commands with arguments should prefill the same guided screen
@@ -94,6 +100,8 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - Put current operation state in the footer/status area. Show live command
   output in the active screen when it is part of the user's current task, and
   put history in explicit log views.
+- Only show install/service logs in the foreground progress or details card for
+  the active operation. Avoid duplicate background log text behind a modal.
 - Do not let Back/Esc hide the screen that owns a mutating running command such
   as install, update, engine setup, service lifecycle, or automation approval.
   Keep live progress visible until the command finishes, then let the user

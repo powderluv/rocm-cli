@@ -1,6 +1,6 @@
 # Implementation Completion Audit
 
-Audited on 2026-06-03 against:
+Audited on 2026-06-06 against:
 
 - `plans/rocm-cli-implementation-plan.md`
 - `plans/rocm-cli-pytorch-engine-spec.md`
@@ -49,6 +49,11 @@ The branch currently has local implementations for the V1 product surfaces:
   read-only/mutating boundaries, lifecycle logs, and audit records.
 - TUI command surfaces that open navigable screens or focused overlapping modal
   cards instead of transcript dumps.
+- Rust/Cosmopolitan single-file rocm-cli artifact that runs the real CLI/TUI on
+  Windows and WSL/Linux without extracting sibling `rocm`, `rocm.exe`, `rocmd`,
+  or first-party `rocm-engine-*` helper binaries. TheRock wheels, Python envs,
+  ComfyUI, ROCm libraries, and model files remain user-approved runtime content
+  installed on disk.
 - CI and local verification hooks for all-target tests, clippy with warnings
   denied, release-readiness self-tests, installer lifecycle tests, and
   acceptance-harness self-tests.
@@ -62,9 +67,9 @@ The branch currently has local implementations for the V1 product surfaces:
 | Privileged Linux driver install acceptance | Distro plans, preflight checks, approval boundaries, execution state, and reconcile commands exist. | Live DKMS acceptance needs a supported Linux host with root/sudo control and compatible driver state. |
 | ATOM live GPU acceptance | Adapter packaging, managed TheRock environment propagation, and offline exact-runtime selector tests exist. | Live acceptance needs upstream-supported ATOM GPU targets. Current local `gfx1201` host is not an upstream ATOM target. |
 | SGLang live GPU acceptance | Adapter packaging, managed-runtime parity, explicit Windows gate, and offline selector tests exist. | Current local `gfx1201` host is blocked by upstream SGLang ROCm kernel support. |
-| Lemonade WSL GPU serving | The adapter is implemented and Windows ROCm validation passes. WSL TheRock/librocdxg works independently. | Lemonade v10.6.0 reports no AMD GPU and marks `llamacpp:rocm` unsupported under WSL before model load. |
 | Broader GPU-family CI | Normal Linux/Windows CI, local no-fallback smoke, self-hosted adapter detect/capabilities smoke, and local RDNA4 Windows/WSL acceptance exist. | More live serving coverage needs additional CI hardware or lab machines. |
 | Production driver-update feed | Local update-available event handling and reviewed driver-plan proposals exist. | A real AMD driver update source/feed must be defined before wiring production event detection. |
+| Universal-binary release publishing | The workspace-local Rust/Cosmopolitan APE build runs on Windows and WSL/Linux and has live GPU E2E coverage on this host. | The build still needs to be promoted from spike scripts into production release publishing and validated on native Linux hardware outside WSL. |
 | Future contained mutating actions | Current contained read-only checks and reviewed mutating proposals exist. | Additional mutating automation actions need explicit product requirements before implementation. |
 
 ## Verification Anchors
@@ -80,6 +85,7 @@ python scripts/pytorch_therock_gpu_test.py --self-test
 python scripts/llama_cpp_therock_gpu_test.py --self-test
 python scripts/comfyui_therock_gpu_test.py --self-test
 python scripts/local_assistant_therock_gpu_test.py --self-test
+python scripts/single_exe_release_gate.py
 ```
 
 Live GPU acceptance is opt-in because it installs packages and launches local
@@ -91,6 +97,15 @@ python scripts/pytorch_therock_gpu_test.py
 python scripts/llama_cpp_therock_gpu_test.py --launch-mode launch
 python scripts/local_assistant_therock_gpu_test.py --model qwen --require-tool-call
 python scripts/comfyui_therock_gpu_test.py
+```
+
+Universal-binary live acceptance should use only the single-file artifact:
+
+```powershell
+python scripts\single_exe_release_gate.py --live-assistant --live-comfyui --generate-cat
+python scripts\local_assistant_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe --engine lemonade --model qwen --require-tool-call
+python scripts\local_assistant_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe --engine pytorch --model qwen --require-tool-call
+python scripts\comfyui_therock_gpu_test.py --rocm .rocm-work\tests\rust-cosmopolitan\rocm-rust-cosmo-release.exe
 ```
 
 WSL verification should run from the WSL filesystem when possible for better IO:
@@ -106,6 +121,16 @@ python3 scripts/llama_cpp_therock_gpu_test.py --self-test
 python3 scripts/local_assistant_therock_gpu_test.py --self-test
 ```
 
+For WSL, run the same universal binary through the APE/Linux path, not as a
+Windows process:
+
+```bash
+sh /home/jam/rocm-cli-e2e/bin/rocm doctor
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh --engine lemonade --model qwen --require-tool-call
+python3 scripts/local_assistant_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh --engine pytorch --model qwen --require-tool-call
+python3 scripts/comfyui_therock_gpu_test.py --rocm /home/jam/rocm-cli-e2e/bin/rocm --rocm-launch-prefix sh
+```
+
 ## Regression Rules
 
 - Do not add CPU fallback for GPU-required serving paths.
@@ -118,6 +143,7 @@ python3 scripts/local_assistant_therock_gpu_test.py --self-test
 - Do not expose raw log paths, runtime keys, wheel jargon, or backend labels in
   first-visible TUI screens unless the user opens an explicit detail/debug view.
 - Do not claim production signing, production hosted indexes, privileged driver
-  acceptance, ATOM/SGLang live acceptance, broader GPU CI, or production driver
-  feeds until the required owner, hardware, upstream, or infrastructure input
-  exists and has passed acceptance.
+  acceptance, ATOM/SGLang live acceptance, broader GPU CI, production driver
+  feeds, native-Linux universal-binary acceptance, or production universal-
+  binary publishing until the required owner, hardware, upstream, or
+  infrastructure input exists and has passed acceptance.

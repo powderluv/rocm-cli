@@ -8,9 +8,14 @@ is GPU-required local serving with no implicit CPU fallback: PyTorch must use a
 managed TheRock ROCm runtime for serving, and `cpu_only` requests fail loudly
 instead of becoming a fallback path.
 
+Current default-engine note, audited 2026-06-06: Lemonade is now the default
+local assistant/server engine. This document remains the PyTorch engine spec,
+so PyTorch is still supported and tested as an explicit managed engine, but
+older lines below that call PyTorch the default Windows engine are historical.
+
 ## Summary
 - Build a first-party `pytorch` serving engine for `rocm-cli`.
-- Make it the default native local serving backend on Windows.
+- Keep it available as an explicit native local serving backend on Windows.
 - Base it on TheRock PyTorch wheel sets installed into `pip` virtual environments managed by `rocm-cli`.
 - Expose the same normalized local endpoint contract used by the other engines so the chat layer and tool layer do not care which backend is active.
 - Keep scope fixed to single-node, single-model local inference in V1. This engine is not trying to compete with `vllm`, `sglang`, or `atom` on throughput or distributed scheduling.
@@ -37,13 +42,14 @@ instead of becoming a fallback path.
 
 ## Position in the Product
 - On Windows:
-  - default local engine: `pytorch`
+  - default local engine: `lemonade`
+  - explicit managed engine: `pytorch`
   - alternate local GPU engine: `llama.cpp` when a HIP-enabled llama-server and
     managed TheRock runtime are available
   - deferred engines: `vllm`, `sglang`, `atom`
 - On Linux:
-  - default ROCm GPU engine: `vllm`
-  - alternate local GPU engines: `llama.cpp`, `pytorch`, `sglang`, `atom`
+  - default local engine: `lemonade`
+  - alternate local GPU engines: `vllm`, `llama.cpp`, `pytorch`, `sglang`, `atom`
     where their upstream ROCm support and managed TheRock runtime are present
   - `pytorch` is available as a compatibility engine for simple single-model
     serving, but it is not the default Linux GPU path.
@@ -479,9 +485,9 @@ Output:
 - `rocm logs --service <id>`
 
 ### Expected TUI Plan
-For `serve qwen on Windows`:
+For an explicit `serve qwen on Windows with PyTorch` request:
 1. detect Windows driver and TheRock runtime
-2. resolve `pytorch` as the default engine
+2. resolve `pytorch` as the requested engine
 3. validate or create the engine env
 4. resolve model recipe and expected memory use
 5. load `Qwen/Qwen2.5-1.5B-Instruct` using GPU-required policy
@@ -605,7 +611,7 @@ compile = "off"
 - Prove the same normalized endpoint contract works.
 
 ### Product Integration
-- `rocm` TUI resolves `pytorch` as the default engine on Windows.
+- `rocm` TUI can resolve `pytorch` when the user chooses or requests it.
 - `rocmd` can restart a crashed `pytorch` service.
 - `rocm logs` and `rocm doctor` reflect engine state accurately.
 

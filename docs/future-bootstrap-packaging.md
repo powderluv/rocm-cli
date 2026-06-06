@@ -1,13 +1,12 @@
 # P0 Bootstrap And Single-File Packaging Spike
 
-Status update, 2026-06-05: this embedded-llamafile/self-extracting APE
+Status update, 2026-06-06: this embedded-llamafile/self-extracting APE
 bootstrap direction is superseded for the active `jam/updates` branch.
-Bootstrap now uses deterministic first-time setup UI, and the active release
-artifact is the platform-native standalone `rocm`/`rocm.exe` binary itself. The
-current target for a real no-extract Cosmopolitan binary is tracked in
+Bootstrap now uses deterministic first-time setup UI, and the active single-exe
+target is the Rust/Cosmopolitan no-extract rocm-cli artifact tracked in
 `docs/cosmopolitan-universal-binary-plan.md`. Keep the notes below as
-historical research unless the user explicitly reopens the embedded assistant
-or self-extracting launcher path.
+historical research only unless the user explicitly reopens the embedded
+assistant or self-extracting launcher path.
 
 This note captures the historical P0 spike on the `jam/updates_exe_ape`
 worktree. The goal was a Cosmopolitan/APE-inspired self-extracting bootstrap

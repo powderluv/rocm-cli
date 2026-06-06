@@ -116,14 +116,14 @@ Production `build` now requires a compiler that looks like Cosmopolitan
 can be used for extraction-only development builds only with
 `--allow-local-compiler`.
 
-## Standalone Single-Exe Release Builder
+## Platform-Native Standalone Builder
 
-Use `scripts/build_single_exe_release.py standalone` for the current repeatable
-release artifact. The output is the `rocm`/`rocm.exe` binary itself: no
-self-extraction, no embedded Qwen/llamafile, no ROCm sidecars, and no vendored
-Codex binary. This artifact is platform-native, not Cosmopolitan-universal.
-Running it with no arguments opens rocm-cli; on first run, the dedicated setup
-wizard appears automatically.
+Use `scripts/build_single_exe_release.py standalone` only for platform-native
+development checks. The output is the `rocm`/`rocm.exe` binary itself for one
+OS: no self-extraction, no embedded Qwen/llamafile, no ROCm sidecars, and no
+vendored Codex binary. This artifact is platform-native, not the current
+Cosmopolitan-universal target. Running it with no arguments opens rocm-cli; on
+first run, the dedicated setup wizard appears automatically.
 
 Typical flow:
 
@@ -133,6 +133,10 @@ python scripts/build_single_exe_release.py standalone
 
 On Windows this writes `.rocm-work/standalone-release/rocm.exe`; on Linux it
 writes `.rocm-work/standalone-release/rocm`.
+
+For current release-style single-exe validation, build and test the
+Rust/Cosmopolitan artifact documented in
+`docs/cosmopolitan-universal-binary-plan.md` and `docs/testing.md`.
 
 The older APE commands below are historical self-extracting launcher tooling
 and are not the active release path or the final no-extract Cosmopolitan target:

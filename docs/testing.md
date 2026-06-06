@@ -54,6 +54,11 @@ itself, not a self-extracting launcher and not a model bundle. Running it with
 no arguments opens normal rocm-cli; if setup is not complete, the first-time
 setup wizard appears automatically.
 
+The current cross-OS release target is the Rust/Cosmopolitan universal binary,
+not the platform-native standalone copy above. Use the universal artifact for
+release-style end-to-end tests unless a test is explicitly about native
+development builds.
+
 Run the historical offline bootstrap/launcher validation harness only when
 working on the old APE spike:
 
@@ -63,7 +68,7 @@ python scripts/ape_bootstrap_package.py self-test
 ```
 
 Those fixture-backed harnesses cover the superseded embedded-llamafile APE
-experiment. They are not required for the current standalone release path.
+experiment. They are not required for the current deterministic setup path.
 
 Run the true no-extract Cosmopolitan feasibility probe when working on the
 universal-binary plan:
@@ -94,6 +99,13 @@ The release artifact is:
 .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
 ```
 
+On Windows, run that file directly. On WSL/Linux, run the same file through the
+APE/Linux path so WSLInterop does not launch the Windows side:
+
+```bash
+sh .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe doctor
+```
+
 Run the production single-exe gate for safe isolated checks:
 
 ```bash
@@ -110,6 +122,18 @@ python scripts/single_exe_release_gate.py \
   --live-comfyui \
   --generate-cat
 ```
+
+Latest local checkpoint, 2026-06-06:
+
+- `cargo test --workspace` passed.
+- Windows universal-binary TUI smoke passed.
+- WSL universal-binary TUI smoke passed through `sh <same file>`.
+- Windows universal-binary Lemonade local-assistant E2E passed.
+- Windows universal-binary PyTorch local-assistant E2E passed.
+- Windows universal-binary ComfyUI install/start/status/stop E2E passed.
+- WSL universal-binary Lemonade local-assistant E2E passed.
+- WSL universal-binary PyTorch local-assistant E2E passed.
+- WSL universal-binary ComfyUI install/start/status/stop E2E passed.
 
 On native Windows, run it directly. For WSL validation, launch the same file
 through a POSIX path so WSLInterop cannot treat the `MZ` header as a Windows
@@ -141,7 +165,8 @@ This harness belongs to the superseded embedded-bootstrap-assistant path. The
 current `rocm bootstrap assistant` compatibility command opens the deterministic
 setup wizard in an interactive terminal instead of launching a model server.
 
-Run the real bootstrap GPU smoke when the production artifacts are present:
+Run the real bootstrap GPU smoke only when revisiting the superseded embedded
+llamafile bootstrap experiment:
 
 ```powershell
 python scripts\bootstrap_real_gpu_smoke.py --skip-build `
@@ -155,7 +180,8 @@ Unlike `bootstrap_workflow_acceptance.py`, this is not a fake-server test. It
 stages the real llamafile, real ROCm sidecar, and real runtime libraries, starts
 the embedded assistant with `gpu_required`, calls `/health` and
 `/v1/chat/completions`, rejects CPU fallback/invalid code-object logs, and
-checks that the child server stops.
+checks that the child server stops. This path is not part of the current
+deterministic setup/bootstrap release target.
 
 The bootstrap packaging self-tests also use per-process roots by default, so
 Windows and WSL agents can run them in parallel without deleting each other's
@@ -970,12 +996,14 @@ fails or `ROCM_CLI_KEEP_ACCEPTANCE_ROOT=1` is set for debugging. Installed
 binary smoke checks set isolated config/data/cache directories inside those
 roots and fail if `rocm doctor` reads the real user `.rocm` state.
 
-On WSL/Linux, the release bundle includes the mandatory `rocm-codex` binary. If
-the host does not have `libcap-dev` or `libssl-dev`, the Linux acceptance script
-downloads the Ubuntu development packages into
-`.rocm-work/tools/wsl-build-deps`, extracts only the headers, libraries, and
-pkg-config metadata there, and points `PKG_CONFIG_PATH`/`PKG_CONFIG_SYSROOT_DIR`
-at that local copy. No sudo install is required.
+For historical platform-bundle acceptance, the Linux bundle still verifies the
+vendored `rocm-codex` binary. The current Rust/Cosmopolitan universal binary
+does not include a vendored Codex binary or require it as a sidecar. If the host
+does not have `libcap-dev` or `libssl-dev`, the Linux acceptance script
+downloads the Ubuntu development packages into `.rocm-work/tools/wsl-build-deps`,
+extracts only the headers, libraries, and pkg-config metadata there, and points
+`PKG_CONFIG_PATH`/`PKG_CONFIG_SYSROOT_DIR` at that local copy. No sudo install
+is required.
 Run `bash scripts/setup-wsl-portable-build-deps.sh --self-test` to verify the
 portable sysroot normalization path without apt, network access, or a real WSL
 package download.

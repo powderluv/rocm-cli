@@ -6,7 +6,8 @@ separates it from the self-extracting APE launcher spike.
 ## Definitions
 
 - **Platform-native standalone**: the Rust `rocm` or `rocm.exe` binary built for
-  one OS. This is the active release artifact today.
+  one OS. This remains useful for development, but it is not the target
+  release shape for the single-exe work.
 - **Self-extracting APE launcher**: a small Cosmopolitan C executable with a ZIP
   payload appended. It extracts a Windows or Linux Rust release payload and then
   delegates to that native binary. This is a compatibility spike, not the final
@@ -46,7 +47,7 @@ cosmo, cosmopolitan, or ape.
 
 ## Current Repo Reality
 
-The repo currently has these runnable release paths:
+The repo currently has these runnable artifact paths:
 
 - `scripts/build_single_exe_release.py standalone`
   - builds/copies the platform-native Rust `rocm` or `rocm.exe`;
@@ -61,7 +62,7 @@ The repo currently has these runnable release paths:
 The self-extracting launcher remains useful only as a compatibility fallback or
 as an APE behavior test bed. It must not be presented as the final answer.
 
-As of 2026-06-05, the repo also has a true Rust/Cosmopolitan feasibility
+As of 2026-06-06, the repo has a true Rust/Cosmopolitan feasibility
 builder:
 
 - `scripts/setup-cosmocc.sh`
@@ -89,7 +90,7 @@ archives a real `libc/proc/waitid.c` implementation into `libcosmo.a` before
 building rocm-cli. The linker wrapper does not inject rocm-cli-local syscall
 objects or compatibility aliases.
 
-Validated clean rebuild on 2026-06-05:
+Validated clean rebuild and E2E checkpoint on 2026-06-06:
 
 - `.rocm-work` was deleted, then recreated by the setup/build scripts above.
 - Revalidated after removing the old linker-injected waitid object path:
@@ -107,6 +108,11 @@ Validated clean rebuild on 2026-06-05:
   wsl_rocdxg_ready`, and `detected_gfx_target: gfx1201`.
 - WSL smoke through `sh <same APE> doctor` reports the Linux path and fails if
   the output reports `os: windows`.
+- Windows and WSL TUI smoke pass with the same universal artifact.
+- Windows and WSL Lemonade local-assistant E2E pass with no CPU/Vulkan fallback.
+- Windows and WSL PyTorch local-assistant E2E pass with no CPU fallback.
+- Windows and WSL ComfyUI install/start/status/stop E2E pass through the same
+  universal artifact using temporary state roots.
 
 WSL caveat: WSLInterop registers an `MZ` binfmt handler that can intercept
 direct `./rocm` execution before rocm-cli starts, even when the file has no
@@ -126,7 +132,11 @@ content.
 
 ### Track A: Native Cosmopolitan Bootstrap/Core
 
-Build a small C/C++ Cosmopolitan program that owns the first-run setup flow:
+This is no longer the active path for `jam/updates`. The Rust/Cosmopolitan
+artifact runs the real rocm-cli setup/TUI, so duplicating setup in C/C++ would
+increase product drift.
+
+Historical shape:
 
 1. Detect OS and AMD GPU basics.
 2. If AMD runtime/driver is missing, show simple driver guidance.
@@ -136,9 +146,7 @@ Build a small C/C++ Cosmopolitan program that owns the first-run setup flow:
    package-selection rules.
 6. Write the normal `~/.rocm` JSON config and runtime registry.
 
-This track can produce a real no-extract APE sooner because Cosmopolitan's
-supported language path is C/C++. It will initially be a bootstrap/core program,
-not the full Rust TUI.
+Keep this track only as a fallback if Rust/Cosmopolitan stops being viable.
 
 ### Track B: Rust-To-Cosmopolitan Feasibility
 
@@ -150,7 +158,11 @@ Prove whether the existing Rust CLI can become a true APE:
 4. Done: build the real `rocm` binary as one APE.
 5. Done: smoke `version` and `doctor` on native Windows and WSL.
 6. Done: no-arg first-time setup TUI opens from the APE on Windows in a PTY.
-7. Remaining: graduate the spike script into the release pipeline.
+7. Done: same artifact runs the Linux/WSL runtime path through `sh <same file>`.
+8. Done: Windows and WSL universal-binary E2E passes for TUI smoke, Lemonade
+   assistant, PyTorch assistant, and ComfyUI start/stop.
+9. Remaining: graduate the spike script into the release pipeline and validate
+   native Linux outside WSL.
 
 Acceptance for this track is no longer "hello world". The current artifact runs
 useful rocm-cli doctor/setup code as one APE; the remaining blocker list is now
@@ -188,6 +200,10 @@ A true universal rocm-cli binary is accepted only when:
 7. Mutating install/uninstall/config operations still require clear approval.
 8. The executable does not claim GPU readiness unless the AMD runtime needed by
    the selected workflow is actually available.
+
+Current status on 2026-06-06: criteria 1-8 pass on Windows and WSL for the
+local `gfx1201` host. Native Linux validation and production release-pipeline
+promotion remain open.
 
 ## Automation
 

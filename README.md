@@ -37,8 +37,7 @@ rocm doctor
 Serve a local model:
 
 ```bash
-rocm engines install pytorch
-rocm serve qwen --engine pytorch --managed
+rocm serve qwen --engine lemonade --managed
 ```
 
 ## Developer Checks

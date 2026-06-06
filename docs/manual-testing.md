@@ -7,6 +7,15 @@ the same commands in a shell.
 For normal users, keep the flow simple: install rocm-cli, run `rocm`, choose a
 ROCm folder, approve setup, and then use the main TUI.
 
+When validating release behavior, use the single universal binary:
+
+```text
+.rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
+```
+
+On Windows, run it directly. On WSL/Linux, run the same file through `sh` so the
+Linux path is used.
+
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should
 detect the right TheRock package family or tell the user what is missing.
 
@@ -43,10 +52,16 @@ Expected result:
 - The setup shows a recommended ROCm folder.
 - The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
   can see that pip downloads stay inside the chosen ROCm folder.
-- Pressing `C` lets the user choose a different folder.
+- The install-folder row opens an interactive folder picker. Arrow keys and the
+  mouse can choose folders; Enter opens or selects; Esc returns without losing
+  the current setup screen.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
+- Install logs show only in the foreground progress card, with PageUp/PageDown
+  and mouse-wheel scrolling.
 - The setup installs ROCm into the folder chosen by the user.
+- After a successful install, setup shows a simple success card and then
+  continues to the main TUI.
 - The setup saves choices so the next `rocm` run opens the main TUI.
 
 If the first run opens the main TUI and expects the user to type `/setup`, this
@@ -102,7 +117,25 @@ python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
 Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup.
 
-## 3. PyTorch GPU Verification
+## 3. Lemonade GPU Verification
+
+Lemonade is the default local assistant/server engine. Serve a small assistant
+model with the managed runtime:
+
+```powershell
+rocm serve qwen --engine lemonade --device gpu_required --managed --foreground --port 11435
+```
+
+Expected result:
+
+- The engine uses ROCm GPU execution.
+- The run does not fall back to CPU or Vulkan.
+- If the GPU cannot be used, the command fails with a clear error.
+- The OpenAI-compatible endpoint answers a simple chat request.
+
+Stop the foreground server with `Ctrl+C`.
+
+## 4. PyTorch GPU Verification
 
 Install or refresh the PyTorch engine:
 
@@ -130,7 +163,7 @@ the recommended low-VRAM `Qwen/Qwen2.5-1.5B-Instruct` assistant recipe.
 
 Stop the foreground server with `Ctrl+C`.
 
-## 4. Local Server Records
+## 5. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:
 
@@ -151,7 +184,7 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
-## 5. llama.cpp GPU Verification
+## 6. llama.cpp GPU Verification
 
 Install or refresh the llama.cpp engine:
 
@@ -185,7 +218,35 @@ This test downloads or reuses a tiny GGUF model, launches llama.cpp with GPU
 required, checks the HTTP endpoint, and verifies that the loaded ROCm libraries
 come from the managed TheRock runtime.
 
-## 6. Optional Cloud Provider Key
+## 7. ComfyUI Verification
+
+ComfyUI is managed as an app surface. It should start a local web server and
+show the URL to open:
+
+```powershell
+rocm comfyui install --yes
+rocm comfyui start --yes --port 18188
+rocm comfyui status
+rocm comfyui stop --yes
+```
+
+Expected result:
+
+- ComfyUI installs without replacing the managed ROCm GPU package stack.
+- The server starts on `http://127.0.0.1:18188`.
+- Status shows the local URL and current state.
+- Stop shuts down the saved process.
+
+For the stricter developer GPU test:
+
+```powershell
+python scripts\comfyui_therock_gpu_test.py
+```
+
+This test may download a small checkpoint and submit a cat image workflow
+through the ComfyUI HTTP API.
+
+## 8. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -210,7 +271,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 7. Optional Provider-Assisted Planning
+## 9. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
