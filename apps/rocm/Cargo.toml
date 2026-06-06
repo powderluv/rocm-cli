@@ -25,7 +25,6 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tar = "0.4"
-unicode-width.workspace = true
 ureq = "2.12"
 
 [target.'cfg(target_os = "windows")'.dependencies]

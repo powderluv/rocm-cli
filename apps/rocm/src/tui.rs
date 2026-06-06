@@ -59,7 +59,6 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
 
 const GPU_MONITOR_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const GPU_STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
@@ -15766,7 +15765,6 @@ struct ScrollMetrics {
 }
 
 impl ScrollMetrics {
-    #[cfg(test)]
     fn max_offset(self) -> usize {
         self.content_len.saturating_sub(self.viewport_len)
     }
@@ -15806,6 +15804,17 @@ fn text_scroll_metrics(
     scroll_metrics(content_len, viewport_height, usize::from(requested_offset))
 }
 
+fn styled_text_scroll_metrics(
+    text: &Text<'_>,
+    content_width: usize,
+    viewport_height: usize,
+    requested_offset: u16,
+) -> ScrollMetrics {
+    let content_len = styled_text_visual_line_count(text, content_width);
+    let viewport_height = scrollable_text_viewport_len(content_len, viewport_height);
+    scroll_metrics(content_len, viewport_height, usize::from(requested_offset))
+}
+
 fn scrollable_text_viewport_len(content_len: usize, viewport_height: usize) -> usize {
     let viewport_height = viewport_height.max(1);
     if content_len > viewport_height {
@@ -15830,7 +15839,7 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, metrics: ScrollMetrics) {
     if area.width == 0 || area.height == 0 || !metrics.should_draw() {
         return;
     }
-    let mut scrollbar_state = ScrollbarState::new(metrics.content_len)
+    let mut scrollbar_state = ScrollbarState::new(metrics.max_offset().saturating_add(1))
         .position(metrics.offset)
         .viewport_content_length(metrics.viewport_len);
     frame.render_stateful_widget(
@@ -19815,15 +19824,14 @@ fn draw_scrollable_text(
 fn draw_scrollable_styled_text_with_block<'a>(
     frame: &mut Frame<'_>,
     styled_text: Text<'static>,
-    measurement_text: &str,
     area: Rect,
     block: Block<'a>,
     style: Style,
     requested_scroll: u16,
 ) -> ScrollMetrics {
     let inner = block.inner(area);
-    let metrics = text_scroll_metrics(
-        measurement_text,
+    let metrics = styled_text_scroll_metrics(
+        &styled_text,
         usize::from(inner.width.max(1)),
         usize::from(inner.height.max(1)),
         requested_scroll,
@@ -19926,7 +19934,6 @@ fn draw_pending_approval_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     draw_scrollable_styled_text_with_block(
         frame,
         render_modal_approval_text(app, pending),
-        &render_modal_approval(app, pending),
         modal,
         surface_block(&title, approval_modal_border_color(pending)),
         Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
@@ -20740,7 +20747,6 @@ fn draw_command_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
         draw_scrollable_styled_text_with_block(
             frame,
             styled_chat_detail_text(&detail_text),
-            &detail_text,
             area,
             surface_block("ROCm Assistant", THEME_ACCENT),
             Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
@@ -20789,8 +20795,9 @@ fn bounded_chat_session_scroll(text: &str, area: Rect, requested: u16) -> u16 {
     if requested == 0 || text.trim().is_empty() {
         return 0;
     }
-    let metrics = text_scroll_metrics(
-        text,
+    let styled_text = styled_chat_detail_text(text);
+    let metrics = styled_text_scroll_metrics(
+        &styled_text,
         area.width.saturating_sub(2).max(1) as usize,
         area.height.saturating_sub(2).max(1) as usize,
         requested,
@@ -20799,15 +20806,17 @@ fn bounded_chat_session_scroll(text: &str, area: Rect, requested: u16) -> u16 {
 }
 
 fn paragraph_visual_line_count(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let count = text
-        .lines()
-        .map(|line| {
-            let display_width = UnicodeWidthStr::width(line);
-            display_width.saturating_sub(1) / width + 1
-        })
-        .sum::<usize>();
-    count.max(1)
+    Paragraph::new(text.to_owned())
+        .wrap(Wrap { trim: false })
+        .line_count(width.min(u16::MAX as usize) as u16)
+        .max(1)
+}
+
+fn styled_text_visual_line_count(text: &Text<'_>, width: usize) -> usize {
+    Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.min(u16::MAX as usize) as u16)
+        .max(1)
 }
 
 fn draw_logs_view(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -39551,6 +39560,53 @@ Full log
         assert!(
             rendered.contains("wheel detail line 89"),
             "mouse wheel over the conversation should reach the bottom:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn chat_session_scrollbar_thumb_reaches_bottom_at_odd_size() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let answer = (0..110)
+            .map(|index| format!("odd-size scrollbar line {index:03}: wide prompt marker ok"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.push_chat_session_turn(super::ChatSessionRole::Assistant, answer);
+        app.set_input("draft".to_owned());
+        if let Some(state) = app.command_screen.as_mut() {
+            state.detail_scroll = 0;
+        }
+        let width = 107;
+        let height = 23;
+        let _ = render_test_buffer(&app, width, height);
+
+        for _ in 0..140 {
+            super::handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 2,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+        let rendered = render_test_terminal(&app, width, height);
+        let buffer = render_test_buffer(&app, width, height);
+        let scrollbar_x = width - 1;
+        let bottom_arrow_y = (0..height)
+            .rev()
+            .find(|row| buffer[(scrollbar_x, *row)].symbol() == "▼")
+            .expect("chat scrollbar should render a bottom arrow");
+        let above_bottom = buffer[(scrollbar_x, bottom_arrow_y - 1)].symbol();
+
+        assert!(
+            rendered.contains("odd-size scrollbar line 109"),
+            "mouse wheel should reach the bottom at odd terminal sizes:\n{rendered}"
+        );
+        assert_eq!(
+            above_bottom, "█",
+            "scrollbar thumb should touch the bottom arrow at the bottom scroll position:\n{rendered}"
         );
     }
 

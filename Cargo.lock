@@ -1730,7 +1730,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
- "unicode-width 0.2.0",
  "ureq",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
