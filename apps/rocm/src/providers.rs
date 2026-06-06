@@ -10,7 +10,6 @@ use std::time::Duration;
 
 pub(crate) const ROCM_TOOL_SCHEMA_ID: &str = "rocm-tools-v0";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ALIAS: &str = "qwen";
-pub(crate) const BOOTSTRAP_ASSISTANT_MODEL_ID: &str = "Qwen/Qwen3.5-0.8B-Q8_0-llamafile";
 pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-0.6B-GGUF";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = LEMONADE_ASSISTANT_MODEL_ID;
 const LOCAL_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -488,8 +487,6 @@ fn local_service_priority(service: &ManagedServiceRecord) -> usize {
     let model = service.canonical_model_id.as_str();
     if model.eq_ignore_ascii_case(LEMONADE_ASSISTANT_MODEL_ID) {
         0
-    } else if model.eq_ignore_ascii_case(BOOTSTRAP_ASSISTANT_MODEL_ID) {
-        1
     } else {
         usize::MAX
     }
@@ -2132,41 +2129,6 @@ mod tests {
     }
 
     #[test]
-    fn local_provider_accepts_bootstrap_qwen_assistant() -> Result<()> {
-        let (root, paths) = temp_app_paths("local-provider-bootstrap-qwen");
-        paths.ensure()?;
-        let bootstrap_server = spawn_models_only_server(BOOTSTRAP_ASSISTANT_MODEL_ID)?;
-
-        let mut bootstrap = ManagedServiceRecord::new(
-            &paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            BOOTSTRAP_ASSISTANT_MODEL_ID,
-            "127.0.0.1",
-            bootstrap_server.port(),
-            "bootstrap",
-            124,
-            None,
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        bootstrap.status = "ready".to_owned();
-        bootstrap.write()?;
-
-        let selected = select_local_chat_service(&paths, None)?;
-        let status = provider_status(&paths, "local")?;
-        let served = bootstrap_server.stop()?;
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(selected.service_id, "svc-bootstrap-qwen");
-        assert_eq!(selected.canonical_model_id, BOOTSTRAP_ASSISTANT_MODEL_ID);
-        assert_eq!(status.auth_status, "ready");
-        assert!(served > 0);
-        Ok(())
-    }
-
-    #[test]
     fn local_provider_accepts_lemonade_qwen_assistant() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-lemonade-qwen");
         paths.ensure()?;
@@ -2205,25 +2167,25 @@ mod tests {
     fn local_provider_prefers_lemonade_over_stale_builtin_services() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-prefers-lemonade");
         paths.ensure()?;
-        let stale_bootstrap_server = spawn_models_only_server("not-the-bootstrap-model")?;
+        let stale_custom_server = spawn_models_only_server("not-the-built-in-model")?;
         let lemonade_server = spawn_models_only_server(LEMONADE_ASSISTANT_MODEL_ID)?;
 
-        let mut bootstrap = ManagedServiceRecord::new(
+        let mut custom = ManagedServiceRecord::new(
             &paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            BOOTSTRAP_ASSISTANT_MODEL_ID,
+            "svc-custom-qwen",
+            "pytorch",
+            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-4B",
             "127.0.0.1",
-            stale_bootstrap_server.port(),
-            "bootstrap",
+            stale_custom_server.port(),
+            "managed",
             124,
             None,
             None,
             Some("gpu_required".to_owned()),
         );
-        bootstrap.status = "ready".to_owned();
-        bootstrap.write()?;
+        custom.status = "ready".to_owned();
+        custom.write()?;
 
         let mut lemonade = ManagedServiceRecord::new(
             &paths,
@@ -2243,7 +2205,7 @@ mod tests {
         lemonade.write()?;
 
         let selected = select_local_chat_service(&paths, None)?;
-        let stale_served = stale_bootstrap_server.stop()?;
+        let stale_served = stale_custom_server.stop()?;
         let lemonade_served = lemonade_server.stop()?;
         fs::remove_dir_all(root).ok();
 

@@ -59,17 +59,6 @@ not the platform-native standalone copy above. Use the universal artifact for
 release-style end-to-end tests unless a test is explicitly about native
 development builds.
 
-Run the historical offline bootstrap/launcher validation harness only when
-working on the old APE spike:
-
-```bash
-python scripts/bootstrap_packaging_validation.py --self-test
-python scripts/ape_bootstrap_package.py self-test
-```
-
-Those fixture-backed harnesses cover the superseded embedded-llamafile APE
-experiment. They are not required for the current deterministic setup path.
-
 Run the true no-extract Cosmopolitan feasibility probe when working on the
 universal-binary plan:
 
@@ -80,7 +69,8 @@ python scripts/cosmopolitan_feasibility.py probe
 
 This probe reports whether the local Rust toolchain exposes a Cosmopolitan/APE
 target, whether a `cosmocc` compiler is available, and whether repo wording
-still separates platform-native binaries from self-extracting APE launchers.
+still separates platform-native helper artifacts from the true no-extract
+Rust/Cosmopolitan APE.
 
 Run the current clean Rust/Cosmopolitan APE rebuild when working on the true
 single-file rocm-cli artifact:
@@ -154,38 +144,6 @@ The WSL output must include `os: linux` and `wsl: true`, and must not include
 Use isolated `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`, and
 `ROCM_CLI_CACHE_DIR` roots for smoke tests, then delete those roots after the
 test so the user's real `.rocm` state stays clean.
-
-Run the bootstrap workflow acceptance harness:
-
-```bash
-python scripts/bootstrap_workflow_acceptance.py
-```
-
-This harness belongs to the superseded embedded-bootstrap-assistant path. The
-current `rocm bootstrap assistant` compatibility command opens the deterministic
-setup wizard in an interactive terminal instead of launching a model server.
-
-Run the real bootstrap GPU smoke only when revisiting the superseded embedded
-llamafile bootstrap experiment:
-
-```powershell
-python scripts\bootstrap_real_gpu_smoke.py --skip-build `
-  --llamafile .rocm-work\real-bootstrap\Qwen3.5-0.8B-Q8_0.llamafile.exe `
-  --rocm-backend .rocm-work\real-bootstrap\ggml-rocm-therock-gfx1201-patched.dll `
-  --runtime-dir D:\jam\venv\Lib\site-packages\_rocm_sdk_core\bin `
-  --runtime-dir D:\jam\venv\Lib\site-packages\_rocm_sdk_libraries_gfx120X_all\bin
-```
-
-Unlike `bootstrap_workflow_acceptance.py`, this is not a fake-server test. It
-stages the real llamafile, real ROCm sidecar, and real runtime libraries, starts
-the embedded assistant with `gpu_required`, calls `/health` and
-`/v1/chat/completions`, rejects CPU fallback/invalid code-object logs, and
-checks that the child server stops. This path is not part of the current
-deterministic setup/bootstrap release target.
-
-The bootstrap packaging self-tests also use per-process roots by default, so
-Windows and WSL agents can run them in parallel without deleting each other's
-fixtures.
 
 Focused doctor guidance coverage:
 

@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Build rocm-cli release artifacts.
+"""Build platform-native rocm-cli release artifacts.
 
-The active release command is `standalone`, which copies the platform-native
-`rocm`/`rocm.exe` binary itself. That artifact is self-contained for the CLI,
-but it is not a Cosmopolitan universal binary.
-
-The `universal` and `build-ape` commands are compatibility/spike tooling for a
-Cosmopolitan-built self-extracting launcher. They produce one distributable file
-that carries Windows and Linux release payloads, extracts one, and delegates to
-it. That is useful to test APE behavior, but it is not the same thing as a true
-no-extract Cosmopolitan build of rocm-cli.
+This helper copies or archives the native `rocm`/`rocm.exe` binary for the
+current platform. It is useful for development packages, but it is not the
+Cosmopolitan universal-binary release path. Use
+`scripts/rust_cosmopolitan_spike.py build-rocm --release` and
+`scripts/single_exe_release_gate.py` for the true no-extract universal binary.
 """
 
 from __future__ import annotations
@@ -23,7 +19,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -43,14 +38,6 @@ WINDOWS_BINARIES = [
 ]
 LINUX_BINARIES = [name[:-4] for name in WINDOWS_BINARIES]
 PLATFORMS = {"windows-amd64", "linux-amd64"}
-BACKEND_NAME_BY_PLATFORM = {
-    "windows-amd64": "ggml-rocm.dll",
-    "linux-amd64": "ggml-rocm.so",
-}
-RUNTIME_DIR_BY_PLATFORM = {
-    "windows-amd64": "windows-runtime",
-    "linux-amd64": "linux-runtime",
-}
 
 
 class ReleaseBuildError(Exception):
@@ -301,150 +288,6 @@ def build_standalone_release(
     return destination
 
 
-def sorted_files(directory: Path) -> list[Path]:
-    if not directory.is_dir():
-        raise ReleaseBuildError(f"directory not found: {directory}")
-    return sorted(path for path in directory.iterdir() if path.is_file())
-
-
-def stage_runtime(
-    *,
-    output_dir: Path,
-    platform: str,
-    rocm_backend: Path,
-    runtime_dir: Path,
-    strip_debug: bool,
-) -> None:
-    if platform not in PLATFORMS:
-        raise ReleaseBuildError(f"platform must be one of {sorted(PLATFORMS)}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    backend_name = BACKEND_NAME_BY_PLATFORM[platform]
-    backend_target = output_dir / backend_name
-    copy_required(rocm_backend, backend_target)
-    if strip_debug:
-        maybe_strip(backend_target, platform=platform, strip_debug_only=True)
-
-    runtime_target = output_dir / RUNTIME_DIR_BY_PLATFORM[platform]
-    if runtime_target.exists():
-        shutil.rmtree(runtime_target)
-    runtime_target.mkdir(parents=True)
-    for source in sorted_files(runtime_dir):
-        target = runtime_target / source.name
-        copy_required(source, target)
-        if strip_debug and (source.suffix.lower() in {".dll", ".so"} or ".so." in source.name):
-            maybe_strip(target, platform=platform, strip_debug_only=True)
-    print(f"wrote {backend_target}")
-    print(f"wrote {runtime_target}")
-
-
-def build_ape(args: argparse.Namespace) -> Path:
-    output = args.output.resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    manifest = args.manifest.resolve()
-    runtime_args: list[str] = []
-    for path in sorted_files(args.windows_runtime_dir.resolve()):
-        runtime_args.extend(["--windows-runtime-dependency", str(path)])
-    for path in sorted_files(args.linux_runtime_dir.resolve()):
-        runtime_args.extend(["--linux-runtime-dependency", str(path)])
-
-    plan_args = [
-        sys.executable,
-        str(SCRIPT_DIR / "ape_bootstrap_package.py"),
-        "plan",
-        "--version",
-        args.version,
-        "--windows-release",
-        str(args.windows_release.resolve()),
-        "--linux-release",
-        str(args.linux_release.resolve()),
-        "--model",
-        str(args.model.resolve()),
-        "--windows-rocm-backend",
-        str(args.windows_rocm_backend.resolve()),
-        "--linux-rocm-backend",
-        str(args.linux_rocm_backend.resolve()),
-        *runtime_args,
-        "--output",
-        str(manifest),
-    ]
-    run(plan_args, cwd=REPO_ROOT)
-    run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "ape_bootstrap_package.py"),
-            "validate",
-            "--manifest",
-            str(manifest),
-        ],
-        cwd=REPO_ROOT,
-    )
-    run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "build_ape_bootstrap.py"),
-            "build",
-            "--manifest",
-            str(manifest),
-            "--output",
-            str(output),
-            "--compiler",
-            str(args.compiler),
-            "--work-dir",
-            str(args.work_dir.resolve()),
-        ],
-        cwd=REPO_ROOT,
-    )
-    write_sha256(output)
-    print(f"wrote {output}")
-    print(f"sha256 {sha256_file(output)}")
-    return output
-
-
-def archive_path_for(output_dir: Path, *, version: str, platform: str) -> Path:
-    suffix = ".zip" if platform == "windows-amd64" else ".tar.gz"
-    return output_dir / f"rocm-cli-v{version}-{platform}{suffix}"
-
-
-def build_universal(args: argparse.Namespace) -> Path:
-    archive_dir = args.archive_dir.resolve()
-    windows_release = (args.windows_release or archive_path_for(archive_dir, version=args.version, platform="windows-amd64")).resolve()
-    linux_release = (args.linux_release or archive_path_for(archive_dir, version=args.version, platform="linux-amd64")).resolve()
-    if not windows_release.is_file():
-        raise ReleaseBuildError(
-            f"missing Windows release archive: {windows_release}; "
-            "run stage-platform on Windows first or pass --windows-release"
-        )
-    if not linux_release.is_file():
-        raise ReleaseBuildError(
-            f"missing Linux release archive: {linux_release}; "
-            "run stage-platform on Linux/WSL first or pass --linux-release"
-        )
-    output = (args.output or (args.output_dir / "rocm.exe")).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable,
-        str(SCRIPT_DIR / "build_ape_bootstrap.py"),
-        "build-universal",
-        "--windows-release",
-        str(windows_release),
-        "--linux-release",
-        str(linux_release),
-        "--output",
-        str(output),
-        "--compiler",
-        str(args.compiler),
-        "--work-dir",
-        str(args.work_dir.resolve()),
-        "--version",
-        args.launcher_cache_version,
-    ]
-    run(command, cwd=REPO_ROOT)
-    write_sha256(output)
-    print(f"wrote {output}")
-    print(f"sha256 {sha256_file(output)}")
-    return output
-
-
 def run_self_test(root: Path) -> None:
     if root.exists():
         shutil.rmtree(root)
@@ -503,53 +346,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     stage = subparsers.add_parser("stage-platform", help="Build and archive the current platform payload.")
     stage.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    stage.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release")
+    stage.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "platform-release")
     stage.add_argument("--version", default="0.2.0")
     stage.add_argument("--platform", choices=sorted(PLATFORMS), default=current_platform())
     stage.add_argument("--skip-cargo-build", action="store_true")
     stage.add_argument("--no-strip", action="store_true")
     stage.add_argument("--jobs", type=int, default=96)
-
-    runtime = subparsers.add_parser("stage-runtime", help="Copy and strip ROCm runtime sidecars.")
-    runtime.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release")
-    runtime.add_argument("--platform", choices=sorted(PLATFORMS), default=current_platform())
-    runtime.add_argument("--rocm-backend", type=Path, required=True)
-    runtime.add_argument("--runtime-dir", type=Path, required=True)
-    runtime.add_argument("--no-strip", action="store_true")
-
-    ape = subparsers.add_parser("build-ape", help="Build the historical embedded-bootstrap self-extracting APE from staged inputs.")
-    ape.add_argument("--version", default="0.2.0-release-min-20260604")
-    ape.add_argument("--manifest", type=Path, required=True)
-    ape.add_argument("--output", type=Path, required=True)
-    ape.add_argument("--windows-release", type=Path, required=True)
-    ape.add_argument("--linux-release", type=Path, required=True)
-    ape.add_argument("--model", type=Path, required=True)
-    ape.add_argument("--windows-rocm-backend", type=Path, required=True)
-    ape.add_argument("--linux-rocm-backend", type=Path, required=True)
-    ape.add_argument("--windows-runtime-dir", type=Path, required=True)
-    ape.add_argument("--linux-runtime-dir", type=Path, required=True)
-    ape.add_argument("--compiler", required=True)
-    ape.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release" / "builder")
-
-    universal = subparsers.add_parser(
-        "universal",
-        help="Build the self-extracting APE compatibility launcher from staged platform archives.",
-    )
-    universal.add_argument("--version", default="0.2.0", help="Release archive version to consume.")
-    universal.add_argument(
-        "--launcher-cache-version",
-        "--universal-version",
-        dest="launcher_cache_version",
-        default="0.2.0-self-extracting",
-        help="Version key used by the self-extracting launcher's extraction cache.",
-    )
-    universal.add_argument("--archive-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "ape-min-release")
-    universal.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "standalone-release")
-    universal.add_argument("--output", type=Path)
-    universal.add_argument("--windows-release", type=Path)
-    universal.add_argument("--linux-release", type=Path)
-    universal.add_argument("--compiler", required=True)
-    universal.add_argument("--work-dir", type=Path, default=REPO_ROOT / ".rocm-work" / "self-extracting-ape-release" / "builder")
 
     self_test = subparsers.add_parser("self-test", help="Run offline archive policy tests.")
     self_test.add_argument(
@@ -585,21 +387,6 @@ def main(argv: list[str] | None = None) -> int:
                 strip_binaries=not args.no_strip,
                 jobs=args.jobs,
             )
-            return 0
-        if args.command == "stage-runtime":
-            stage_runtime(
-                output_dir=args.output_dir.resolve(),
-                platform=args.platform,
-                rocm_backend=args.rocm_backend.resolve(),
-                runtime_dir=args.runtime_dir.resolve(),
-                strip_debug=not args.no_strip,
-            )
-            return 0
-        if args.command == "build-ape":
-            build_ape(args)
-            return 0
-        if args.command == "universal":
-            build_universal(args)
             return 0
         if args.command == "self-test":
             run_self_test(args.root.resolve())

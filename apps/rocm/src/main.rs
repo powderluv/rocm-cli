@@ -58,7 +58,7 @@ enum Command {
     #[command(hide = true)]
     Bootstrap {
         #[command(subcommand)]
-        command: bootstrap::BootstrapCommand,
+        command: Option<bootstrap::BootstrapCommand>,
     },
     Setup {
         #[command(subcommand)]
@@ -5584,12 +5584,6 @@ pub(crate) fn render_chat_prompt_result(
     render_chat_prompt_result_with_progress(paths, provider, model, prompt, rocm_tools, None)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ChatToolPolicy {
-    General,
-    Bootstrap,
-}
-
 pub(crate) fn render_chat_prompt_result_with_progress(
     paths: &AppPaths,
     provider: &str,
@@ -5598,26 +5592,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     rocm_tools: bool,
     progress: Option<&mut dyn FnMut(String)>,
 ) -> Result<ChatPromptResult> {
-    render_chat_prompt_result_with_policy_and_progress(
-        paths,
-        provider,
-        model,
-        prompt,
-        rocm_tools,
-        ChatToolPolicy::General,
-        progress,
-    )
-}
-
-pub(crate) fn render_chat_prompt_result_with_policy_and_progress(
-    paths: &AppPaths,
-    provider: &str,
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-    policy: ChatToolPolicy,
-    mut progress: Option<&mut dyn FnMut(String)>,
-) -> Result<ChatPromptResult> {
+    let mut progress = progress;
     let user_prompt = latest_user_chat_message(prompt);
     if rocm_tools && let Some(approval) = install_sdk_without_prefix_chat_approval(user_prompt) {
         report_chat_tool_progress(&mut progress, "Asking the assistant.");
@@ -5632,11 +5607,7 @@ pub(crate) fn render_chat_prompt_result_with_policy_and_progress(
     if rocm_tools {
         messages.push(providers::ChatMessage {
             role: "system".to_owned(),
-            content: match policy {
-                ChatToolPolicy::General => ROCM_CHAT_TOOL_SYSTEM_PROMPT,
-                ChatToolPolicy::Bootstrap => ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT,
-            }
-            .to_owned(),
+            content: ROCM_CHAT_TOOL_SYSTEM_PROMPT.to_owned(),
         });
     }
     messages.push(providers::ChatMessage {
@@ -5646,23 +5617,12 @@ pub(crate) fn render_chat_prompt_result_with_policy_and_progress(
     let mut response = if rocm_tools {
         report_chat_tool_progress(&mut progress, "Asking the assistant.");
         if let Some(call) = deterministic_mutating_tool_call_for_prompt(user_prompt)? {
-            if policy == ChatToolPolicy::Bootstrap
-                && validate_bootstrap_chat_tool_call(&call).is_err()
-            {
-                providers::ChatResponse {
-                    provider: provider.to_owned(),
-                    model: model.unwrap_or("local").to_owned(),
-                    content: BOOTSTRAP_TOOL_POLICY_MESSAGE.to_owned(),
-                    tool_calls: Vec::new(),
-                }
-            } else {
-                report_chat_tool_progress(&mut progress, "Preparing a review card.");
-                providers::ChatResponse {
-                    provider: provider.to_owned(),
-                    model: model.unwrap_or("local").to_owned(),
-                    content: deterministic_mutating_tool_intro(&call),
-                    tool_calls: vec![call],
-                }
+            report_chat_tool_progress(&mut progress, "Preparing a review card.");
+            providers::ChatResponse {
+                provider: provider.to_owned(),
+                model: model.unwrap_or("local").to_owned(),
+                content: deterministic_mutating_tool_intro(&call),
+                tool_calls: vec![call],
             }
         } else {
             match providers::provider_chat(
@@ -5739,14 +5699,7 @@ pub(crate) fn render_chat_prompt_result_with_policy_and_progress(
     let tool_result = if rocm_tools {
         let explanation = (!fallback_tool_call_used && !initial_content.trim().is_empty())
             .then_some(initial_content.as_str());
-        append_chat_tool_results(
-            paths,
-            &response,
-            &mut output,
-            explanation,
-            policy,
-            &mut progress,
-        )?
+        append_chat_tool_results(paths, &response, &mut output, explanation, &mut progress)?
     } else {
         ChatToolRunResult {
             approval: None,
@@ -6513,8 +6466,6 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 
 const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer the recommended low-VRAM assistant model qwen when available, which maps to Qwen3-0.6B-GGUF with Lemonade and gpu_required. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 
-const ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's first-time setup helper for AMD ROCm/TheRock. Your job is narrow: help the user check this computer, choose a ROCm/TheRock Python folder, install ROCm/TheRock into that folder, keep an existing ROCm setup, or uninstall a ROCm CLI-managed setup. Speak in short, simple English for non-technical users. Treat the conversation state as important: if the user has already chosen a folder, preserve it exactly; if ROCm CLI says an install already exists, ask whether to keep using it, reinstall into a chosen folder, or uninstall it. Allowed tool use: doctor, gpu_snapshot, bridge_snapshot, path_exists, update_check, install_sdk_dry_run, install_sdk, and rocm_command only for doctor, version, config show, runtimes list, runtimes uninstall, setup reset, or install sdk. For ROCm/TheRock installs, never invent a default folder. If the user asks to install or reinstall without a folder, ask them to choose a folder; ROCm CLI may open a folder picker for them. If the user gives a folder, request install sdk with --channel release --format pip --prefix PATH, preserving any requested --build-date YYYY-MM-DD or --version VERSION. Read-only checks may run immediately. Installs, reinstalls, uninstalls, and setup reset require a ROCm CLI review card before anything changes. Do not help install or manage ComfyUI, llama.cpp, vLLM, sglang, engines, model servers, automations, provider keys, or settings during first-time setup; tell the user those are available after ROCm is ready in the main assistant. Do not request shell commands, package managers, public network binding, or CPU fallback. Do not describe ROCm as anything other than AMD ROCm/TheRock.";
-
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -6611,7 +6562,6 @@ fn append_chat_tool_results(
     response: &providers::ChatResponse,
     output: &mut String,
     assistant_explanation: Option<&str>,
-    policy: ChatToolPolicy,
     progress: &mut Option<&mut dyn FnMut(String)>,
 ) -> Result<ChatToolRunResult> {
     if response.tool_calls.is_empty() {
@@ -6641,17 +6591,6 @@ fn append_chat_tool_results(
                 output,
                 "    not run: choose an install folder before the review card"
             );
-            continue;
-        }
-        if policy == ChatToolPolicy::Bootstrap
-            && let Err(error) = validate_bootstrap_chat_tool_call(call)
-        {
-            report_chat_tool_progress(progress, "Bootstrap guide refused a non-setup action.");
-            let message = error.to_string();
-            let _ = writeln!(output, "  Bootstrap setup: not allowed");
-            let _ = writeln!(output, "    {message}");
-            let _ = writeln!(follow_up_text, "bootstrap_policy:");
-            let _ = writeln!(follow_up_text, "{message}");
             continue;
         }
         validate_chat_tool_call(call)?;
@@ -6733,45 +6672,6 @@ fn rocm_command_args_install_sdk_without_prefix(
             .get(1)
             .is_some_and(|arg| arg.eq_ignore_ascii_case("sdk"))
         && chat_cli_arg_value(&args, "--prefix").is_none()
-}
-
-fn validate_bootstrap_chat_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    validate_chat_tool_call(call)?;
-    match call.name.as_str() {
-        "doctor"
-        | "gpu_snapshot"
-        | "bridge_snapshot"
-        | "path_exists"
-        | "install_sdk_dry_run"
-        | "update_check"
-        | "install_sdk" => Ok(()),
-        "rocm_command" => {
-            let args = normalized_chat_rocm_command_args(call)?;
-            validate_bootstrap_rocm_command_args(&args)
-        }
-        _ => bail!("{BOOTSTRAP_TOOL_POLICY_MESSAGE}"),
-    }
-}
-
-const BOOTSTRAP_TOOL_POLICY_MESSAGE: &str = "During first-time setup I can only check this computer or prepare ROCm/TheRock install and uninstall steps. Finish ROCm setup first, then the main assistant can help with ComfyUI, llama.cpp, vLLM, settings, and model servers.";
-
-fn validate_bootstrap_rocm_command_args(args: &[String]) -> Result<()> {
-    let first = args.first().map(|value| value.to_ascii_lowercase());
-    let second = args.get(1).map(|value| value.to_ascii_lowercase());
-    match first.as_deref() {
-        Some("doctor" | "version") => Ok(()),
-        Some("runtimes")
-            if second
-                .as_deref()
-                .is_none_or(|value| matches!(value, "list" | "uninstall")) =>
-        {
-            Ok(())
-        }
-        Some("config") if second.as_deref() == Some("show") => Ok(()),
-        Some("install") if second.as_deref() == Some("sdk") => Ok(()),
-        Some("setup") if second.as_deref() == Some("reset") => Ok(()),
-        _ => bail!("{BOOTSTRAP_TOOL_POLICY_MESSAGE}"),
-    }
 }
 
 pub(crate) fn chat_tool_approval_request(
@@ -14451,31 +14351,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_assistant_prompt_is_narrow_and_stateful() {
-        for expected in [
-            "first-time setup helper",
-            "choose a ROCm/TheRock Python folder",
-            "keep an existing ROCm setup",
-            "uninstall a ROCm CLI-managed setup",
-            "preserve it exactly",
-            "Allowed tool use",
-            "install sdk",
-            "--prefix PATH",
-            "review card",
-            "during first-time setup",
-            "Do not request shell commands",
-            "AMD ROCm/TheRock",
-        ] {
-            assert!(
-                ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT.contains(expected),
-                "bootstrap prompt should mention {expected}"
-            );
-        }
-        assert!(!ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT.contains("NVIDIA"));
-        assert!(!ROCM_BOOTSTRAP_TOOL_SYSTEM_PROMPT.contains("CUDA"));
-    }
-
-    #[test]
     fn deterministic_rocm_tool_summary_interprets_managed_runtime_as_installed() {
         let summary = deterministic_rocm_tool_summary(
             "\
@@ -15092,7 +14967,6 @@ model recipes
             &response,
             &mut output,
             Some("I can install ROCm."),
-            ChatToolPolicy::General,
             &mut progress,
         )?;
 
@@ -15290,79 +15164,6 @@ model recipes
             }
         }
         Ok(())
-    }
-
-    #[test]
-    fn bootstrap_tool_policy_blocks_after_setup_actions_without_review_card() -> Result<()> {
-        let (_root, paths) = test_paths("bootstrap-tool-policy-block");
-        for prompt in [
-            "Can you setup ComfyUI for me?",
-            "Can you setup and serve an LLM for me?",
-        ] {
-            let result = render_chat_prompt_result_with_policy_and_progress(
-                &paths,
-                "local",
-                None,
-                prompt,
-                true,
-                ChatToolPolicy::Bootstrap,
-                None,
-            )?;
-            assert!(result.approval.is_none(), "{prompt}");
-            assert!(
-                result.rendered.contains("During first-time setup"),
-                "{prompt}: {}",
-                result.rendered
-            );
-            assert!(!result.rendered.contains("Install ComfyUI"), "{prompt}");
-            assert!(
-                !result.rendered.contains("Start local model server"),
-                "{prompt}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_tool_policy_allows_setup_status_install_and_uninstall() {
-        for call in [
-            providers::ChatToolCall {
-                id: None,
-                name: "doctor".to_owned(),
-                arguments: serde_json::json!({}),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({ "args": ["runtimes", "list"] }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({
-                    "args": ["install", "sdk", "--channel", "release", "--format", "pip", "--prefix", "D:\\jam\\temp\\therock_venvs"]
-                }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({ "args": ["runtimes", "uninstall", "release-pip-gfx120x-all"] }),
-            },
-        ] {
-            validate_bootstrap_chat_tool_call(&call)
-                .unwrap_or_else(|error| panic!("call should be allowed: {call:?}: {error}"));
-        }
-
-        let serve = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "pytorch", "--device", "gpu_required", "--managed"]
-            }),
-        };
-        let error = validate_bootstrap_chat_tool_call(&serve)
-            .expect_err("bootstrap should not allow serving");
-        assert!(error.to_string().contains("During first-time setup"));
     }
 
     #[test]
@@ -16056,8 +15857,7 @@ install therock";
             );
         }
         Cli::try_parse_from(["rocm", "setup"]).expect("setup should parse");
-        Cli::try_parse_from(["rocm", "bootstrap", "assistant", "--validate-only"])
-            .expect("bootstrap assistant should parse");
+        Cli::try_parse_from(["rocm", "bootstrap"]).expect("bootstrap setup should parse");
         Cli::try_parse_from(["rocm", "setup", "status"]).expect("setup status should parse");
         Cli::try_parse_from(["rocm", "setup", "reset"]).expect("setup reset should parse");
         Cli::try_parse_from(["rocm", "models"]).expect("models alias should parse");

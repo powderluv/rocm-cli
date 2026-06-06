@@ -1,17 +1,17 @@
 # Cosmopolitan Universal Binary Plan
 
 This document defines what "single universal binary" means for rocm-cli and
-separates it from the self-extracting APE launcher spike.
+separates it from the retired payload-delegating APE launcher spike.
 
 ## Definitions
 
 - **Platform-native standalone**: the Rust `rocm` or `rocm.exe` binary built for
   one OS. This remains useful for development, but it is not the target
   release shape for the single-exe work.
-- **Self-extracting APE launcher**: a small Cosmopolitan C executable with a ZIP
-  payload appended. It extracts a Windows or Linux Rust release payload and then
-  delegates to that native binary. This is a compatibility spike, not the final
-  universal binary.
+- **Payload-delegating APE launcher**: a retired compatibility spike that
+  appended platform-specific release payloads to a small launcher and delegated
+  to one of them at runtime. It is not the final universal binary and is no
+  longer active in this tree.
 - **True no-extract APE**: the actual rocm-cli program is compiled and linked as
   one Cosmopolitan executable. The executable can run on supported OSes without
   unpacking separate `rocm.exe`/`rocm` binaries first.
@@ -53,14 +53,6 @@ The repo currently has these runnable artifact paths:
   - builds/copies the platform-native Rust `rocm` or `rocm.exe`;
   - no extraction;
   - not universal across OSes.
-- `scripts/build_single_exe_release.py universal`
-  - builds a Cosmopolitan C wrapper;
-  - appends Windows and Linux platform release archives;
-  - extracts the matching payload to a cache and delegates to that binary;
-  - one file to distribute, but not a true no-extract rocm-cli binary.
-
-The self-extracting launcher remains useful only as a compatibility fallback or
-as an APE behavior test bed. It must not be presented as the final answer.
 
 As of 2026-06-06, the repo has a true Rust/Cosmopolitan feasibility
 builder:
@@ -223,7 +215,7 @@ python scripts/cosmopolitan_feasibility.py probe \
 ```
 
 The probe is intentionally small. It should fail loudly if repo wording drifts
-back to calling the self-extracting wrapper a true universal binary.
+back to calling any payload-delegating wrapper a true universal binary.
 
 Build the current Rust APE from a clean workspace-local tool cache:
 

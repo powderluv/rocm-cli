@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """Probe the true no-extract Cosmopolitan binary path.
 
-This script deliberately separates three release shapes:
-
-- platform-native standalone: the normal Rust `rocm` or `rocm.exe` binary;
-- self-extracting APE launcher: a Cosmopolitan C launcher that extracts and
-  delegates to platform-native Rust payloads;
-- true no-extract APE: the actual rocm-cli program compiled and linked as a
-  Cosmopolitan executable.
-
-The current repo can build the first two shapes. The third shape is the target
-for the next spike, and this probe makes the missing pieces visible.
+This script verifies the local Rust/Cosmopolitan prerequisites and checks that
+repo wording still separates platform-native helper artifacts from the true
+universal rocm-cli APE built by `rust_cosmopolitan_spike.py`.
 """
 
 from __future__ import annotations
@@ -114,14 +107,14 @@ def compile_minimal_c_ape(compiler: str, work_dir: Path) -> Path:
 def repo_contract_messages() -> list[str]:
     release_script = (REPO_ROOT / "scripts" / "build_single_exe_release.py").read_text(encoding="utf-8")
     messages: list[str] = []
-    if "self-extracting APE compatibility launcher" in release_script:
-        messages.append("release script labels APE wrapper as self-extracting compatibility tooling")
+    if "Cosmopolitan universal-binary release path" in release_script:
+        messages.append("platform-native release helper is explicitly not the universal-binary path")
     else:
-        raise FeasibilityError("release script does not clearly label the APE wrapper as self-extracting compatibility tooling")
-    if "not a Cosmopolitan universal binary" in release_script:
-        messages.append("standalone release is explicitly not called a Cosmopolitan universal binary")
+        raise FeasibilityError("native release helper wording does not distinguish platform-native from universal")
+    if "rust_cosmopolitan_spike.py" in release_script and "single_exe_release_gate.py" in release_script:
+        messages.append("release helper points universal builds to the Rust/Cosmopolitan scripts")
     else:
-        raise FeasibilityError("standalone release wording does not distinguish platform-native from Cosmopolitan universal")
+        raise FeasibilityError("release helper does not point universal builds to the Rust/Cosmopolitan scripts")
     return messages
 
 

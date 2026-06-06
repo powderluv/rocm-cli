@@ -241,14 +241,6 @@ pub fn run(initial_provider: Option<String>) -> Result<()> {
     run_app(&mut app)
 }
 
-#[allow(dead_code)]
-pub(crate) fn run_bootstrap_assistant(service: ManagedServiceRecord) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let mut app = App::new(paths, Some("local".to_owned()));
-    app.open_bootstrap_assistant_chat_session(service);
-    run_app(&mut app)
-}
-
 pub(crate) fn run_bootstrap_setup() -> Result<()> {
     let paths = AppPaths::discover()?;
     let mut app = App::new(paths, Some("local".to_owned()));
@@ -623,7 +615,6 @@ struct ChatSessionState {
     service_id: Option<String>,
     endpoint_url: Option<String>,
     turns: Vec<ChatSessionTurn>,
-    bootstrap_ui: bool,
     pending_install_args: Option<Vec<String>>,
 }
 
@@ -5901,7 +5892,6 @@ impl App {
                     service_id: service_id.clone(),
                     endpoint_url: endpoint_url.clone(),
                     turns: Vec::new(),
-                    bootstrap_ui: false,
                     pending_install_args: None,
                 });
             session.provider = "local".to_owned();
@@ -6013,35 +6003,6 @@ impl App {
 
     fn local_chat_service_available(&self, model: Option<&str>) -> bool {
         self.ready_local_chat_record_for_model(model).is_some()
-    }
-
-    fn open_bootstrap_assistant_chat_session(&mut self, service: ManagedServiceRecord) {
-        self.onboarding_active = false;
-        self.home_dashboard_visible = false;
-        self.transcript.clear();
-        self.clear_input();
-        self.open_local_rocm_tools_chat_session(Some(service));
-        if let Some(state) = self.command_screen.as_mut()
-            && let Some(session) = state.chat_session.as_mut()
-        {
-            session.bootstrap_ui = true;
-            state.selected = 0;
-            state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
-        }
-        self.status = "Qwen assistant is ready. It will help you set up ROCm.".to_owned();
-        let Some(model) = self
-            .command_screen
-            .as_ref()
-            .and_then(|state| state.chat_session.as_ref())
-            .and_then(|session| session.model.clone())
-        else {
-            return;
-        };
-        let prompt = bootstrap_assistant_start_prompt_for_state(setup_has_current_install(
-            &self.paths,
-            &self.config,
-        ));
-        self.start_chat_stream(prompt, false, Some(model));
     }
 
     fn handle_managed_serve_completion(&mut self, rendered: &str) {
@@ -8117,21 +8078,6 @@ impl App {
             self.status = "Assistant replied.".to_owned();
             return true;
         }
-        if self.current_chat_session_is_bootstrap()
-            && let Some(reply) = bootstrap_unclear_prompt_reply(&prompt)
-        {
-            self.push_chat_session_turn(ChatSessionRole::User, prompt);
-            self.push_chat_session_turn(ChatSessionRole::Assistant, reply);
-            if let Some(state) = self.command_screen.as_mut() {
-                state.message = None;
-                state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
-            }
-            self.status = "Type a clear setup request.".to_owned();
-            return true;
-        }
-        if self.handle_bootstrap_limited_prompt(&prompt) {
-            return true;
-        }
         if let Some(approval) = crate::install_sdk_chat_approval_for_prompt(&prompt) {
             self.push_chat_session_turn(ChatSessionRole::User, prompt);
             if chat_install_sdk_approval_needs_prefix(&approval.args) {
@@ -8179,10 +8125,6 @@ impl App {
                 return false;
             };
             let Some(record) = self.ready_local_chat_record_for_session(&session) else {
-                if session.bootstrap_ui {
-                    self.show_bootstrap_assistant_connection_message();
-                    return false;
-                }
                 self.open_local_assistant_start_flow(model);
                 return false;
             };
@@ -8200,10 +8142,6 @@ impl App {
             model
         };
         if self.provider == "local" && !self.local_chat_service_available(model.as_deref()) {
-            if self.current_chat_session_is_bootstrap() {
-                self.show_bootstrap_assistant_connection_message();
-                return false;
-            }
             self.open_local_assistant_start_flow(model);
             return false;
         }
@@ -8217,94 +8155,6 @@ impl App {
             state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         }
         self.start_chat_stream(request_prompt, true, model)
-    }
-
-    fn handle_bootstrap_limited_prompt(&mut self, prompt: &str) -> bool {
-        if !self.current_chat_session_is_bootstrap() {
-            return false;
-        }
-        match classify_bootstrap_prompt(
-            prompt,
-            setup_has_current_install(&self.paths, &self.config),
-        ) {
-            BootstrapPromptIntent::KeepExisting => {
-                self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
-                let message = if setup_has_current_install(&self.paths, &self.config) {
-                    "Okay. ROCm CLI will keep using the existing ROCm/TheRock setup. You can ask me to check your GPU or reinstall later if something looks wrong."
-                } else {
-                    "I do not see a ready ROCm/TheRock setup yet. Choose an install folder when you are ready, and I will show the install review card."
-                };
-                self.push_chat_session_turn(ChatSessionRole::Assistant, message);
-                self.status = "Assistant replied.".to_owned();
-                true
-            }
-            BootstrapPromptIntent::InstallLocation => {
-                self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
-                let message = bootstrap_install_location_reply(&self.paths, &self.config);
-                self.push_chat_session_turn(ChatSessionRole::Assistant, message);
-                if let Some(state) = self.command_screen.as_mut() {
-                    state.message = None;
-                    state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
-                }
-                self.status = "Assistant showed the ROCm install folder.".to_owned();
-                true
-            }
-            BootstrapPromptIntent::Uninstall => {
-                self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
-                let Some(runtime) = current_setup_runtime(&self.paths, &self.config) else {
-                    self.push_chat_session_turn(
-                        ChatSessionRole::Assistant,
-                        "I do not see a ROCm/TheRock install to uninstall. Nothing changed.",
-                    );
-                    self.status = "No ROCm install was found.".to_owned();
-                    return true;
-                };
-                let Some(runtime_key) = runtime.runtime_key.clone() else {
-                    self.push_chat_session_turn(
-                    ChatSessionRole::Assistant,
-                    "I found a ROCm folder, but it is missing the saved install id ROCm CLI needs to uninstall it safely. Open Set Up ROCm or ROCm Installs and choose the install there.",
-                );
-                    self.status = "ROCm install needs attention before uninstall.".to_owned();
-                    return true;
-                };
-                let args = vec![
-                    "runtimes".to_owned(),
-                    "uninstall".to_owned(),
-                    runtime_key.clone(),
-                ];
-                self.push_chat_session_turn(
-                ChatSessionRole::Assistant,
-                "I can uninstall the current ROCm/TheRock install. Review the card before anything is removed.",
-            );
-                self.request_screen_cli_approval_with_explanation(
-                    "Uninstall ROCm",
-                    "Runtimes",
-                    args,
-                    Some(format!("rocm runtimes uninstall {runtime_key}")),
-                    Some("Uninstall the selected ROCm/TheRock install.".to_owned()),
-                );
-                self.status = "Review the ROCm uninstall before anything is removed.".to_owned();
-                true
-            }
-            BootstrapPromptIntent::InstallFolder(folder) => {
-                let args = bootstrap_default_install_sdk_args(prompt);
-                self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
-                self.finish_install_sdk_folder_choice(args, PathBuf::from(folder));
-                true
-            }
-            BootstrapPromptIntent::AfterSetupWork => {
-                self.push_chat_session_turn(ChatSessionRole::User, prompt.to_owned());
-                self.push_chat_session_turn(
-                ChatSessionRole::Assistant,
-                "This first setup assistant is only for checking your AMD GPU and installing or uninstalling ROCm/TheRock. After ROCm is ready, the main ROCm assistant can help install ComfyUI, set up llama.cpp or vLLM, and start larger local models.",
-            );
-                self.status = "Finish ROCm setup before app or model-server actions.".to_owned();
-                true
-            }
-            BootstrapPromptIntent::InstallRocm
-            | BootstrapPromptIntent::AskOrCheck
-            | BootstrapPromptIntent::Other => false,
-        }
     }
 
     fn handle_direct_chat_action_prompt(&mut self, prompt: &str) -> bool {
@@ -8484,36 +8334,10 @@ impl App {
         if !is_plain_casual_input(prompt) {
             return None;
         }
-        Some(if self.current_chat_session_is_bootstrap() {
-            if setup_has_current_install(&self.paths, &self.config) {
-                "Hi. I am here and the embedded Qwen assistant is already running. I found an existing ROCm/TheRock setup. You can ask me to check your GPU, keep using this setup, reinstall ROCm into a folder you choose, or uninstall the current ROCm install. I will show a review card before anything changes."
-                    .to_owned()
-            } else {
-                "Hi. I am here and the embedded Qwen assistant is already running. Tell me where you want the ROCm/TheRock Python folder, or ask what you want to set up. For example: install ROCm in D:\\jam\\temp\\therock_venvs or check my GPU. I will show a review card before anything installs or changes."
-                    .to_owned()
-            }
-        } else {
+        Some(
             "Hi. I am here. Ask me about ROCm setup, local models, ComfyUI, llama.cpp, or what this machine can run. I will ask before making changes."
-                .to_owned()
-        })
-    }
-
-    fn current_chat_session_is_bootstrap(&self) -> bool {
-        self.command_screen
-            .as_ref()
-            .and_then(|state| state.chat_session.as_ref())
-            .is_some_and(|session| session.bootstrap_ui)
-    }
-
-    fn show_bootstrap_assistant_connection_message(&mut self) {
-        if let Some(state) = self.command_screen.as_mut() {
-            state.message = Some(
-                "The embedded Qwen assistant is still starting or lost its connection.\n\nWait a moment and try again. If it keeps happening, close this window and open ROCm CLI again."
-                    .to_owned(),
-            );
-            state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
-        }
-        self.status = "Embedded assistant is not ready yet.".to_owned();
+                .to_owned(),
+        )
     }
 
     fn chat_session_request_prompt(&self, prompt: &str) -> String {
@@ -10782,7 +10606,6 @@ impl App {
         }
         let provider = self.provider.clone();
         let paths = self.paths.clone();
-        let bootstrap_tools = self.current_chat_session_is_bootstrap();
         let current_session_has_ready_service = self
             .command_screen
             .as_ref()
@@ -10793,10 +10616,6 @@ impl App {
             && !current_session_has_ready_service
             && !self.local_chat_service_available(model.as_deref())
         {
-            if self.current_chat_session_is_bootstrap() {
-                self.show_bootstrap_assistant_connection_message();
-                return false;
-            }
             self.open_local_assistant_start_flow(model);
             return false;
         }
@@ -10813,14 +10632,8 @@ impl App {
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let provider_for_thread = provider.clone();
         std::thread::spawn(move || {
-            let result = run_provider_chat_stream(
-                &paths,
-                &provider_for_thread,
-                &request,
-                bootstrap_tools,
-                &sender,
-            )
-            .map_err(|error| error.to_string());
+            let result = run_provider_chat_stream(&paths, &provider_for_thread, &request, &sender)
+                .map_err(|error| error.to_string());
             let _ = sender.send(RunningJobEvent::Finished(result));
         });
         self.running_job = Some(RunningJob {
@@ -12489,275 +12302,6 @@ fn chat_prompt_is_how_to_only(lower: &str) -> bool {
             "launch now",
         ],
     )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapPromptIntent {
-    KeepExisting,
-    Uninstall,
-    InstallLocation,
-    InstallFolder(String),
-    InstallRocm,
-    AskOrCheck,
-    AfterSetupWork,
-    Other,
-}
-
-fn classify_bootstrap_prompt(prompt: &str, has_current_install: bool) -> BootstrapPromptIntent {
-    let tokens = normalized_prompt_tokens(prompt);
-    if tokens.is_empty() {
-        return BootstrapPromptIntent::Other;
-    }
-    if prompt_mentions_after_setup_work(&tokens) && !prompt_mentions_rocm_setup(&tokens) {
-        return BootstrapPromptIntent::AfterSetupWork;
-    }
-    if prompt_requests_uninstall(&tokens) {
-        return BootstrapPromptIntent::Uninstall;
-    }
-    if let Some(folder) = crate::chat_install_folder_from_prompt(prompt) {
-        return BootstrapPromptIntent::InstallFolder(folder);
-    }
-    if prompt_requests_install_location(&tokens) {
-        return BootstrapPromptIntent::InstallLocation;
-    }
-    if has_current_install && prompt_requests_keep_existing(&tokens) {
-        return BootstrapPromptIntent::KeepExisting;
-    }
-    if prompt_requests_install_or_reinstall(&tokens) && prompt_mentions_rocm_setup(&tokens) {
-        return BootstrapPromptIntent::InstallRocm;
-    }
-    if prompt_requests_check_or_explanation(&tokens) {
-        return BootstrapPromptIntent::AskOrCheck;
-    }
-    if prompt_mentions_after_setup_work(&tokens) {
-        return BootstrapPromptIntent::AfterSetupWork;
-    }
-    BootstrapPromptIntent::Other
-}
-
-fn normalized_prompt_tokens(prompt: &str) -> Vec<String> {
-    prompt
-        .to_ascii_lowercase()
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn token_set_contains(tokens: &[String], candidates: &[&str]) -> bool {
-    tokens
-        .iter()
-        .any(|token| candidates.iter().any(|candidate| token == candidate))
-}
-
-fn token_phrase_contains(tokens: &[String], phrase: &[&str]) -> bool {
-    !phrase.is_empty()
-        && tokens
-            .windows(phrase.len())
-            .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
-}
-
-fn prompt_mentions_rocm_setup(tokens: &[String]) -> bool {
-    token_set_contains(
-        tokens,
-        &["rocm", "therock", "the-rock", "gpu", "amd", "runtime"],
-    ) || token_phrase_contains(tokens, &["the", "rock"])
-        || token_phrase_contains(tokens, &["local", "ai"])
-}
-
-fn prompt_requests_uninstall(tokens: &[String]) -> bool {
-    token_set_contains(tokens, &["uninstall", "remove"])
-        || token_phrase_contains(tokens, &["delete", "rocm"])
-        || token_phrase_contains(tokens, &["delete", "therock"])
-        || token_phrase_contains(tokens, &["start", "over"])
-}
-
-fn prompt_requests_keep_existing(tokens: &[String]) -> bool {
-    (token_set_contains(tokens, &["keep", "continue"])
-        || token_phrase_contains(tokens, &["use", "existing"])
-        || token_phrase_contains(tokens, &["use", "current"])
-        || token_phrase_contains(tokens, &["use", "this"]))
-        && (token_set_contains(tokens, &["existing", "current", "ready", "installed"])
-            || token_phrase_contains(tokens, &["this", "setup"])
-            || prompt_mentions_rocm_setup(tokens))
-}
-
-fn prompt_requests_install_location(tokens: &[String]) -> bool {
-    let asks_place = token_set_contains(
-        tokens,
-        &["where", "folder", "path", "location", "directory", "dir"],
-    ) || token_phrase_contains(tokens, &["where", "is"])
-        || token_phrase_contains(tokens, &["where", "did"]);
-    let target = prompt_mentions_rocm_setup(tokens)
-        || token_set_contains(
-            tokens,
-            &["install", "installed", "setup", "venv", "python", "runtime"],
-        );
-    asks_place && target
-}
-
-fn prompt_requests_install_or_reinstall(tokens: &[String]) -> bool {
-    token_set_contains(
-        tokens,
-        &["install", "reinstall", "setup", "prepare", "make"],
-    ) || token_phrase_contains(tokens, &["set", "up"])
-        || token_phrase_contains(tokens, &["get", "ready"])
-}
-
-fn prompt_requests_check_or_explanation(tokens: &[String]) -> bool {
-    token_set_contains(
-        tokens,
-        &[
-            "check",
-            "status",
-            "ready",
-            "installed",
-            "why",
-            "what",
-            "how",
-            "gpu",
-        ],
-    ) || token_phrase_contains(tokens, &["is", "it"])
-        || token_phrase_contains(tokens, &["what", "happens"])
-}
-
-fn prompt_mentions_after_setup_work(tokens: &[String]) -> bool {
-    token_set_contains(
-        tokens,
-        &[
-            "comfyui",
-            "comfy",
-            "llama.cpp",
-            "llama",
-            "vllm",
-            "sglang",
-            "engine",
-            "model",
-            "models",
-            "llm",
-            "server",
-        ],
-    )
-}
-
-fn bootstrap_unclear_prompt_reply(prompt: &str) -> Option<&'static str> {
-    let trimmed = prompt.trim();
-    if trimmed.chars().count() == 1 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic()) {
-        if trimmed.eq_ignore_ascii_case("h") {
-            return Some(
-                "Hi. I am here. Ask me to check your GPU, show where ROCm is installed, install ROCm, use a folder like D:\\jam\\temp\\therock_venvs, or uninstall ROCm.",
-            );
-        }
-        return Some(
-            "I am here. Tell me what you want to do with ROCm: check my GPU, where is ROCm installed, install ROCm, use D:\\jam\\temp\\therock_venvs, or uninstall ROCm.",
-        );
-    }
-    None
-}
-
-fn bootstrap_install_location_reply(paths: &AppPaths, config: &RocmCliConfig) -> String {
-    let selected_folder = setup_install_root(paths, config);
-    let mut output = String::new();
-    let Some(runtime) = current_setup_runtime(paths, config) else {
-        let _ = writeln!(output, "I do not see a ready ROCm/TheRock install yet.");
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Selected install folder:");
-        let _ = writeln!(output, "  {}", selected_folder.display());
-        let _ = writeln!(output);
-        let _ = writeln!(
-            output,
-            "Ask me to install ROCm when you are ready. I will show a review card first."
-        );
-        return output.trim_end().to_owned();
-    };
-
-    let install_root = runtime.install_root.as_ref().unwrap_or(&selected_folder);
-    let ready = runtime_install_root_ready(&runtime);
-    let _ = writeln!(output, "ROCm/TheRock is installed here:");
-    let _ = writeln!(output, "  {}", install_root.display());
-    if let Some(version) = runtime
-        .version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-    {
-        let _ = writeln!(output, "Version: {version}");
-    }
-    let _ = writeln!(
-        output,
-        "Status: {}",
-        if ready {
-            "ready"
-        } else {
-            "saved, but not fully ready"
-        }
-    );
-    if config
-        .active_runtime_key
-        .as_deref()
-        .is_none_or(|key| runtime.runtime_key.as_deref() != Some(key))
-    {
-        let _ = writeln!(
-            output,
-            "Default runtime for model serving is not selected yet."
-        );
-    }
-    if let Some(python) = runtime
-        .python_executable
-        .as_ref()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Python:");
-        let _ = writeln!(output, "  {}", python.display());
-    }
-    if let Some(sdk) = runtime.rocm_sdk.as_ref() {
-        if let Some(root) = sdk.root_path.as_ref() {
-            let _ = writeln!(output);
-            let _ = writeln!(output, "ROCm SDK:");
-            let _ = writeln!(output, "  {}", root.display());
-        }
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Downloads/cache:");
-    let _ = writeln!(output, "  {}", install_root.join("pip-cache").display());
-    output.trim_end().to_owned()
-}
-
-fn bootstrap_default_install_sdk_args(prompt: &str) -> Vec<String> {
-    crate::install_sdk_chat_approval_for_prompt(prompt)
-        .map(|approval| cli_args_without_option_value(&approval.args, "--prefix"))
-        .unwrap_or_else(|| {
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "pip".to_owned(),
-            ]
-        })
-}
-
-fn cli_args_without_option_value(args: &[String], option: &str) -> Vec<String> {
-    let mut filtered = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == option {
-            index += 2;
-            continue;
-        }
-        if arg
-            .strip_prefix(option)
-            .is_some_and(|rest| rest.starts_with('='))
-        {
-            index += 1;
-            continue;
-        }
-        filtered.push(arg.clone());
-        index += 1;
-    }
-    filtered
 }
 
 fn is_plain_local_assistant_support_request(input: &str) -> bool {
@@ -20351,17 +19895,8 @@ fn draw_command_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if state.chat_session.is_some() {
         let detail_text = command_screen_detail_text(app);
         let detail_scroll = bounded_chat_session_scroll(&detail_text, area, state.detail_scroll);
-        let title = if state
-            .chat_session
-            .as_ref()
-            .is_some_and(|session| session.bootstrap_ui)
-        {
-            "ROCm Assistant"
-        } else {
-            "Assistant"
-        };
         let details = Paragraph::new(styled_chat_detail_text(&detail_text))
-            .block(surface_block(title, THEME_ACCENT))
+            .block(surface_block("ROCm Assistant", THEME_ACCENT))
             .style(Style::default().fg(THEME_TEXT))
             .wrap(Wrap { trim: false })
             .scroll((detail_scroll, 0));
@@ -25158,7 +24693,6 @@ fn run_provider_chat_stream(
     paths: &AppPaths,
     provider: &str,
     request: &ChatRequest,
-    bootstrap_tools: bool,
     sender: &mpsc::Sender<RunningJobEvent>,
 ) -> Result<CommandOutput> {
     if request.rocm_tools {
@@ -25175,18 +24709,12 @@ fn run_provider_chat_stream(
                 line,
             });
         };
-        let policy = if bootstrap_tools {
-            crate::ChatToolPolicy::Bootstrap
-        } else {
-            crate::ChatToolPolicy::General
-        };
-        let result = crate::render_chat_prompt_result_with_policy_and_progress(
+        let result = crate::render_chat_prompt_result_with_progress(
             paths,
             provider,
             request.model.as_deref(),
             prompt,
             true,
-            policy,
             Some(&mut progress),
         )?;
         return Ok(CommandOutput {
@@ -25375,38 +24903,6 @@ fn chat_session_install_review_text(args: &[String]) -> String {
     output.trim_end().to_owned()
 }
 
-#[cfg(test)]
-fn bootstrap_assistant_start_prompt() -> String {
-    bootstrap_assistant_start_prompt_for_state(false)
-}
-
-fn bootstrap_assistant_start_prompt_for_state(has_current_install: bool) -> String {
-    if has_current_install {
-        return [
-            "You are the ROCm CLI legacy bootstrap guide.",
-            "Greet the user in one short paragraph.",
-            "Explain that ROCm CLI found an existing ROCm/TheRock setup on this computer.",
-            "Ask whether the user wants to keep using it, reinstall ROCm into a chosen folder, or uninstall the existing ROCm install.",
-            "Use simple English for a non-technical Windows user.",
-            "Do not change anything yet.",
-            "Mention that ROCm CLI will show a review card before any install or uninstall runs.",
-            "Valid prompts the user can type include: check my AMD GPU, reinstall ROCm into D:\\jam\\temp\\therock_venvs, uninstall the current ROCm install, and keep using this ROCm setup.",
-        ]
-        .join(" ");
-    }
-    [
-        "You are the ROCm CLI legacy bootstrap guide.",
-        "Greet the user in one short paragraph.",
-        "Explain that you can prepare ROCm/TheRock on this computer using ROCm CLI commands.",
-        "Ask the user where the ROCm/TheRock Python folder should live.",
-        "Show simple example prompts the user can type: install ROCm into D:\\jam\\temp\\therock_venvs, use D:\\jam\\temp\\therock_venvs, install TheRock build 06052026 into D:\\jam\\temp\\therock_venvs, check my AMD GPU, and what happens before you install.",
-        "Use simple English for a non-technical Windows user.",
-        "Do not change anything yet and do not invent a default folder.",
-        "Mention that ROCm CLI will show a review card before any package download starts.",
-    ]
-    .join(" ")
-}
-
 fn friendly_model_label(model: &str) -> String {
     model
         .rsplit(['/', '\\'])
@@ -25523,76 +25019,24 @@ fn render_chat_session_detail(app: &App, running_message: Option<String>) -> Str
     };
     let mut output = String::new();
     if session.turns.is_empty() {
-        if session.bootstrap_ui {
-            let has_current_install = setup_has_current_install(&app.paths, &app.config);
-            let _ = writeln!(output, "Qwen is starting inside ROCm CLI.");
-            if has_current_install {
-                let _ = writeln!(
-                    output,
-                    "ROCm CLI found an existing ROCm/TheRock setup on this computer."
-                );
-            } else {
-                let _ = writeln!(
-                    output,
-                    "Type naturally. It can help set up ROCm/TheRock step by step."
-                );
-            }
-            let _ = writeln!(output);
-        } else {
-            let _ = writeln!(output, "Type your message below.");
-        }
+        let _ = writeln!(output, "Type your message below.");
         if let Some(model) = session.model.as_deref() {
             let _ = writeln!(output, "Model: {}", friendly_model_label(model));
             let _ = writeln!(output);
         }
-        if session.bootstrap_ui {
-            let has_current_install = setup_has_current_install(&app.paths, &app.config);
-            if has_current_install {
-                let _ = writeln!(
-                    output,
-                    "Nothing changes until ROCm CLI shows a review card and you approve it."
-                );
-                let _ = writeln!(output);
-                let _ = writeln!(output, "Try typing");
-                let _ = writeln!(output, "  Check my AMD GPU");
-                let _ = writeln!(output, "  Keep using this ROCm setup");
-                let _ = writeln!(output, "  Reinstall ROCm into D:\\jam\\temp\\therock_venvs");
-                let _ = writeln!(output, "  Uninstall the current ROCm install");
-            } else {
-                let _ = writeln!(
-                    output,
-                    "When it asks for an install folder, choose the folder you want to use."
-                );
-                let _ = writeln!(
-                    output,
-                    "Nothing changes until ROCm CLI shows a review card and you approve it."
-                );
-                let _ = writeln!(output);
-                let _ = writeln!(output, "Try typing");
-                let _ = writeln!(output, "  Install ROCm into D:\\jam\\temp\\therock_venvs");
-                let _ = writeln!(output, "  Use D:\\jam\\temp\\therock_venvs");
-                let _ = writeln!(
-                    output,
-                    "  Install TheRock build 06052026 into D:\\jam\\temp\\therock_venvs"
-                );
-                let _ = writeln!(output, "  Check my AMD GPU");
-                let _ = writeln!(output, "  What happens before you install?");
-            }
-        } else {
-            let _ = writeln!(
-                output,
-                "Ask about ROCm setup, local models, engines, or app readiness."
-            );
-            let _ = writeln!(
-                output,
-                "For installs, say the exact date or version you want. I will show a review card first."
-            );
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Try");
-            let _ = writeln!(output, "  Is my AMD GPU ready?");
-            let _ = writeln!(output, "  Which local models can this GPU run?");
-            let _ = writeln!(output, "  Install ComfyUI for me.");
-        }
+        let _ = writeln!(
+            output,
+            "Ask about ROCm setup, local models, engines, or app readiness."
+        );
+        let _ = writeln!(
+            output,
+            "For installs, say the exact date or version you want. I will show a review card first."
+        );
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Try");
+        let _ = writeln!(output, "  Is my AMD GPU ready?");
+        let _ = writeln!(output, "  Which local models can this GPU run?");
+        let _ = writeln!(output, "  Install ComfyUI for me.");
     } else {
         for turn in &session.turns {
             match turn.role {
@@ -25923,9 +25367,6 @@ fn tui_service_is_builtin_assistant(record: &ManagedServiceRecord) -> bool {
     record
         .canonical_model_id
         .eq_ignore_ascii_case(VALIDATED_LOCAL_ASSISTANT_MODEL)
-        || record
-            .canonical_model_id
-            .eq_ignore_ascii_case(providers::BOOTSTRAP_ASSISTANT_MODEL_ID)
 }
 
 fn managed_serve_command_launched_service(rendered: &str) -> bool {
@@ -32351,359 +31792,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_assistant_starts_in_conversation_first_chat() -> anyhow::Result<()> {
-        let mut app = test_app();
-        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
-            "Hi. Where should I install ROCm/TheRock?",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-        )?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-            "127.0.0.1",
-            port,
-            "bootstrap",
-            123,
-            None,
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-
-        app.open_bootstrap_assistant_chat_session(record);
-        assert!(
-            app.local_chat_service_available(Some(crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID)),
-            "bootstrap service should be available"
-        );
-        assert!(
-            app.running_job.is_some(),
-            "bootstrap greeting should start a chat job; status={}",
-            app.status
-        );
-
-        assert!(
-            app.command_screen
-                .as_ref()
-                .and_then(|state| state.chat_session.as_ref())
-                .is_some_and(|session| session.bootstrap_ui)
-        );
-        assert!(!app.onboarding_active);
-        assert!(!app.should_draw_home_dashboard());
-        assert_eq!(app.provider, "local");
-        let rendered = render_test_terminal(&app, 120, 32);
-        assert!(rendered.contains("ROCm Assistant"));
-        assert!(rendered.contains("Qwen is starting inside ROCm CLI."));
-        assert!(rendered.contains("Try typing"));
-        assert!(rendered.contains("Install ROCm into D:\\jam\\temp\\therock_venvs"));
-        assert!(rendered.contains("Use D:\\jam\\temp\\therock_venvs"));
-        assert!(rendered.contains("Install TheRock build 06052026"));
-        assert!(rendered.contains("Check my AMD GPU"));
-        assert!(rendered.contains("What happens before you install?"));
-        assert!(!rendered.contains("Installer output"));
-        assert!(!rendered.contains("Recent log"));
-        assert!(!rendered.contains("> Send message"));
-        assert!(!rendered.contains("Server info"));
-        assert!(!rendered.contains("Status"));
-
-        let request = request_receiver.recv_timeout(Duration::from_secs(5))?;
-        assert_eq!(
-            request.get("model").and_then(Value::as_str),
-            Some(crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID)
-        );
-        assert!(
-            request.get("tool_choice").is_none(),
-            "bootstrap greeting should not enable ROCm tools"
-        );
-        assert!(
-            request.get("tools").is_none(),
-            "bootstrap greeting should not expose tools"
-        );
-        let messages = request
-            .get("messages")
-            .and_then(Value::as_array)
-            .expect("bootstrap request should include messages");
-        assert!(messages.iter().any(|message| {
-            message.get("role").and_then(Value::as_str) == Some("user")
-                && message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains(
-                            "Ask the user where the ROCm/TheRock Python folder should live",
-                        ) && content.contains("Do not change anything yet")
-                            && content.contains("install ROCm into D:\\jam\\temp\\therock_venvs")
-                            && content.contains("install TheRock build 06052026")
-                            && content.contains("check my AMD GPU")
-                    })
-        }));
-
-        poll_app_until_idle(&mut app);
-        let assistant_text = app
-            .command_screen
-            .as_ref()
-            .and_then(|state| state.chat_session.as_ref())
-            .and_then(|session| {
-                session
-                    .turns
-                    .iter()
-                    .find(|turn| turn.role == super::ChatSessionRole::Assistant)
-            })
-            .map(|turn| turn.content.as_str())
-            .unwrap_or("<missing>");
-        assert!(
-            assistant_text.contains("Where should I install ROCm/TheRock?"),
-            "{assistant_text}"
-        );
-        let rendered = render_test_terminal(&app, 120, 32);
-        assert!(rendered.contains("Where should I install"));
-        assert!(!rendered.contains("> Send message"));
-        assert!(!rendered.contains("Status"));
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_start_prompt_teaches_valid_prompts() {
-        let prompt = super::bootstrap_assistant_start_prompt();
-
-        assert!(prompt.contains("install ROCm into D:\\jam\\temp\\therock_venvs"));
-        assert!(prompt.contains("use D:\\jam\\temp\\therock_venvs"));
-        assert!(prompt.contains("install TheRock build 06052026"));
-        assert!(prompt.contains("check my AMD GPU"));
-        assert!(prompt.contains("what happens before you install"));
-        assert!(prompt.contains("review card"));
-    }
-
-    #[test]
-    fn bootstrap_prompt_classifier_handles_stateful_setup_intents() {
-        for (prompt, has_current_install, expected) in [
-            (
-                "uninstall the current ROCm install",
-                true,
-                super::BootstrapPromptIntent::Uninstall,
-            ),
-            (
-                "remove therock and start over",
-                true,
-                super::BootstrapPromptIntent::Uninstall,
-            ),
-            (
-                "use D:\\jam\\temp\\therock_venvs",
-                false,
-                super::BootstrapPromptIntent::InstallFolder(
-                    "D:\\jam\\temp\\therock_venvs".to_owned(),
-                ),
-            ),
-            (
-                "keep using this ROCm setup",
-                true,
-                super::BootstrapPromptIntent::KeepExisting,
-            ),
-            (
-                "install therock",
-                false,
-                super::BootstrapPromptIntent::InstallRocm,
-            ),
-            (
-                "can you setup comfyui for me",
-                false,
-                super::BootstrapPromptIntent::AfterSetupWork,
-            ),
-            (
-                "which GPU do I have?",
-                false,
-                super::BootstrapPromptIntent::AskOrCheck,
-            ),
-        ] {
-            assert_eq!(
-                super::classify_bootstrap_prompt(prompt, has_current_install),
-                expected,
-                "{prompt}"
-            );
-        }
-    }
-
-    #[test]
-    fn bootstrap_chat_hello_stays_friendly_without_rocm_checks_or_server_start()
-    -> anyhow::Result<()> {
-        let mut app = test_app();
-        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
-            "Hi. Where should I install ROCm/TheRock?",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-        )?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-            "127.0.0.1",
-            port,
-            "bootstrap",
-            123,
-            None,
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-
-        app.open_bootstrap_assistant_chat_session(record);
-        let _ = request_receiver.recv_timeout(Duration::from_secs(5))?;
-        poll_app_until_idle(&mut app);
-
-        for prompt in ["hello", "can you hear me"] {
-            app.set_input(prompt.to_owned());
-            handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-
-            assert!(
-                request_receiver
-                    .recv_timeout(Duration::from_millis(200))
-                    .is_err(),
-                "{prompt}"
-            );
-            assert!(app.command_screen_is_chat_session(), "{prompt}");
-            assert!(app.running_job.is_none(), "{prompt}");
-            assert!(app.pending_approval.is_none(), "{prompt}");
-            assert!(app.serve_wizard.is_none(), "{prompt}");
-            let rendered = render_test_terminal(&app, 120, 32);
-            assert!(rendered.contains("You"), "{prompt}");
-            assert!(rendered.contains(prompt), "{prompt}");
-            assert!(
-                rendered.contains("embedded Qwen assistant is already running"),
-                "{prompt}"
-            );
-            assert!(!rendered.contains("I checked ROCm"), "{prompt}");
-            assert!(!rendered.contains("Start local model server"), "{prompt}");
-            assert!(!rendered.contains("Serve failed"), "{prompt}");
-            assert!(!rendered.contains("Bad Request"), "{prompt}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_chat_blocks_after_setup_actions_without_approval() -> anyhow::Result<()> {
-        let mut app = test_app();
-        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
-            "Hi. Where should I install ROCm/TheRock?",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-        )?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-            "127.0.0.1",
-            port,
-            "bootstrap",
-            123,
-            None,
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-
-        app.open_bootstrap_assistant_chat_session(record);
-        let _ = request_receiver.recv_timeout(Duration::from_secs(5))?;
-        poll_app_until_idle(&mut app);
-
-        app.set_input("can you setup comfyui for me?".to_owned());
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(
-            request_receiver
-                .recv_timeout(Duration::from_millis(200))
-                .is_err()
-        );
-        assert!(app.command_screen_is_chat_session());
-        assert!(app.running_job.is_none());
-        assert!(app.pending_approval.is_none());
-        let rendered = render_test_terminal(&app, 120, 32);
-        assert!(rendered.contains("first setup assistant"), "{rendered}");
-        assert!(
-            rendered.contains("installing or uninstalling ROCm/TheRock"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Install ComfyUI"), "{rendered}");
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_chat_existing_setup_can_keep_or_uninstall() -> anyhow::Result<()> {
-        let mut app = test_app();
-        let runtime_key = "release-pip-gfx120x-all-bootstrap-uninstall";
-        write_test_runtime_with_key(&app.paths, runtime_key, "therock-release:gfx120X-all", 20)?;
-        app.config.active_runtime_key = Some(runtime_key.to_owned());
-        app.config.save(&app.paths)?;
-        let (port, request_receiver) = spawn_fake_local_chat_server_for_model(
-            "I found an existing ROCm setup.",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-        )?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-bootstrap-qwen",
-            "llamafile-bootstrap",
-            "Qwen3.5-0.8B-Q8_0.llamafile",
-            crate::providers::BOOTSTRAP_ASSISTANT_MODEL_ID,
-            "127.0.0.1",
-            port,
-            "bootstrap",
-            123,
-            None,
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-
-        app.open_bootstrap_assistant_chat_session(record);
-        let request = request_receiver.recv_timeout(Duration::from_secs(5))?;
-        let messages = request
-            .get("messages")
-            .and_then(Value::as_array)
-            .expect("bootstrap request should include messages");
-        assert!(messages.iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| {
-                    content.contains("found an existing ROCm/TheRock setup")
-                        && content.contains("uninstall the existing ROCm install")
-                })
-        }));
-        poll_app_until_idle(&mut app);
-
-        app.set_input("keep using this ROCm setup".to_owned());
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.pending_approval.is_none());
-        let rendered = render_test_terminal(&app, 120, 32);
-        assert!(rendered.contains("keep using the existing ROCm/TheRock setup"));
-
-        app.set_input("uninstall the current ROCm install".to_owned());
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-        let pending = app
-            .pending_approval
-            .as_ref()
-            .expect("uninstall should request approval");
-        assert_eq!(pending.title, "Uninstall ROCm");
-        assert!(matches!(
-            &pending.action,
-            super::ApprovalAction::CliCommand { args, .. }
-                if args == &vec![
-                    "runtimes".to_owned(),
-                    "uninstall".to_owned(),
-                    runtime_key.to_owned()
-                ]
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn chat_install_prompt_waits_for_folder_then_opens_review_without_model_guess()
     -> anyhow::Result<()> {
         let mut app = test_app();
@@ -33404,131 +32492,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_chat_location_question_shows_install_folder_without_model_guess()
-    -> anyhow::Result<()> {
-        let mut app = test_app();
-        let runtime_key = "release-pip-gfx120x-all-location";
-        write_test_runtime_with_key(&app.paths, runtime_key, "therock-release:gfx120X-all", 20)?;
-        let install_root = app
-            .paths
-            .data_dir
-            .join("runtimes")
-            .join("pip")
-            .join(runtime_key);
-        app.config.setup.therock_venv = Some(install_root.clone());
-
-        let (port, request_receiver) =
-            spawn_fake_local_chat_server("Hi. I found the existing ROCm setup.")?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-qwen25",
-            "pytorch",
-            "qwen",
-            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
-            "127.0.0.1",
-            port,
-            "managed",
-            123,
-            None,
-            None,
-            None,
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-        app.open_bootstrap_assistant_chat_session(record);
-        request_receiver.recv_timeout(Duration::from_secs(5))?;
-        poll_app_until_idle(&mut app);
-
-        app.set_input("where is rocm installed".to_owned());
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-        poll_app_until_idle(&mut app);
-
-        assert!(
-            request_receiver
-                .recv_timeout(Duration::from_millis(150))
-                .is_err()
-        );
-        assert!(app.pending_approval.is_none());
-        assert!(app.running_job.is_none());
-        let rendered = render_test_terminal(&app, 140, 34);
-        assert!(
-            rendered.contains("ROCm/TheRock is installed here:"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Downloads/cache:"), "{rendered}");
-        assert!(
-            !rendered.contains("Here is what I found on this computer."),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("I checked ROCm"), "{rendered}");
-        let content = app
-            .command_screen
-            .as_ref()
-            .and_then(|state| state.chat_session.as_ref())
-            .and_then(|session| session.turns.last())
-            .map(|turn| turn.content.as_str())
-            .unwrap_or_default();
-        assert!(
-            content.contains(&install_root.display().to_string()),
-            "{content}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_chat_short_accidental_prompt_does_not_inspect_or_call_model() -> anyhow::Result<()>
-    {
-        let mut app = test_app();
-        let (port, request_receiver) = spawn_fake_local_chat_server("This should not be called.")?;
-        let mut record = ManagedServiceRecord::new(
-            &app.paths,
-            "svc-qwen25",
-            "pytorch",
-            "qwen",
-            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
-            "127.0.0.1",
-            port,
-            "managed",
-            123,
-            None,
-            None,
-            None,
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-        app.open_bootstrap_assistant_chat_session(record);
-        request_receiver.recv_timeout(Duration::from_secs(5))?;
-        poll_app_until_idle(&mut app);
-
-        for prompt in ["h", "a"] {
-            app.set_input(prompt.to_owned());
-            handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-            poll_app_until_idle(&mut app);
-        }
-
-        assert!(
-            request_receiver
-                .recv_timeout(Duration::from_millis(150))
-                .is_err()
-        );
-        assert!(app.pending_approval.is_none());
-        assert!(app.running_job.is_none());
-        let rendered = render_test_terminal(&app, 140, 34);
-        assert!(rendered.contains("Hi. I am here."), "{rendered}");
-        assert!(
-            rendered.contains("Tell me what you want to do with ROCm"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("where is ROCm installed"), "{rendered}");
-        assert!(
-            !rendered.contains("Here is what I found on this computer."),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("I checked ROCm"), "{rendered}");
-        Ok(())
-    }
-
-    #[test]
     fn pending_install_folder_answers_status_questions_without_losing_picker() -> anyhow::Result<()>
     {
         let mut app = test_app();
@@ -33652,8 +32615,7 @@ mod tests {
         };
         let (sender, receiver) = mpsc::channel();
 
-        let output =
-            super::run_provider_chat_stream(&app.paths, "local", &request, false, &sender)?;
+        let output = super::run_provider_chat_stream(&app.paths, "local", &request, &sender)?;
 
         let progress = receiver
             .try_iter()
@@ -34760,7 +33722,6 @@ Full log
             service_id: None,
             endpoint_url: None,
             turns: Vec::new(),
-            bootstrap_ui: false,
             pending_install_args: None,
         });
         assert!(app.handle_command("chat"));
