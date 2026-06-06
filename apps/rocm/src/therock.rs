@@ -3291,7 +3291,7 @@ fn find_python_executable_recursive(root: &Path, depth: usize) -> Option<PathBuf
 }
 
 fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    if let Some(value) = std::env::var("ROCM_CLI_PYTHON").ok() {
+    if let Ok(value) = std::env::var("ROCM_CLI_PYTHON") {
         python_launcher_install_ready(Path::new(&value))
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
@@ -3641,6 +3641,7 @@ fn slugify(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

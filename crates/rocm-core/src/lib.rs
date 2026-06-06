@@ -5436,7 +5436,7 @@ fn current_executable_path_from_argv0_value(
         || argv0_text.starts_with('.')
         || argv0_text.starts_with('~');
     if looks_path_like && let Some(current_dir) = current_dir {
-        return Ok(normalize_runtime_join_path(&current_dir, &argv0_text));
+        return Ok(normalize_runtime_join_path(current_dir, &argv0_text));
     }
 
     if prefer_current_dir_file
@@ -5458,7 +5458,7 @@ fn current_executable_path_from_argv0_value(
     }
 
     if let Some(current_dir) = current_dir {
-        return Ok(normalize_runtime_join_path(&current_dir, &argv0_text));
+        return Ok(normalize_runtime_join_path(current_dir, &argv0_text));
     }
 
     bail!("unable to resolve current executable from argv[0]: {argv0_text}");

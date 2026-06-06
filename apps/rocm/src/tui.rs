@@ -8434,13 +8434,23 @@ impl App {
                     "Install ComfyUI into ROCm CLI's managed app folder.",
                 ))
             } else if any_substring(&lower, &["start", "run", "launch", "open"]) {
-                Some((
-                    "Start ComfyUI",
-                    "ComfyUI",
-                    vec!["comfyui".to_owned(), "start".to_owned()],
-                    "Sure. I can start ComfyUI and show the local URL. Nothing launches until you approve it.",
-                    "Start ComfyUI locally and show its URL.",
-                ))
+                if crate::comfyui::is_installed(&self.paths).unwrap_or(false) {
+                    Some((
+                        "Start ComfyUI",
+                        "ComfyUI",
+                        vec!["comfyui".to_owned(), "start".to_owned()],
+                        "Sure. I can start ComfyUI and show the local URL. Nothing launches until you approve it.",
+                        "Start ComfyUI locally and show its URL.",
+                    ))
+                } else {
+                    Some((
+                        "Install ComfyUI",
+                        "ComfyUI",
+                        vec!["comfyui".to_owned(), "install".to_owned()],
+                        "ComfyUI is not installed yet. I can install it first.",
+                        "Install ComfyUI before starting it.",
+                    ))
+                }
             } else {
                 None
             }
@@ -8461,21 +8471,36 @@ impl App {
                 ],
             )
         {
-            Some((
-                "Start local model server",
-                "Serve",
-                vec![
-                    "serve".to_owned(),
-                    VALIDATED_LOCAL_ASSISTANT_MODEL.to_owned(),
-                    "--engine".to_owned(),
-                    "lemonade".to_owned(),
-                    "--device".to_owned(),
-                    "gpu_required".to_owned(),
-                    "--managed".to_owned(),
-                ],
-                "Sure. I can start the recommended Lemonade assistant on your AMD GPU. Nothing launches until you approve it.",
-                "Start the recommended Lemonade assistant.",
-            ))
+            let engine = assistant_requested_engine_from_prompt(&lower).unwrap_or("lemonade");
+            if self.engine_installed_for_assistant_start(engine) {
+                Some((
+                    "Start local model server",
+                    "Serve",
+                    vec![
+                        "serve".to_owned(),
+                        VALIDATED_LOCAL_ASSISTANT_MODEL.to_owned(),
+                        "--engine".to_owned(),
+                        engine.to_owned(),
+                        "--device".to_owned(),
+                        "gpu_required".to_owned(),
+                        "--managed".to_owned(),
+                    ],
+                    "Sure. I can start the local assistant on your AMD GPU. Nothing launches until you approve it.",
+                    "Start the local assistant.",
+                ))
+            } else {
+                Some((
+                    "Install engine",
+                    "Engine",
+                    vec![
+                        "engines".to_owned(),
+                        "install".to_owned(),
+                        engine.to_owned(),
+                    ],
+                    "That model engine is not installed yet. I can install it first.",
+                    "Install the selected model engine before starting it.",
+                ))
+            }
         } else {
             None
         };
@@ -11737,22 +11762,7 @@ impl App {
                 if output.ok
                     && let Some(approval) = chat_approval
                 {
-                    if self.open_install_folder_choice_for_chat_approval(&approval) {
-                        self.status =
-                            "Assistant needs an install folder. Choose one, then review the install."
-                                .to_owned();
-                    } else {
-                        self.request_screen_cli_approval_with_explanation(
-                            &approval.pending_title,
-                            &approval.command_title,
-                            approval.args,
-                            approval.display_command,
-                            approval.explanation,
-                        );
-                        self.status =
-                            "Assistant suggested a change. Review it before anything runs."
-                                .to_owned();
-                    }
+                    self.request_chat_tool_approval_or_dependency_install(approval);
                 }
             }
             (RunningJobKind::Chat { provider, .. }, Err(error)) => {
@@ -12045,6 +12055,107 @@ impl App {
         self.record_activity(format!("approval requested: {pending_title}"));
         self.status =
             "Review the change. Press Enter or Y to approve; Esc or N cancels.".to_owned();
+    }
+
+    fn request_chat_tool_approval_or_dependency_install(
+        &mut self,
+        approval: ChatToolApprovalRequest,
+    ) {
+        if self.open_install_folder_choice_for_chat_approval(&approval) {
+            self.status = "Assistant needs an install folder. Choose one, then review the install."
+                .to_owned();
+            return;
+        }
+        if self.request_missing_dependency_install_for_chat_approval(&approval) {
+            return;
+        }
+        self.request_screen_cli_approval_with_explanation(
+            &approval.pending_title,
+            &approval.command_title,
+            approval.args,
+            approval.display_command,
+            approval.explanation,
+        );
+        self.status = "Assistant suggested a change. Review it before anything runs.".to_owned();
+    }
+
+    fn request_missing_dependency_install_for_chat_approval(
+        &mut self,
+        approval: &ChatToolApprovalRequest,
+    ) -> bool {
+        if chat_approval_requests_comfyui_start(&approval.args)
+            && !crate::comfyui::is_installed(&self.paths).unwrap_or(false)
+        {
+            self.note_assistant_dependency_redirect(
+                "ComfyUI is not installed yet. I can install it first.",
+            );
+            self.request_screen_cli_approval_with_explanation(
+                "Install ComfyUI",
+                "ComfyUI",
+                vec!["comfyui".to_owned(), "install".to_owned()],
+                Some("/comfyui install".to_owned()),
+                Some("Install ComfyUI before starting it.".to_owned()),
+            );
+            self.status = "Review ComfyUI install before starting it.".to_owned();
+            return true;
+        }
+
+        let Some(engine) = chat_approval_serve_engine(&approval.args, &self.config) else {
+            return false;
+        };
+        if self.engine_installed_for_assistant_start(&engine) {
+            return false;
+        }
+        let engine = canonical_engine_name(&engine).unwrap_or(engine.as_str());
+        self.note_assistant_dependency_redirect(format!(
+            "{} is not installed yet. I can install it first.",
+            assistant_engine_label(engine)
+        ));
+        self.request_screen_cli_approval_with_explanation(
+            "Install engine",
+            "Engine",
+            vec![
+                "engines".to_owned(),
+                "install".to_owned(),
+                engine.to_owned(),
+            ],
+            Some(format!("/engine install {engine}")),
+            Some("Install the selected model engine before starting it.".to_owned()),
+        );
+        self.status = "Review engine install before starting the model.".to_owned();
+        true
+    }
+
+    fn note_assistant_dependency_redirect(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.command_screen_is_chat_session() {
+            self.push_chat_session_turn(ChatSessionRole::Assistant, message);
+            if let Some(state) = self.command_screen.as_mut() {
+                state.message = None;
+                state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
+            }
+        } else {
+            self.set_active_screen_message(message);
+        }
+    }
+
+    fn engine_installed_for_assistant_start(&self, engine: &str) -> bool {
+        if ready_engine_env_id(&self.paths, &self.config, engine).is_some() {
+            return true;
+        }
+        let Some(entry) = self.config.engine_config(engine) else {
+            return false;
+        };
+        [
+            entry.preferred_env_id.as_ref(),
+            entry.last_installed_env_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|env_id| {
+            load_onboarding_engine_env(&self.paths, engine, env_id)
+                .is_some_and(|manifest| manifest.env_path.is_dir())
+        })
     }
 
     fn open_install_folder_choice_for_chat_approval(
@@ -16173,6 +16284,7 @@ fn read_fallback_terminal_event_from_receiver(
     })
 }
 
+#[cfg(test)]
 fn read_fallback_terminal_event<R: Read>(reader: &mut R) -> Option<Event> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte).ok()?;
@@ -25083,6 +25195,58 @@ fn cli_arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     None
 }
 
+fn chat_approval_requests_comfyui_start(args: &[String]) -> bool {
+    matches!(
+        args,
+        [command, action, ..]
+            if command.eq_ignore_ascii_case("comfyui")
+                && action.eq_ignore_ascii_case("start")
+    )
+}
+
+fn chat_approval_serve_engine(args: &[String], config: &RocmCliConfig) -> Option<String> {
+    if !args
+        .first()
+        .is_some_and(|command| command.eq_ignore_ascii_case("serve"))
+    {
+        return None;
+    }
+    cli_arg_value(args, "--engine")
+        .or(config.default_engine.as_deref())
+        .or(Some(default_engine_for_platform()))
+        .and_then(|engine| canonical_engine_name(engine).map(str::to_owned))
+}
+
+fn canonical_engine_name(engine: &str) -> Option<&'static str> {
+    engine_inventory()
+        .iter()
+        .find_map(|(name, _)| name.eq_ignore_ascii_case(engine).then_some(*name))
+}
+
+fn assistant_requested_engine_from_prompt(lower: &str) -> Option<&'static str> {
+    for (name, _) in engine_inventory() {
+        if lower.contains(name) {
+            return Some(*name);
+        }
+    }
+    if lower.contains("llama cpp") {
+        return Some("llama.cpp");
+    }
+    None
+}
+
+fn assistant_engine_label(engine: &str) -> &str {
+    match engine {
+        "lemonade" => "Lemonade",
+        "pytorch" => "PyTorch",
+        "llama.cpp" => "llama.cpp",
+        "vllm" => "vLLM",
+        "sglang" => "SGLang",
+        "atom" => "ATOM",
+        _ => "This engine",
+    }
+}
+
 fn plain_serve_approval_lines(args: &[String]) -> Vec<String> {
     let refs = args.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
     if let Ok(plan) = parse_serve_command_args(&refs) {
@@ -28067,7 +28231,8 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_does_not_claim_ready_when_runtime_registry_is_missing() -> anyhow::Result<()> {
+    fn sidebar_recovers_ready_setup_from_local_runtime_manifest_when_registry_is_missing()
+    -> anyhow::Result<()> {
         let mut app = test_app();
         let runtime_key = "release-pip-gfx120x-all-local-only";
         write_test_runtime_with_key(&app.paths, runtime_key, "therock-release:gfx120X-all", 20)?;
@@ -28078,12 +28243,26 @@ mod tests {
             .join("pip")
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
-        fs::remove_dir_all(app.paths.data_dir.join("runtimes").join("registry"))?;
+        app.config.save(&app.paths)?;
+        let old_registry_dir = app.paths.data_dir.join("runtimes").join("registry");
+        fs::remove_dir_all(&old_registry_dir)?;
+
+        app.rebase_paths_to_saved_setup_folder();
+        let restored_registry_path = app
+            .paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join(format!("{runtime_key}.json"));
 
         assert!(super::setup_venv_ready(&app.paths, &app.config));
+        assert!(
+            restored_registry_path.is_file(),
+            "setup runtime registry should be restored from the venv-local runtime manifest"
+        );
         let rendered = app.sidebar_text();
 
-        assert!(rendered.contains("Setup: not set up"));
+        assert!(rendered.contains("Setup: ready"));
         Ok(())
     }
 
@@ -33835,8 +34014,8 @@ mod tests {
                         }
                     }]
                 }),
-                "Start local model server",
-                "rocm serve Qwen3-4B-Instruct-2507-GGUF --engine lemonade --device gpu_required --managed",
+                "Install engine",
+                "rocm engines install lemonade",
             ),
             (
                 "install this specific TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
@@ -35600,6 +35779,115 @@ Full log
         let modal = super::render_modal_approval(&app, app.pending_approval.as_ref().unwrap());
         assert!(modal.contains("Folder:"));
         assert!(modal.contains(&prefix.display().to_string()));
+    }
+
+    #[test]
+    fn assistant_start_comfyui_installs_first_when_missing() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let (port, _request_receiver) =
+            spawn_fake_local_chat_server("This should not be needed for direct actions.")?;
+        let mut record = ManagedServiceRecord::new(
+            &app.paths,
+            "svc-qwen-direct",
+            "pytorch",
+            "qwen",
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write()?;
+        app.open_local_rocm_tools_chat_session(Some(record));
+
+        assert!(app.submit_chat_session_prompt("start comfyui".to_owned()));
+
+        assert!(app.command_screen_is_chat_session());
+        let pending_action = app.pending_approval.as_ref().map(|pending| &pending.action);
+        let rendered = render_test_terminal(&app, 140, 32);
+        assert!(
+            matches!(
+                pending_action,
+                Some(super::ApprovalAction::CliCommand {
+                    title,
+                    args,
+                    display_command: Some(display_command),
+                    ..
+                }) if title == "ComfyUI"
+                    && args == &vec!["comfyui".to_owned(), "install".to_owned()]
+                    && display_command.ends_with("comfyui install")
+            ),
+            "{pending_action:#?}\n{rendered}"
+        );
+        let chat_detail = super::command_screen_detail_text(&app);
+        assert!(chat_detail.contains("ComfyUI is not installed yet"));
+        assert!(!rendered.contains("/comfyui start"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_serve_tool_call_installs_missing_engine_first() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let sender = attach_running_job(
+            &mut app,
+            "Chat",
+            super::RunningJobKind::Chat {
+                provider: "local".to_owned(),
+                rocm_tools: true,
+            },
+        );
+        sender
+            .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
+                ok: true,
+                rendered: "I can start the local model.".to_owned(),
+                chat_approval: Some(ChatToolApprovalRequest {
+                    pending_title: "Start local model server".to_owned(),
+                    command_title: "Serve".to_owned(),
+                    args: vec![
+                        "serve".to_owned(),
+                        "qwen".to_owned(),
+                        "--engine".to_owned(),
+                        "lemonade".to_owned(),
+                        "--device".to_owned(),
+                        "gpu_required".to_owned(),
+                        "--managed".to_owned(),
+                    ],
+                    display_command: Some(
+                        "rocm serve qwen --engine lemonade --device gpu_required --managed"
+                            .to_owned(),
+                    ),
+                    explanation: Some("Start the local assistant.".to_owned()),
+                }),
+            })))
+            .unwrap();
+
+        app.poll_running_job();
+
+        assert!(app.command_screen_is_chat_session());
+        assert!(matches!(
+            app.pending_approval.as_ref().map(|pending| &pending.action),
+            Some(super::ApprovalAction::CliCommand {
+                title,
+                args,
+                display_command: Some(display_command),
+                ..
+            }) if title == "Engine"
+                && args == &vec![
+                    "engines".to_owned(),
+                    "install".to_owned(),
+                    "lemonade".to_owned(),
+                ]
+                && display_command == "/engine install lemonade"
+        ));
+        let rendered = render_test_terminal(&app, 140, 32);
+        let chat_detail = super::command_screen_detail_text(&app);
+        assert!(chat_detail.contains("Lemonade is not installed yet"));
+        assert!(!rendered.contains("Start local model server"), "{rendered}");
     }
 
     #[test]
