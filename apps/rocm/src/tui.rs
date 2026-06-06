@@ -13860,11 +13860,8 @@ fn onboarding_selection_status(app: &App) -> String {
 fn onboarding_menu_label(app: &App, choice: OnboardingMenuChoice) -> String {
     match choice {
         OnboardingMenuChoice::Folder => {
-            if app.config.setup.therock_venv.is_some() {
-                "Install folder: selected".to_owned()
-            } else {
-                "Install folder: recommended".to_owned()
-            }
+            let folder = display_runtime_folder_path(&setup_install_root(&app.paths, &app.config));
+            format!("Install folder: {folder}")
         }
         OnboardingMenuChoice::Primary if app.pending_approval.is_some() => {
             match app
@@ -16048,16 +16045,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if app.onboarding_active
-        && !app.onboarding_path_editing
-        && app.pending_approval.is_none()
-        && app.input.is_empty()
-        && matches!((key.modifiers, key.code), (_, KeyCode::Char('?')))
-    {
-        app.open_help_overlay();
-        return;
-    }
-
     if app.onboarding_active && handle_onboarding_key(app, key) {
         return;
     }
@@ -18119,6 +18106,9 @@ fn handle_logs_view_text_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
+    if app.overlay_card.is_some() && handle_overlay_card_key(app, key) {
+        return true;
+    }
     if app.onboarding_path_editing {
         return handle_onboarding_path_key(app, key);
     }
@@ -18236,6 +18226,11 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
                 && app.selected_onboarding_choice() == OnboardingMenuChoice::Folder =>
         {
             app.start_onboarding_path_edit();
+        }
+        (_, KeyCode::Char('?')) if app.pending_approval.is_none() && app.running_job.is_none() => {
+            app.status =
+                "Setup is open. Use arrows to choose a row, Enter to select, or Esc to go back."
+                    .to_owned();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
         | (_, KeyCode::Char('\n' | '\r'))
@@ -20645,7 +20640,8 @@ fn install_sdk_choice_label(choice: InstallSdkChoice, folder: &str) -> String {
             if folder.trim().is_empty() {
                 "Install folder: choose".to_owned()
             } else {
-                "Install folder: selected".to_owned()
+                let folder = display_runtime_folder_path(Path::new(folder));
+                format!("Install folder: {folder}")
             }
         }
         InstallSdkChoice::Install => "Install ROCm".to_owned(),
@@ -24191,6 +24187,17 @@ fn running_progress_bar(started_at: Instant) -> String {
 }
 
 fn running_job_output_lines(app: &App) -> Vec<String> {
+    if app.onboarding_install_running() {
+        let lines = app
+            .onboarding_install_log
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            return lines;
+        }
+        return app.running_job_output.iter().cloned().collect::<Vec<_>>();
+    }
     let mut lines = active_screen_message_text(app)
         .map(|message| {
             message
@@ -34174,6 +34181,21 @@ Full log
     }
 
     #[test]
+    fn setup_question_mark_does_not_open_command_list() {
+        let mut app = test_app();
+        app.onboarding_active = true;
+        app.reset_onboarding_selection();
+
+        handle_key(&mut app, key_event(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(app.onboarding_active);
+        assert!(app.overlay_card.is_none());
+        assert!(app.command_screen.is_none());
+        assert!(!app.status.contains("Command list"));
+        assert!(app.status.contains("Setup is open"));
+    }
+
+    #[test]
     fn setup_reset_persists_first_time_setup_prompt_without_deleting_installs() -> anyhow::Result<()>
     {
         let mut app = test_app();
@@ -34322,6 +34344,7 @@ Full log
         );
         assert!(app.overlay_card.is_some());
         handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay_card.is_none());
         let hidden_again = render_test_terminal(&app, 140, 32);
         assert!(hidden_again.contains("Show install log"));
         assert!(!hidden_again.contains(&log_path.display().to_string()));
@@ -34555,12 +34578,19 @@ Full log
         assert!(body.contains("ROCm is installed and ready."));
         assert!(body.contains("Press Enter to start ROCm CLI."));
         assert!(body.contains(&install_root.display().to_string()));
-        assert!(rendered.contains("Install folder: selected"));
+        let folder_label = format!(
+            "Install folder: {}",
+            super::display_runtime_folder_path(&install_root)
+        );
+        assert_eq!(
+            super::onboarding_menu_label(&app, super::OnboardingMenuChoice::Folder),
+            folder_label
+        );
+        assert!(rendered.contains("Install folder:"), "{rendered}");
         assert!(rendered.contains("Start ROCm CLI"));
         assert!(!rendered.contains("ROCm CLI folder"));
         assert!(!rendered.contains("Install ROCm CLI"));
         assert!(!rendered.contains("Add ROCm CLI to PATH"));
-        assert!(!rendered.contains(&format!("> Install folder: {}", install_root.display())));
         Ok(())
     }
 
@@ -35166,6 +35196,42 @@ Full log
         );
         assert!(!rendered.contains("command: /install"));
         assert!(!rendered.contains("[Approval]"));
+    }
+
+    #[test]
+    fn onboarding_running_install_modal_ignores_stale_manager_text() {
+        let mut app = test_app();
+        let (sender, receiver) = mpsc::channel();
+        app.onboarding_active = true;
+        app.open_automations_manager();
+        app.running_job = Some(super::RunningJob {
+            title: "Install".to_owned(),
+            kind: super::RunningJobKind::Cli,
+            receiver,
+            started_at: Instant::now(),
+            streamed_lines: 0,
+            streamed_stdout_lines: 0,
+            streamed_stderr_lines: 0,
+        });
+
+        sender
+            .send(super::RunningJobEvent::Stream {
+                stream: super::CommandOutputStream::Stdout,
+                line: "Collecting torch from TheRock".to_owned(),
+            })
+            .unwrap();
+        app.poll_running_job();
+
+        let rendered = render_test_terminal(&app, 120, 32);
+        assert!(rendered.contains("Install is working."), "{rendered}");
+        assert!(
+            rendered.contains("Collecting torch from TheRock"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Choose a review request"),
+            "setup install modal should not show stale manager text:\n{rendered}"
+        );
     }
 
     #[test]
@@ -39385,7 +39451,7 @@ Full log
     }
 
     #[test]
-    fn install_folder_row_keeps_long_path_out_of_left_menu() -> anyhow::Result<()> {
+    fn install_folder_row_shows_selected_path() -> anyhow::Result<()> {
         let mut app = test_app();
         let folder = app
             .paths
@@ -39408,10 +39474,17 @@ Full log
 
         let row_label =
             super::install_sdk_choice_label(super::InstallSdkChoice::Folder, &folder_text);
-        assert_eq!(row_label, "Install folder: selected");
-        assert!(!row_label.contains(&folder_text));
-        let rendered = render_test_terminal(&app, 120, 28);
-        assert!(rendered.contains("Install folder: selected"), "{rendered}");
+        assert_eq!(
+            row_label,
+            format!(
+                "Install folder: {}",
+                super::display_runtime_folder_path(&folder)
+            )
+        );
+        assert!(row_label.contains(&folder_text));
+        let rendered = render_test_terminal(&app, 220, 28);
+        assert!(rendered.contains("Install folder:"), "{rendered}");
+        assert!(!rendered.contains("Install folder: selected"), "{rendered}");
         let details = super::install_manager_detail_text(&app);
         assert!(details.contains("Selected folder"), "{details}");
         assert!(details.contains(&folder_text), "{details}");
@@ -40957,21 +41030,19 @@ Full log
     }
 
     #[test]
-    fn question_mark_opens_help_during_onboarding_without_leaving_setup() {
+    fn question_mark_shows_setup_hint_without_opening_command_list() {
         let mut app = test_app();
         app.onboarding_active = true;
 
         handle_key(&mut app, key_event(KeyCode::Char('?'), KeyModifiers::NONE));
 
         assert!(app.onboarding_active);
-        assert_eq!(
-            app.overlay_card.as_ref().map(|state| state.title.as_str()),
-            Some("Command List")
-        );
+        assert!(app.overlay_card.is_none());
+        assert!(app.command_screen.is_none());
+        assert!(app.status.contains("Setup is open"));
         let rendered = render_test_terminal(&app, 120, 32);
         assert!(rendered.contains("Set Up ROCm"));
-        assert!(rendered.contains("Command List"));
-        assert!(rendered.contains("Enter open"));
+        assert!(!rendered.contains("Command List"));
         assert!(!app.transcript.iter().any(|line| line == "[Commands]"));
     }
 
