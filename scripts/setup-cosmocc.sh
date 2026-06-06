@@ -41,6 +41,21 @@ restore_tool_permissions() {
   fi
 }
 
+needs_elf_toolchain() {
+  local root="$1"
+  local tool
+  for tool in \
+    "$root/bin/x86_64-linux-cosmo-ar" \
+    "$root/bin/x86_64-unknown-cosmo-cc" \
+    "$root/bin/cosmocross" \
+    "$root/bin/assimilate"; do
+    if [[ -f "$tool" ]] && is_ape_file "$tool"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 prepare_wsl_elf_toolchain() {
   local src="$1"
   local dest="$2"
@@ -58,7 +73,7 @@ prepare_wsl_elf_toolchain() {
     exit 1
   fi
 
-  echo "setup-cosmocc: preparing WSL-safe ELF toolchain in $dest" >&2
+  echo "setup-cosmocc: preparing executable ELF toolchain in $dest" >&2
   rm -rf "$dest"
   mkdir -p "$dest"
   tar --exclude=./cosmocc.zip -C "$src" -cf - . | tar -C "$dest" -xf -
@@ -120,7 +135,7 @@ else
 fi
 
 chmod +x "$COSMOCC"
-if is_wsl; then
+if is_wsl || needs_elf_toolchain "$TOOLS_DIR"; then
   prepare_wsl_elf_toolchain "$TOOLS_DIR" "$WSL_ELF_DIR"
 else
   echo "$COSMOCC"

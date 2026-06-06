@@ -21,6 +21,9 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 COSMO_TARGET_KEYWORDS = ("cosmo", "cosmopolitan", "ape")
+DEFAULT_RUSTUP_HOME = REPO_ROOT / ".rocm-work" / "tools" / "rustup"
+DEFAULT_CARGO_HOME = REPO_ROOT / ".rocm-work" / "tools" / "cargo"
+DEFAULT_TOOLCHAIN = "nightly"
 
 
 class FeasibilityError(Exception):
@@ -35,10 +38,16 @@ class CommandResult:
     stderr: str
 
 
-def run_capture(args: list[str], *, cwd: Path | None = None) -> CommandResult:
+def run_capture(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
     completed = subprocess.run(
         args,
         cwd=cwd,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -47,11 +56,30 @@ def run_capture(args: list[str], *, cwd: Path | None = None) -> CommandResult:
     return CommandResult(args, completed.returncode, completed.stdout, completed.stderr)
 
 
-def rust_target_list(rustc: str) -> list[str]:
-    result = run_capture([rustc, "--print", "target-list"])
+def local_rust_env() -> dict[str, str] | None:
+    cargo_bin = DEFAULT_CARGO_HOME / "bin"
+    if not DEFAULT_RUSTUP_HOME.is_dir():
+        return None
+    env = os.environ.copy()
+    env["RUSTUP_HOME"] = str(DEFAULT_RUSTUP_HOME)
+    env["CARGO_HOME"] = str(DEFAULT_CARGO_HOME)
+    if cargo_bin.is_dir():
+        env["PATH"] = str(cargo_bin) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def rust_target_list(rustc: str) -> tuple[str, list[str]]:
+    env = local_rust_env()
+    result = run_capture([rustc, "--print", "target-list"], env=env)
+    label = rustc
+    if result.returncode != 0 and "no default is configured" in result.stderr.lower():
+        fallback = run_capture([rustc, f"+{DEFAULT_TOOLCHAIN}", "--print", "target-list"], env=env)
+        if fallback.returncode == 0:
+            result = fallback
+            label = f"{rustc} +{DEFAULT_TOOLCHAIN}"
     if result.returncode != 0:
         raise FeasibilityError(result.stderr.strip() or result.stdout.strip() or "rustc target-list failed")
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return label, [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def has_builtin_cosmopolitan_target(targets: list[str]) -> bool:
@@ -120,10 +148,10 @@ def repo_contract_messages() -> list[str]:
 
 def print_probe(args: argparse.Namespace) -> None:
     rustc = args.rustc
-    targets = rust_target_list(rustc)
+    rustc_label, targets = rust_target_list(rustc)
     matches = matching_cosmopolitan_targets(targets)
     print("Rust target probe")
-    print(f"  rustc: {rustc}")
+    print(f"  rustc: {rustc_label}")
     print(f"  builtin Cosmopolitan/APE target: {'yes' if matches else 'no'}")
     if matches:
         print(f"  matching targets: {', '.join(matches)}")

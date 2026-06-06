@@ -59,8 +59,9 @@ builder:
 
 - `scripts/setup-cosmocc.sh`
   - downloads `cosmocc` under `.rocm-work/tools/cosmocc`;
-  - creates a WSL-safe ELF-converted toolchain under
-    `.rocm-work/tools/cosmocc-wsl-elf`.
+  - creates an executable ELF-converted toolchain under
+    `.rocm-work/tools/cosmocc-wsl-elf` when the host needs it, including WSL
+    and native Linux containers without APE `execve` support.
 - `scripts/rust_cosmopolitan_spike.py install-toolchain`
   - installs a workspace-local nightly Rust toolchain plus `rust-src` under
     `.rocm-work/tools`.

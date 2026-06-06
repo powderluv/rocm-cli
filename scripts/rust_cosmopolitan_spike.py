@@ -33,7 +33,8 @@ DEFAULT_WORK_ROOT = REPO_ROOT / ".rocm-work" / "tests" / "rust-cosmopolitan"
 DEFAULT_RELEASE_ROOT = REPO_ROOT / ".rocm-work" / "single-exe-release"
 DEFAULT_RUSTUP_HOME = REPO_ROOT / ".rocm-work" / "tools" / "rustup"
 DEFAULT_CARGO_HOME = REPO_ROOT / ".rocm-work" / "tools" / "cargo"
-DEFAULT_COSMOCC_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc-wsl-elf"
+DEFAULT_COSMOCC_NATIVE_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc"
+DEFAULT_COSMOCC_WSL_ELF_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc-wsl-elf"
 DEFAULT_COSMOPOLITAN_SOURCE_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmopolitan-src"
 DEFAULT_TOOLCHAIN = "nightly"
 
@@ -87,6 +88,36 @@ def format_command_failure(result: CommandResult) -> str:
 
 def executable_name(name: str) -> str:
     return f"{name}.exe" if os.name == "nt" else name
+
+
+def host_is_wsl() -> bool:
+    if os.name == "nt":
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "microsoft" in version.lower() or "wsl" in version.lower()
+
+
+def cosmocc_root_has_minimal_tools(root: Path) -> bool:
+    return all(
+        (root / "bin" / name).is_file()
+        for name in (
+            "cosmocc",
+            "cosmocross",
+            "x86_64-unknown-cosmo-cc",
+            "ape-x86_64.elf",
+        )
+    )
+
+
+def default_cosmocc_root() -> Path:
+    if host_is_wsl() or cosmocc_root_has_minimal_tools(DEFAULT_COSMOCC_WSL_ELF_ROOT):
+        return DEFAULT_COSMOCC_WSL_ELF_ROOT
+    return DEFAULT_COSMOCC_NATIVE_ROOT
 
 
 def require_posix_host() -> None:
@@ -1151,14 +1182,6 @@ def probe(args: argparse.Namespace) -> None:
         print(f"  {name}: {status}")
 
 
-def host_is_wsl() -> bool:
-    try:
-        version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-    return "microsoft" in version.lower() or "wsl" in version.lower()
-
-
 def expected_rocm_ape(args: argparse.Namespace, release: bool) -> Path:
     if release:
         return args.work_root.resolve() / "rocm-rust-cosmo-release.exe"
@@ -1226,6 +1249,12 @@ def run_self_test() -> None:
     create_hello_project(with_dir / "hello")
     assert (with_dir / "hello" / "Cargo.toml").is_file()
     assert "[workspace]" in (with_dir / "hello" / "Cargo.toml").read_text(encoding="utf-8")
+    expected_cosmocc_root = (
+        DEFAULT_COSMOCC_WSL_ELF_ROOT
+        if host_is_wsl() or cosmocc_root_has_minimal_tools(DEFAULT_COSMOCC_WSL_ELF_ROOT)
+        else DEFAULT_COSMOCC_NATIVE_ROOT
+    )
+    assert default_cosmocc_root() == expected_cosmocc_root
     print("rust-cosmopolitan spike self-test: ok")
 
 
@@ -1233,7 +1262,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
     parser.add_argument("--rustup-home", type=Path, default=DEFAULT_RUSTUP_HOME)
     parser.add_argument("--cargo-home", type=Path, default=DEFAULT_CARGO_HOME)
-    parser.add_argument("--cosmocc-root", type=Path, default=DEFAULT_COSMOCC_ROOT)
+    parser.add_argument("--cosmocc-root", type=Path, default=default_cosmocc_root())
     parser.add_argument("--cosmopolitan-source-root", type=Path, default=DEFAULT_COSMOPOLITAN_SOURCE_ROOT)
     parser.add_argument("--toolchain", default=DEFAULT_TOOLCHAIN)
 
