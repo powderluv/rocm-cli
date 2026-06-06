@@ -2126,6 +2126,7 @@ impl App {
         };
         let keep_cache_dir = std::env::var_os("ROCM_CLI_CACHE_DIR").is_some();
         self.paths = self.paths.clone().with_managed_root(root, keep_cache_dir);
+        let _ = recover_setup_runtime_registration(&self.paths, &self.config);
     }
 
     fn should_show_onboarding(&self) -> bool {
@@ -13225,7 +13226,10 @@ fn setup_venv_ready(paths: &AppPaths, config: &RocmCliConfig) -> bool {
         .any(runtime_install_root_ready)
 }
 
-fn setup_runtime_ready_for_sidebar(paths: &AppPaths, _config: &RocmCliConfig) -> bool {
+fn setup_runtime_ready_for_sidebar(paths: &AppPaths, config: &RocmCliConfig) -> bool {
+    if setup_venv_ready(paths, config) {
+        return true;
+    }
     ready_serve_runtime_manifests(paths).is_ok_and(|runtimes| !runtimes.is_empty())
 }
 
@@ -40724,7 +40728,7 @@ Full log
         let _ = fs::remove_dir_all(&registry_dir);
 
         assert!(super::setup_venv_ready(&app.paths, &app.config));
-        assert!(!super::setup_runtime_ready_for_sidebar(
+        assert!(super::setup_runtime_ready_for_sidebar(
             &app.paths,
             &app.config
         ));

@@ -1441,16 +1441,35 @@ fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Option<PathBuf>
 }
 
 fn default_qwen_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
-    let mut roots = vec![paths.cache_dir.join("huggingface").join("hub")];
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        roots.push(
-            PathBuf::from(home)
-                .join(".cache")
-                .join("huggingface")
-                .join("hub"),
+    default_qwen_cache_roots_from(paths, |name| std::env::var_os(name).map(PathBuf::from))
+}
+
+fn default_qwen_cache_roots_from<F>(paths: &AppPaths, mut env_path: F) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<PathBuf>,
+{
+    let mut roots = Vec::new();
+    if let Some(hub_cache) = env_path("HUGGINGFACE_HUB_CACHE") {
+        push_qwen_cache_root(&mut roots, hub_cache);
+    }
+    if let Some(hf_home) = env_path("HF_HOME") {
+        push_qwen_cache_root(&mut roots, hf_home.join("hub"));
+    }
+    push_qwen_cache_root(&mut roots, paths.cache_dir.join("huggingface").join("hub"));
+    if let Some(home) = env_path("HOME") {
+        push_qwen_cache_root(
+            &mut roots,
+            home.join(".cache").join("huggingface").join("hub"),
         );
     }
     roots
+}
+
+fn push_qwen_cache_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() || roots.iter().any(|existing| existing == &path) {
+        return;
+    }
+    roots.push(path);
 }
 
 fn find_default_qwen_gguf(cache_root: PathBuf) -> Option<PathBuf> {
@@ -2016,6 +2035,34 @@ mod tests {
                 "--llamacpp",
                 "rocm",
                 "--save-options",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_qwen_lookup_checks_huggingface_cache_env() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("rocm-cache"),
+        };
+        let roots = default_qwen_cache_roots_from(&paths, |name| match name {
+            "HUGGINGFACE_HUB_CACHE" => Some(PathBuf::from("hf-hub")),
+            "HF_HOME" => Some(PathBuf::from("hf-home")),
+            "HOME" => Some(PathBuf::from("home")),
+            _ => None,
+        });
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("hf-hub"),
+                PathBuf::from("hf-home").join("hub"),
+                PathBuf::from("rocm-cache").join("huggingface").join("hub"),
+                PathBuf::from("home")
+                    .join(".cache")
+                    .join("huggingface")
+                    .join("hub"),
             ]
         );
     }

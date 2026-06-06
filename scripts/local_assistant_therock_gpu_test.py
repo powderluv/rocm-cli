@@ -79,6 +79,7 @@ def run_live_acceptance(
 ) -> int:
     data_dir = rocm_cli_data_dir(env)
     service_id = args.service_id
+    manifest_path: Path | None = None
     started_service = False
 
     try:
@@ -95,12 +96,17 @@ def run_live_acceptance(
             )
             serve_output = run_text(serve_cmd, env=env, timeout=args.timeout)
             print(serve_output, end="" if serve_output.endswith("\n") else "\n")
+            manifest_path = parse_manifest_path(serve_output)
             service_id = parse_service_id(serve_output) or find_latest_service_id(
                 data_dir, args.model, args.engine
             )
             started_service = True
 
-        manifest = wait_ready_manifest(data_dir, service_id, args.timeout)
+        manifest = (
+            wait_ready_manifest_path(manifest_path, args.timeout)
+            if manifest_path is not None
+            else wait_ready_manifest(data_dir, service_id, args.timeout)
+        )
         assert_service_manifest(manifest, expected_engine=args.engine)
         wait_local_endpoint(manifest, args.timeout)
         chat_model = args.chat_model or manifest.get("canonical_model_id") or args.model
@@ -119,7 +125,7 @@ def run_live_acceptance(
             "runtime_id": manifest.get("runtime_id"),
             "env_id": manifest.get("env_id"),
             "device_policy": manifest.get("device_policy"),
-            "manifest_path": str(service_manifest_path(data_dir, service_id)),
+            "manifest_path": str(manifest_path or service_manifest_path(data_dir, service_id)),
         }
         print_step("Success: local assistant used the managed local service.")
         print(json.dumps(summary, indent=2))
@@ -345,6 +351,13 @@ def parse_service_id(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def parse_manifest_path(output: str) -> Path | None:
+    match = re.search(r"(?m)^\s*manifest_path:\s*(.+?)\s*$", output)
+    if not match:
+        return None
+    return runtime_path_to_host_path(match.group(1).strip())
+
+
 def rocm_cli_data_dir(env: dict[str, str]) -> Path:
     override = env.get("ROCM_CLI_DATA_DIR")
     if override:
@@ -358,6 +371,10 @@ def service_manifest_path(data_dir: Path, service_id: str) -> Path:
 
 def wait_ready_manifest(data_dir: Path, service_id: str, timeout: int) -> dict[str, Any]:
     path = service_manifest_path(data_dir, service_id)
+    return wait_ready_manifest_path(path, timeout)
+
+
+def wait_ready_manifest_path(path: Path, timeout: int) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_status = "<missing>"
     last_engine_status = "<missing>"
@@ -379,11 +396,11 @@ def wait_ready_manifest(data_dir: Path, service_id: str, timeout: int) -> dict[s
                         return manifest
             if last_status in {"failed", "exited", "unreachable"}:
                 raise RuntimeError(
-                    f"managed service {service_id} reached {last_status}; inspect {path}"
+                    f"managed service manifest reached {last_status}; inspect {path}"
                 )
         time.sleep(1)
     raise RuntimeError(
-        f"managed service {service_id} did not become ready before timeout; "
+        "managed service did not become ready before timeout; "
         f"last status: {last_status}; engine status: {last_engine_status}; manifest: {path}"
     )
 
@@ -680,6 +697,9 @@ def run_self_test() -> int:
     assert "--provider" in chat and "local" in chat
     assert parse_service_id("managed service launched\n  service_id: svc-qwen\n") == "svc-qwen"
     assert parse_service_id("managed service launched\n") is None
+    assert parse_manifest_path("managed service launched\n  manifest_path: /tmp/svc.json\n") == Path(
+        "/tmp/svc.json"
+    )
     with tempfile.TemporaryDirectory() as temp:
         data_dir = Path(temp)
         services = data_dir / "services"

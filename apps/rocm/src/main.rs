@@ -806,6 +806,7 @@ fn render_freeform_doctor_answer(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<String> {
+    recover_setup_runtime_registration(paths, config)?;
     let doctor = DoctorSummary::gather()?;
     let manifests = therock::load_runtime_manifests(paths)?;
     let active = current_runtime_manifest(config, &manifests);
@@ -3306,6 +3307,7 @@ fn env_root_for_self_managed_engine(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<Option<PathBuf>> {
+    recover_setup_runtime_registration(paths, config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
     for selector in [
         config.active_runtime_key.as_deref(),
@@ -4632,6 +4634,7 @@ struct RuntimeUninstallResult {
 }
 
 pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    recover_setup_runtime_registration(paths, config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
     let mut output = String::new();
     let _ = writeln!(output, "registered ROCm runtimes");
@@ -5366,6 +5369,65 @@ fn write_runtime_registry_manifest(
     )
     .with_context(|| format!("failed to write {}", registry_path.display()))?;
     Ok(())
+}
+
+fn recover_setup_runtime_registration(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    let Some(setup_root) = config
+        .setup
+        .therock_venv
+        .as_deref()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+    if !setup_root.is_dir() {
+        return Ok(None);
+    }
+
+    let local_manifest_path = setup_root.join(".rocm-cli-runtime.json");
+    if !local_manifest_path.is_file() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&local_manifest_path)
+        .with_context(|| format!("failed to read {}", local_manifest_path.display()))?;
+    let manifest: therock::InstalledRuntimeManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", local_manifest_path.display()))?;
+    if manifest.runtime_key.trim().is_empty() {
+        bail!(
+            "setup runtime manifest {} has an empty runtime_key",
+            local_manifest_path.display()
+        );
+    }
+    if !paths_equivalent(&manifest.install_root, setup_root) {
+        bail!(
+            "setup runtime manifest {} points at {}, but setup is configured for {}",
+            local_manifest_path.display(),
+            manifest.install_root.display(),
+            setup_root.display()
+        );
+    }
+    validate_runtime_manifest_for_activation(&manifest).with_context(|| {
+        format!(
+            "setup runtime `{}` from {} is not usable",
+            manifest.runtime_key,
+            local_manifest_path.display()
+        )
+    })?;
+
+    if !runtime_manifest_path(paths, &manifest.runtime_key).is_file() {
+        write_runtime_registry_manifest(paths, &manifest, false).with_context(|| {
+            format!(
+                "failed to restore setup runtime `{}` into {}",
+                manifest.runtime_key,
+                runtime_registry_dir(paths).display()
+            )
+        })?;
+    }
+    Ok(Some(manifest.runtime_key))
 }
 
 fn current_runtime_manifest<'a>(
@@ -8776,6 +8838,7 @@ pub(crate) fn render_doctor_text() -> Result<String> {
 }
 
 fn render_doctor_text_with_paths(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    recover_setup_runtime_registration(paths, config)?;
     let summary = DoctorSummary::gather()?;
     let mut output = render_doctor_plain_header(&summary);
     output.push_str(&summary.render_text());
@@ -13456,6 +13519,8 @@ fn validate_engine_selection_runtime(
 }
 
 fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
+    let config = RocmCliConfig::load(paths).unwrap_or_default();
+    recover_setup_runtime_registration(paths, &config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
     let ready = manifests
         .iter()
@@ -13476,6 +13541,13 @@ fn resolve_runtime_selector_to_exact_key(
     match select_runtime_manifest(&manifests, selector) {
         Ok(manifest) => Ok(manifest.runtime_key.clone()),
         Err(error) => {
+            let config = RocmCliConfig::load(paths).unwrap_or_default();
+            if recover_setup_runtime_registration(paths, &config)?.is_some() {
+                let manifests = therock::load_runtime_manifests(paths)?;
+                if let Ok(manifest) = select_runtime_manifest(&manifests, selector) {
+                    return Ok(manifest.runtime_key.clone());
+                }
+            }
             bail!(
                 "runtime selector `{selector}` from {source} is not an exact usable runtime: {error}; run `rocm runtimes list` and `rocm runtimes activate <runtime_key>`, or pass --runtime-id <runtime_key>"
             )
@@ -17250,6 +17322,49 @@ VERSION_ID="41"
             )?,
             "release-pip-gfx120x-all"
         );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_selector_recovers_setup_runtime_registry_from_local_manifest() -> Result<()> {
+        let (root, paths) = test_paths("runtime-selector-recover-setup");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-local-manifest",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            1,
+        )?;
+        let install_root = manifest.install_root.clone();
+        let mut config = RocmCliConfig {
+            default_runtime_id: Some(manifest.runtime_id.clone()),
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+        config.setup.completed = true;
+        config.setup.therock_venv = Some(install_root.clone());
+        config.save(&paths)?;
+
+        let rebased_paths = paths.with_managed_root(install_root, false);
+        let rebased_registry = runtime_registry_dir(&rebased_paths);
+        let _ = fs::remove_dir_all(&rebased_registry);
+
+        assert!(!runtime_manifest_path(&rebased_paths, &manifest.runtime_key).is_file());
+        assert_eq!(
+            resolve_runtime_selector_to_exact_key(
+                &rebased_paths,
+                &manifest.runtime_key,
+                "test active runtime"
+            )?,
+            manifest.runtime_key
+        );
+        assert!(runtime_manifest_path(&rebased_paths, &manifest.runtime_key).is_file());
+
+        let rendered = render_runtimes_text(&rebased_paths, &config)?;
+        assert!(rendered.contains("release-pip-gfx120x-all-local-manifest"));
+        assert!(rendered.contains("status=ready"));
+
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
