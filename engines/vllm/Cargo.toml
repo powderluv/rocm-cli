@@ -10,9 +10,6 @@ rust-version.workspace = true
 name = "rocm-engine-vllm"
 path = "src/main.rs"
 
-[lib]
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

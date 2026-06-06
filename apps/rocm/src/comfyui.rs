@@ -124,15 +124,14 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
             writeln!(output, "  installed: yes")?;
             writeln!(
                 output,
-                "  ROCm install: {} ({})",
-                manifest.runtime_key, manifest.runtime_id
+                "  ROCm install: {}",
+                therock::runtime_version_display(&manifest.runtime_version)
             )?;
-            writeln!(output, "  folder: {}", manifest.source_path.display())?;
-            writeln!(output, "  python: {}", manifest.python_executable.display())?;
+            writeln!(output, "  folder: {}", manifest.runtime_root.display())?;
             writeln!(
                 output,
-                "  torch: {}",
-                manifest.torch_version.as_deref().unwrap_or("unknown")
+                "  models path: {}",
+                models_folder_for_manifest(&manifest).display()
             )?;
             writeln!(
                 output,
@@ -142,11 +141,6 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
                 } else {
                     "failed"
                 }
-            )?;
-            writeln!(
-                output,
-                "  last install log: {}",
-                manifest.log_path.display()
             )?;
         }
         None => {
@@ -166,15 +160,10 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
                 comfyui_run_state_cli_label(run_report.state)
             )?;
             writeln!(output, "  url: {}", state.url)?;
-            writeln!(output, "  pid: {}", state.pid)?;
-            writeln!(output, "  log: {}", state.log_path.display())?;
             match run_report.state {
                 ComfyUiRunState::Running => {}
                 ComfyUiRunState::Starting => {
-                    writeln!(
-                        output,
-                        "  note: process exists, but the local URL is not ready yet"
-                    )?;
+                    writeln!(output, "  note: starting")?;
                 }
                 ComfyUiRunState::Stopped => {
                     writeln!(output, "  next step: rocm comfyui start")?;
@@ -214,6 +203,11 @@ pub(crate) fn render_tui_status(paths: &AppPaths, config: &RocmCliConfig) -> Res
                 output,
                 "  ROCm install: {}",
                 therock::runtime_version_display(&manifest.runtime_version)
+            )?;
+            writeln!(
+                output,
+                "  models path: {}",
+                models_folder_for_manifest(&manifest).display()
             )?;
             writeln!(
                 output,
@@ -263,12 +257,6 @@ pub(crate) fn render_tui_status(paths: &AppPaths, config: &RocmCliConfig) -> Res
         writeln!(output, "ROCm")?;
         writeln!(output, "  Install ROCm first from Set Up ROCm.")?;
     }
-    writeln!(output)?;
-    writeln!(output, "Next actions")?;
-    writeln!(
-        output,
-        "  Use the rows on the left to install, start, or open logs."
-    )?;
     Ok(output)
 }
 
@@ -282,6 +270,36 @@ pub(crate) fn render_tui_logs(
     show_file_locations: bool,
 ) -> Result<String> {
     render_logs_with_options(paths, line_limit, show_file_locations)
+}
+
+pub(crate) fn models_folder(paths: &AppPaths) -> Result<Option<PathBuf>> {
+    Ok(load_manifest(paths)?.map(|manifest| models_folder_for_manifest(&manifest)))
+}
+
+pub(crate) fn is_installed(paths: &AppPaths) -> Result<bool> {
+    Ok(load_manifest(paths)?.is_some())
+}
+
+pub(crate) fn render_models_path(paths: &AppPaths) -> Result<String> {
+    let Some(path) = models_folder(paths)? else {
+        bail!("ComfyUI is not installed yet. Run `rocm comfyui install` first.");
+    };
+    Ok(format!("{}\n", path.display()))
+}
+
+pub(crate) fn running_url(paths: &AppPaths) -> Result<Option<String>> {
+    let Some(state) = load_state(paths)? else {
+        return Ok(None);
+    };
+    let report = evaluate_running_state(&state);
+    if matches!(
+        report.state,
+        ComfyUiRunState::Running | ComfyUiRunState::Starting
+    ) {
+        Ok(Some(state.url))
+    } else {
+        Ok(None)
+    }
 }
 
 fn render_logs_with_options(
@@ -330,28 +348,25 @@ pub(crate) fn install(
 ) -> Result<String> {
     paths.ensure()?;
     let runtime = select_runtime(paths, config, options.runtime_id.as_deref())?;
-    let app_root = app_root(paths);
-    let source_path = source_path(paths);
+    let app_root = runtime_app_root(&runtime.manifest);
+    let source_path = source_path_from_app_root(&app_root);
     let pip_cache = app_root.join("pip-cache");
-    let log_path = install_log_path(paths);
+    let log_path = install_log_path_from_app_root(&app_root);
     let requirements_path = source_path.join("requirements.txt");
+    let models_folder = models_folder_for_source(&source_path);
     let runtime_env = runtime_environment_from_runtime(&runtime.manifest, &runtime.python);
 
     let mut output = String::new();
-    writeln!(output, "{APP_NAME} install")?;
-    writeln!(output, "  ROCm install: {}", runtime.manifest.runtime_key)?;
+    writeln!(output, "{APP_NAME}")?;
+    writeln!(output, "  action: install")?;
     writeln!(
         output,
-        "  ROCm version: {}",
+        "  ROCm install: {}",
         therock::runtime_version_display(&runtime.manifest.version)
     )?;
-    writeln!(output, "  folder: {}", source_path.display())?;
-    writeln!(output, "  python: {}", runtime.python.display())?;
+    writeln!(output, "  folder: {}", app_root.display())?;
+    writeln!(output, "  models path: {}", models_folder.display())?;
     writeln!(output, "  pip cache: {}", pip_cache.display())?;
-    writeln!(
-        output,
-        "  package policy: keep the TheRock ROCm torch packages already installed in this Python environment"
-    )?;
 
     if options.dry_run {
         writeln!(output, "  mode: dry-run")?;
@@ -390,7 +405,7 @@ pub(crate) fn install(
     if !source_path.exists() {
         println!("Downloading ComfyUI source...");
         let _ = io::stdout().flush();
-        download_and_extract_source(paths, &source_path, &mut log)?;
+        download_and_extract_source(&app_root, &source_path, &mut log)?;
     } else {
         println!("Using existing ComfyUI source folder...");
         let _ = io::stdout().flush();
@@ -400,6 +415,8 @@ pub(crate) fn install(
             source_path.display()
         )?;
     }
+    fs::create_dir_all(&models_folder)
+        .with_context(|| format!("failed to create {}", models_folder.display()))?;
 
     let packages = filtered_requirement_specs(&requirements_path)?;
     writeln!(
@@ -448,14 +465,13 @@ pub(crate) fn install(
     writeln!(output, "  installed: yes")?;
     writeln!(
         output,
-        "  AMD GPU check: ready ({} device{})",
+        "  AMD GPU: ready ({} device{})",
         probe.device_count,
         if probe.device_count == 1 { "" } else { "s" }
     )?;
     if !probe.devices.is_empty() {
         writeln!(output, "  GPU: {}", probe.devices.join(", "))?;
     }
-    writeln!(output, "  log: {}", log_path.display())?;
     writeln!(output, "  next step: rocm comfyui start")?;
     Ok(output)
 }
@@ -469,6 +485,9 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
         );
     }
     let runtime_env = runtime_environment_for_manifest(paths, &manifest)?;
+    let models_folder = models_folder_for_manifest(&manifest);
+    fs::create_dir_all(&models_folder)
+        .with_context(|| format!("failed to create {}", models_folder.display()))?;
     let probe = probe_comfyui(
         &manifest.python_executable,
         &manifest.source_path,
@@ -478,7 +497,7 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
         bail!("ComfyUI cannot start because the AMD GPU check failed. No CPU mode was used.");
     }
     let url = format_http_base_url(&options.host, options.port);
-    let log_path = start_log_path(paths);
+    let log_path = start_log_path_for_manifest(&manifest);
     fs::create_dir_all(
         log_path
             .parent()
@@ -531,15 +550,11 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
     if !probe.devices.is_empty() {
         writeln!(output, "  GPU: {}", probe.devices.join(", "))?;
     }
-    writeln!(output, "  url: {url}")?;
+    writeln!(output, "  URL: {url}")?;
+    writeln!(output, "  models path: {}", models_folder.display())?;
     writeln!(output, "  browser: {browser_status}")?;
-    writeln!(output, "  pid: {pid}")?;
-    writeln!(output, "  log: {}", log_path.display())?;
     if run_report.state == ComfyUiRunState::Starting {
-        writeln!(
-            output,
-            "  note: ComfyUI is still loading; use the URL above once it is ready"
-        )?;
+        writeln!(output, "  note: still loading")?;
     }
     Ok(output)
 }
@@ -560,9 +575,7 @@ pub(crate) fn stop(paths: &AppPaths) -> Result<String> {
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
     writeln!(output, "  status: stopped")?;
-    writeln!(output, "  pid: {}", state.pid)?;
     writeln!(output, "  url: {}", state.url)?;
-    writeln!(output, "  log: {}", state.log_path.display())?;
     Ok(output)
 }
 
@@ -606,7 +619,7 @@ fn spawn_comfyui_background_unix(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    apply_runtime_environment(&mut command, &runtime_env)?;
+    apply_runtime_environment(&mut command, runtime_env)?;
     let child = command.spawn().with_context(|| {
         format!(
             "failed to start ComfyUI with {}",
@@ -725,8 +738,25 @@ fn app_root(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("apps").join(APP_ID)
 }
 
+#[cfg(test)]
 fn source_path(paths: &AppPaths) -> PathBuf {
-    app_root(paths).join("source")
+    source_path_from_app_root(&app_root(paths))
+}
+
+fn runtime_app_root(runtime: &therock::InstalledRuntimeManifest) -> PathBuf {
+    runtime.install_root.join("apps").join(APP_ID)
+}
+
+fn source_path_from_app_root(app_root: &Path) -> PathBuf {
+    app_root.join("source")
+}
+
+fn models_folder_for_source(source_path: &Path) -> PathBuf {
+    source_path.join("models")
+}
+
+fn models_folder_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
+    models_folder_for_source(&manifest.source_path)
 }
 
 fn manifest_path(paths: &AppPaths) -> PathBuf {
@@ -737,14 +767,18 @@ fn state_path(paths: &AppPaths) -> PathBuf {
     app_root(paths).join("state").join("running.json")
 }
 
-fn install_log_path(paths: &AppPaths) -> PathBuf {
-    app_root(paths)
+fn install_log_path_from_app_root(app_root: &Path) -> PathBuf {
+    app_root
         .join("logs")
         .join(format!("install-{}.log", unix_time_millis()))
 }
 
-fn start_log_path(paths: &AppPaths) -> PathBuf {
-    app_root(paths)
+fn start_log_path_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
+    manifest
+        .source_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| manifest.runtime_root.join("apps").join(APP_ID))
         .join("logs")
         .join(format!("start-{}.log", unix_time_millis()))
 }
@@ -1129,9 +1163,9 @@ fn select_default_runtime<'a>(
     }
 }
 
-fn select_single_ready_runtime<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Result<&'a therock::InstalledRuntimeManifest> {
+fn select_single_ready_runtime(
+    manifests: &[therock::InstalledRuntimeManifest],
+) -> Result<&therock::InstalledRuntimeManifest> {
     let ready = manifests
         .iter()
         .filter(|manifest| runtime_usability_status(manifest) == "ready")
@@ -1289,12 +1323,11 @@ fn runtime_environment_assignments(
     if let Some(path) = prepend_env_paths(&path_entries, std::env::var_os("PATH"))? {
         values.push(("PATH", path));
     }
-    if runtime_is_linux() {
-        if let Some(ld_library_path) =
+    if runtime_is_linux()
+        && let Some(ld_library_path) =
             prepend_env_paths(&env.library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
-        {
-            values.push(("LD_LIBRARY_PATH", ld_library_path));
-        }
+    {
+        values.push(("LD_LIBRARY_PATH", ld_library_path));
     }
     Ok(values)
 }
@@ -1304,11 +1337,11 @@ fn prepend_env_paths(entries: &[PathBuf], current: Option<OsString>) -> Result<O
     for entry in entries {
         push_existing_path(&mut parts, entry.clone());
     }
-    if let Some(current) = current {
-        if !current.is_empty() {
-            for entry in split_runtime_paths(&current) {
-                push_existing_path(&mut parts, entry);
-            }
+    if let Some(current) = current
+        && !current.is_empty()
+    {
+        for entry in split_runtime_paths(&current) {
+            push_existing_path(&mut parts, entry);
         }
     }
     if parts.is_empty() {
@@ -1363,13 +1396,11 @@ fn same_path_text(left: &Path, right: &Path) -> bool {
 }
 
 fn download_and_extract_source(
-    paths: &AppPaths,
+    app_root: &Path,
     source_path: &Path,
     log: &mut fs::File,
 ) -> Result<()> {
-    let archive_path = app_root(paths)
-        .join("downloads")
-        .join(COMFYUI_SOURCE_ARCHIVE_NAME);
+    let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
     fs::create_dir_all(
         archive_path
             .parent()
@@ -1385,7 +1416,7 @@ fn download_and_extract_source(
             archive_path.display()
         )?;
     }
-    let extract_root = app_root(paths)
+    let extract_root = app_root
         .join("extract")
         .join(format!("source-{}", unix_time_millis()));
     fs::create_dir_all(&extract_root)
@@ -1779,6 +1810,11 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn unused_local_port() -> Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        Ok(listener.local_addr()?.port())
+    }
+
     #[test]
     fn requirements_filter_preserves_therock_torch_stack() {
         let text = "torch torchvision>=1 torchaudio\nnumpy>=1.25\n# comment\naiohttp\n";
@@ -1810,6 +1846,33 @@ mod tests {
         let rendered = render_status(&paths, &config)?;
         assert!(rendered.contains("installed: no"));
         assert!(rendered.contains("next step: rocm comfyui install"));
+        Ok(())
+    }
+
+    #[test]
+    fn install_dry_run_uses_selected_runtime_folder() -> Result<()> {
+        let paths = test_paths("comfyui-selected-runtime-folder");
+        let runtime = ready_runtime_manifest(&paths, "selected-runtime")?;
+        write_runtime_manifest(&paths, &runtime)?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(runtime.runtime_key.clone()),
+            ..Default::default()
+        };
+
+        let rendered = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: None,
+                reinstall: false,
+                dry_run: true,
+            },
+        )?;
+
+        let runtime_app = runtime_app_root(&runtime);
+        assert!(rendered.contains(&runtime_app.display().to_string()));
+        assert!(rendered.contains(&runtime_app.join("pip-cache").display().to_string()));
+        assert!(!rendered.contains(&app_root(&paths).display().to_string()));
         Ok(())
     }
 
@@ -1919,13 +1982,14 @@ mod tests {
         let paths = test_paths("comfyui-stale-state");
         let logs = app_root(&paths).join("logs");
         fs::create_dir_all(&logs)?;
+        let port = unused_local_port()?;
         save_state(
             &paths,
             &ComfyUiState {
                 app_id: APP_ID.to_owned(),
-                url: "http://127.0.0.1:8188".to_owned(),
+                url: format!("http://127.0.0.1:{port}"),
                 host: "127.0.0.1".to_owned(),
-                port: 8188,
+                port,
                 pid: 0,
                 source_path: source_path(&paths),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
@@ -1947,13 +2011,14 @@ mod tests {
         let paths = test_paths("comfyui-tui-stale-state");
         let logs = app_root(&paths).join("logs");
         fs::create_dir_all(&logs)?;
+        let port = unused_local_port()?;
         save_state(
             &paths,
             &ComfyUiState {
                 app_id: APP_ID.to_owned(),
-                url: "http://127.0.0.1:8188".to_owned(),
+                url: format!("http://127.0.0.1:{port}"),
                 host: "127.0.0.1".to_owned(),
-                port: 8188,
+                port,
                 pid: 0,
                 source_path: source_path(&paths),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
@@ -2001,7 +2066,7 @@ mod tests {
 
         assert!(rendered.contains("Installed"));
         assert!(rendered.contains("AMD GPU check: ready"));
-        assert!(rendered.contains("Use the rows on the left"));
+        assert!(!rendered.contains("Use the rows on the left"));
         assert!(!rendered.contains("python"));
         assert!(!rendered.contains("torch"));
         assert!(!rendered.contains("saved file:"));
@@ -2191,6 +2256,82 @@ mod tests {
             .get_envs()
             .find(|(name, _)| name.to_string_lossy() == key)
             .and_then(|(_, value)| value.map(OsString::from))
+    }
+
+    fn ready_runtime_manifest(
+        paths: &AppPaths,
+        runtime_key: &str,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let runtime_root = paths.data_dir.join("runtime-root").join(runtime_key);
+        let python_bin = runtime_root.join(runtime_python_bin_dir_name());
+        let python = python_bin.join(runtime_python_executable_name());
+        let sdk_root = runtime_root.join("sdk");
+        let sdk_bin = sdk_root.join("bin");
+        fs::create_dir_all(&python_bin)?;
+        fs::create_dir_all(&sdk_bin)?;
+        fs::write(runtime_root.join(".rocm-cli-runtime.json"), "{}")?;
+        fs::write(&python, "python")?;
+        let amdhip = sdk_bin.join(if runtime_is_windows() {
+            "amdhip64.dll"
+        } else {
+            "libamdhip64.so"
+        });
+        let hipblas = sdk_bin.join(if runtime_is_windows() {
+            "hipblas.dll"
+        } else {
+            "libhipblas.so"
+        });
+        fs::write(&amdhip, "amdhip")?;
+        fs::write(&hipblas, "hipblas")?;
+
+        Ok(therock::InstalledRuntimeManifest {
+            runtime_key: runtime_key.to_owned(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            channel: "release".to_owned(),
+            format: "pip".to_owned(),
+            family: "gfx120X-all".to_owned(),
+            family_source: "test".to_owned(),
+            version: "7.13.0a20260511".to_owned(),
+            install_root: runtime_root,
+            selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            index_url: None,
+            tarball_file_name: None,
+            python_launcher: None,
+            python_executable: Some(python.display().to_string()),
+            pip_cache_dir: None,
+            rocm_sdk: Some(therock::RocmSdkPythonProbe {
+                import_ok: true,
+                root_path: Some(sdk_root.clone()),
+                bin_path: Some(sdk_bin),
+                resolved_libraries: vec![
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "amdhip64".to_owned(),
+                        paths: vec![amdhip],
+                    },
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "hipblas".to_owned(),
+                        paths: vec![hipblas],
+                    },
+                ],
+                ..therock::RocmSdkPythonProbe::default()
+            }),
+            read_only: false,
+            imported_from: None,
+            installed_at_unix_ms: 100,
+        })
+    }
+
+    fn write_runtime_manifest(
+        paths: &AppPaths,
+        manifest: &therock::InstalledRuntimeManifest,
+    ) -> Result<()> {
+        let registry_dir = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry_dir)?;
+        fs::write(
+            registry_dir.join(format!("{}.json", manifest.runtime_key)),
+            serde_json::to_vec_pretty(manifest)?,
+        )?;
+        Ok(())
     }
 
     fn test_paths(name: &str) -> AppPaths {

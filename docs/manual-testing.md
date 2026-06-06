@@ -13,8 +13,16 @@ When validating release behavior, use the single universal binary:
 .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
 ```
 
-On Windows, run it directly. On WSL/Linux, run the same file through `sh` so the
-Linux path is used.
+On Windows, run it directly. On WSL/Linux, copy or rename the same file to
+`rocm` and run it through `sh` so the Linux path is used:
+
+```bash
+sh ./rocm doctor
+```
+
+Current caveat: direct `./rocm` inside WSL can still be intercepted by
+WSLInterop as a Windows executable before rocm-cli starts. The WSL release
+smoke must report `os: linux` through `sh ./rocm`.
 
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should
 detect the right TheRock package family or tell the user what is missing.
@@ -66,6 +74,16 @@ Expected result:
 
 If the first run opens the main TUI and expects the user to type `/setup`, this
 test fails.
+
+Quiet UI rule:
+
+- First-view setup, engine, service, assistant, and ComfyUI screens should stay
+  terse.
+- Live pip/install logs belong only in the foreground progress card.
+- Finished screens should not show raw command dumps, repeated `Output:`
+  prefixes, hidden log paths, or stale background panes unless the user opens a
+  log/details card.
+- One Esc closes the focused card or asks to quit from the main menu.
 
 After setup, check the machine state:
 
@@ -169,13 +187,15 @@ After a managed or foreground serve attempt, inspect local server records:
 
 ```powershell
 rocm services
+rocm services list --all
 rocm services logs <service-id>
 ```
 
 Expected result:
 
-- Ready or starting servers are counted as local servers.
-- Failed or stopped attempts are shown as past attempts, not running servers.
+- `rocm services` shows only living local servers.
+- `rocm services list --all` shows saved history, including failed or stopped
+  attempts.
 - The logs command shows the exact service failure or startup output.
 - Stop and restart require explicit approval:
 

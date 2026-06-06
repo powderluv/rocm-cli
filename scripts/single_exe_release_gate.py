@@ -18,9 +18,10 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT = (
+DEFAULT_INTERNAL_ARTIFACT = (
     REPO_ROOT / ".rocm-work" / "tests" / "rust-cosmopolitan" / "rocm-rust-cosmo-release.exe"
 )
+DEFAULT_RELEASE_ARTIFACT = REPO_ROOT / ".rocm-work" / "single-exe-release" / "rocm.exe"
 
 
 class GateError(Exception):
@@ -32,6 +33,8 @@ def main() -> int:
     artifact = resolve_path(args.artifact)
     if not artifact.is_file():
         raise SystemExit(f"single-exe artifact not found: {artifact}")
+    if args.stage_release:
+        artifact = stage_release_artifact(artifact, resolve_path(args.release_output))
 
     run_python_self_tests()
     run_windows_smoke(artifact)
@@ -47,7 +50,14 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact", default=str(DEFAULT_ARTIFACT))
+    parser.add_argument("--artifact", default=str(default_artifact()))
+    parser.add_argument(
+        "--stage-release",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="copy the checked artifact to the clean release name before smoke tests",
+    )
+    parser.add_argument("--release-output", default=str(DEFAULT_RELEASE_ARTIFACT))
     parser.add_argument(
         "--wsl",
         action=argparse.BooleanOptionalAction,
@@ -68,11 +78,30 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def default_artifact() -> Path:
+    if DEFAULT_INTERNAL_ARTIFACT.is_file():
+        return DEFAULT_INTERNAL_ARTIFACT
+    return DEFAULT_RELEASE_ARTIFACT
+
+
 def resolve_path(value: str) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = REPO_ROOT / path
     return path.resolve()
+
+
+def stage_release_artifact(source: Path, destination: Path) -> Path:
+    if source == destination:
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    try:
+        destination.chmod(destination.stat().st_mode | 0o755)
+    except OSError:
+        pass
+    print(f"[single-exe-gate] staged release artifact: {destination}")
+    return destination
 
 
 def run_python_self_tests() -> None:
@@ -94,6 +123,21 @@ def run_windows_smoke(artifact: Path) -> None:
         doctor = run([str(artifact), "doctor"], env=env)
         require("os: windows" in doctor, "Windows doctor did not report os: windows")
         require("detected_gfx_target:" in doctor, "Windows doctor did not report GPU target")
+        run_windows_safe_command_smokes(artifact, env)
+
+
+def run_windows_safe_command_smokes(artifact: Path, env: dict[str, str]) -> None:
+    print("[single-exe-gate] running Windows safe command smokes")
+    services = run([str(artifact), "services", "list"], env=env)
+    require("No local servers are running." in services, "services list did not use the empty-state text")
+    services_all = run([str(artifact), "services", "list", "--all"], env=env)
+    require("No local server records yet." in services_all, "services list --all did not use the empty all-records text")
+    runtimes = run([str(artifact), "runtimes", "list"], env=env)
+    require("installed: none" in runtimes, "runtimes list did not report the empty install state")
+    comfyui = run([str(artifact), "comfyui", "status"], env=env)
+    require("installed: no" in comfyui, "comfyui status did not report the empty install state")
+    engines = run([str(artifact), "engines", "list"], env=env)
+    require("lemonade" in engines and "default embedded Lemonade" in engines, "engines list did not report Lemonade")
 
 
 def run_wsl_smoke(artifact: Path) -> None:

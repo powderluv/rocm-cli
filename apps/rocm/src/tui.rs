@@ -3,10 +3,11 @@ use crate::{
     ChatToolApprovalRequest, FreeformPlanAction, activate_runtime, engine_inventory,
     format_structured_tool_call, freeform_plan_next_action_with_context,
     freeform_plan_uses_provider, load_managed_services, logs_browser_page_count,
-    managed_service_sidebar_counts, provider_keys, render_automations_text, render_chat_text,
-    render_daemon_text, render_doctor_text, render_freeform_plan,
-    render_logs_browser_page_text_for_tui, render_service_logs_text_for_tui, render_sidebar_text,
-    render_uninstall_dry_run, render_update_text, runtime_usability_status, therock,
+    managed_service_is_live, managed_service_sidebar_counts, provider_keys,
+    render_automations_text, render_chat_text, render_daemon_text, render_doctor_text,
+    render_freeform_plan, render_logs_browser_page_text_for_tui, render_service_logs_text_for_tui,
+    render_sidebar_text, render_uninstall_dry_run, render_update_text, runtime_usability_status,
+    therock,
 };
 use anyhow::{Context, Result, bail};
 use crossterm::{
@@ -22,7 +23,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -45,7 +46,8 @@ use rocm_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Stdout};
@@ -57,6 +59,7 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 const GPU_MONITOR_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const GPU_STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
@@ -65,6 +68,7 @@ const GPU_AMD_SMI_TIMEOUT: Duration = Duration::from_millis(1_500);
 const TUI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const TUI_SERVICE_READY_TIMEOUT: Duration = Duration::from_millis(250);
+const FALLBACK_ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
 const MAX_COMMAND_OUTPUT_LINES: usize = 240;
 const MAX_COMPLETION_MENU_ITEMS: usize = 8;
 const MAX_ACTIVITY_LOG_ITEMS: usize = 3;
@@ -73,14 +77,13 @@ const ACTIVITY_LOG_TAIL_BYTES: u64 = 64 * 1024;
 const TUI_LOG_BROWSER_PAGE_SIZE: usize = 24;
 const LOG_FOLLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ONBOARDING_INSTALL_LOG_LINES: usize = 10;
-const ONBOARDING_PROGRESS_BAR_WIDTH: usize = 28;
 const PAGE_SCROLL_LINES: i16 = 10;
 const MOUSE_SCROLL_LINES: i16 = 3;
 const CHAT_SESSION_MAX_TURNS: usize = 20;
 const CHAT_SESSION_FOLLOW_SCROLL: u16 = 10_000;
 const ACTIVE_SCREEN_RECENT_OUTPUT_LINES: usize = 120;
 const RUNNING_JOB_OUTPUT_LINES: usize = 1000;
-const VALIDATED_LOCAL_ASSISTANT_MODEL: &str = "Qwen3-0.6B-GGUF";
+const VALIDATED_LOCAL_ASSISTANT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const THEME_BG: Color = Color::Rgb(13, 15, 18);
 const THEME_PANEL: Color = Color::Rgb(19, 20, 22);
 const THEME_PANEL_2: Color = Color::Rgb(29, 31, 35);
@@ -191,7 +194,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "logs",
-        usage: "/logs [query|follow|stop|next|prev|refresh|--search <query>|--service <service-id>]",
+        usage: "/logs [query|follow|stop|next|prev|--search <query>|--service <service-id>]",
     },
     SlashCommandSpec {
         name: "gpu",
@@ -312,7 +315,11 @@ struct App {
     config_manager: Option<ConfigManagerState>,
     services_manager: Option<ServicesManagerState>,
     command_screen: Option<CommandScreenState>,
+    command_screen_last_area: Cell<Option<Rect>>,
     saved_chat_session: Option<ChatSessionState>,
+    chat_stop_service_id: Option<String>,
+    tui_owned_service_ids: BTreeSet<String>,
+    tui_started_comfyui: bool,
     overlay_card: Option<OverlayCardState>,
     folder_browser: Option<FolderBrowserState>,
     onboarding_active: bool,
@@ -338,18 +345,6 @@ enum TuiMode {
     Automations,
 }
 
-impl TuiMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "ask",
-            Self::Act => "act",
-            Self::Serve => "serve",
-            Self::Logs => "logs",
-            Self::Automations => "automations",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeDashboardAction {
     Setup,
@@ -361,6 +356,7 @@ enum HomeDashboardAction {
     Engine,
     Permissions,
     Help,
+    Quit,
 }
 
 fn tui_mode_for_command(head: &str, has_args: bool) -> TuiMode {
@@ -575,7 +571,6 @@ enum DoctorManagerChoice {
 enum LogsViewAction {
     PreviousPage,
     NextPage,
-    Refresh,
     Search,
     ClearSearch,
     ToggleFollow,
@@ -650,7 +645,6 @@ enum CommandScreenAction {
     EditChat,
     ViewChatConnection,
     ViewChatResult,
-    Refresh,
     EnableFullAccess,
     ResetPermissions,
     OpenCommand(&'static str),
@@ -669,11 +663,26 @@ struct OverlayCardState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayCardAction {
     OpenCommand(&'static str),
+    HelpTopic(HelpTopic),
     ClearTranscript,
     ClearProviderKey,
     ShowSetupAgain,
+    StopChatAssistant,
     Quit,
     Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpTopic {
+    GettingStarted,
+    TuiBasics,
+    Setup,
+    LocalModels,
+    Assistant,
+    ComfyUi,
+    Commands,
+    KeyboardShortcuts,
+    Troubleshooting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,6 +692,7 @@ struct FolderBrowserState {
     current_dir: PathBuf,
     entries: Vec<FolderBrowserEntry>,
     selected: usize,
+    scroll_offset: usize,
     message: Option<String>,
     context: FolderBrowserContext,
 }
@@ -830,7 +840,6 @@ enum ServicesManagerAction {
     OpenLogs,
     Stop,
     Restart,
-    Refresh,
     Back,
 }
 
@@ -950,7 +959,6 @@ impl RuntimeAdoptChannel {
 enum RuntimeManagerAction {
     Install,
     RemoveSelected,
-    Refresh,
     AdvancedOptions,
 }
 
@@ -1051,8 +1059,13 @@ enum EngineManagerAction {
     InstallSelected,
     ReinstallSelected,
     InstallRocm,
-    Refresh,
     Back,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineManagerRow {
+    Item(usize),
+    Action(EngineManagerAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1218,13 +1231,6 @@ impl CommandOutputStream {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
-        }
-    }
-
-    fn screen_label(self) -> &'static str {
-        match self {
-            Self::Stdout => "Output",
-            Self::Stderr => "Warning",
         }
     }
 }
@@ -1485,8 +1491,8 @@ impl GpuTelemetry {
         let _ = writeln!(output, "GPU status:");
         if self.static_cards.is_empty() && self.monitor_cards.is_empty() {
             if let Some(error) = &self.last_error {
-                let _ = writeln!(output, "  status: unavailable");
-                let _ = writeln!(output, "  problem: {error}");
+                let _ = writeln!(output, "  status: live usage unavailable");
+                let _ = writeln!(output, "  note: {}", friendly_gpu_telemetry_error(error));
             } else {
                 let _ = writeln!(output, "  status: checking GPU");
             }
@@ -1501,20 +1507,19 @@ impl GpuTelemetry {
         if let Some(model) = self.primary_model_name() {
             let _ = writeln!(output, "  model: {model}");
         }
-        if let Some(gfx) = self.primary_gfx_target() {
-            let _ = writeln!(output, "  ROCm target: {gfx}");
-        }
         if let Some(age) = self.last_monitor_refresh.map(|value| value.elapsed()) {
             let _ = writeln!(output, "  updated: {}", format_elapsed(age));
         }
         if let Some(summary) = self.aggregate_line() {
             let _ = writeln!(output, "  activity: {summary}");
+        } else if self.monitor_cards.is_empty() {
+            let _ = writeln!(output, "  live usage: unavailable");
         }
         for line in self.per_gpu_lines() {
             let _ = writeln!(output, "  {line}");
         }
         if let Some(error) = &self.last_error {
-            let _ = writeln!(output, "  problem: {error}");
+            let _ = writeln!(output, "  note: {}", friendly_gpu_telemetry_error(error));
         }
         output.trim_end().to_owned()
     }
@@ -1528,9 +1533,9 @@ impl GpuTelemetry {
             let _ = writeln!(output);
             let _ = writeln!(output, "No GPU details are available yet.");
             if let Some(error) = &self.last_error {
-                let _ = writeln!(output, "Problem: {error}");
+                let _ = writeln!(output, "Note: {}", friendly_gpu_telemetry_error(error));
             } else {
-                let _ = writeln!(output, "Choose Refresh to check again.");
+                let _ = writeln!(output, "Press F5 to check again.");
             }
             return output;
         }
@@ -1608,7 +1613,7 @@ impl GpuTelemetry {
         }
         if let Some(error) = &self.last_error {
             let _ = writeln!(output);
-            let _ = writeln!(output, "Problem: {error}");
+            let _ = writeln!(output, "Note: {}", friendly_gpu_telemetry_error(error));
         }
         output
     }
@@ -1632,22 +1637,6 @@ impl GpuTelemetry {
             .static_cards
             .values()
             .all(|card| card.market_name.as_deref() == Some(first))
-        {
-            Some(first)
-        } else {
-            Some("mixed")
-        }
-    }
-
-    fn primary_gfx_target(&self) -> Option<&str> {
-        let first = self
-            .static_cards
-            .values()
-            .find_map(|card| card.gfx_target.as_deref())?;
-        if self
-            .static_cards
-            .values()
-            .all(|card| card.gfx_target.as_deref() == Some(first))
         {
             Some(first)
         } else {
@@ -1755,6 +1744,15 @@ impl GpuTelemetry {
         }
         ids.sort_unstable();
         ids
+    }
+}
+
+fn friendly_gpu_telemetry_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("amd-smi") {
+        "live GPU usage is not available in this terminal"
+    } else {
+        "live GPU usage is not available right now"
     }
 }
 
@@ -2067,7 +2065,11 @@ impl App {
             config_manager: None,
             services_manager: None,
             command_screen: None,
+            command_screen_last_area: std::cell::Cell::new(None),
             saved_chat_session: None,
+            chat_stop_service_id: None,
+            tui_owned_service_ids: std::collections::BTreeSet::new(),
+            tui_started_comfyui: false,
             overlay_card: None,
             folder_browser: None,
             onboarding_active: false,
@@ -2116,6 +2118,15 @@ impl App {
 
     fn refresh_config(&mut self) {
         self.config = RocmCliConfig::load(&self.paths).unwrap_or_default();
+        self.rebase_paths_to_saved_setup_folder();
+    }
+
+    fn rebase_paths_to_saved_setup_folder(&mut self) {
+        let Some(root) = self.config.setup.therock_venv.clone() else {
+            return;
+        };
+        let keep_cache_dir = std::env::var_os("ROCM_CLI_CACHE_DIR").is_some();
+        self.paths = self.paths.clone().with_managed_root(root, keep_cache_dir);
     }
 
     fn should_show_onboarding(&self) -> bool {
@@ -2225,14 +2236,16 @@ impl App {
             .is_some_and(|job| matches!(job.kind, RunningJobKind::DoctorRefresh))
         {
             self.doctor_manager = None;
-            self.status = "Doctor closed. The check will finish in the background.".to_owned();
+            self.return_to_home_after_surface_close(
+                "Doctor closed. The check will finish in the background.",
+            );
             return;
         }
         if self.running_job_blocks_screen_close() {
             return;
         }
         self.doctor_manager = None;
-        self.status = "Doctor closed.".to_owned();
+        self.return_to_home_after_surface_close("Doctor closed.");
     }
 
     fn refresh_doctor_manager(&mut self) {
@@ -2291,10 +2304,8 @@ impl App {
         };
         if lines < 0 {
             state.detail_scroll = state.detail_scroll.saturating_sub(lines.unsigned_abs());
-            self.status = "Doctor details scrolled up.".to_owned();
         } else {
             state.detail_scroll = state.detail_scroll.saturating_add(lines as u16);
-            self.status = "Doctor details scrolled down.".to_owned();
         }
     }
 
@@ -2302,8 +2313,8 @@ impl App {
         match self.selected_doctor_manager_choice() {
             DoctorManagerChoice::Back => self.close_doctor_manager(),
             _ => {
-                self.status =
-                    "Use Up/Down to choose another check, R to refresh, Esc to go back.".to_owned();
+                self.status = "Use Up/Down to choose another check, F5 to refresh, Esc to go back."
+                    .to_owned();
             }
         }
     }
@@ -2425,7 +2436,7 @@ impl App {
             return;
         }
         self.runtime_manager = None;
-        self.status = "Runtime manager closed.".to_owned();
+        self.return_to_home_after_surface_close("ROCm installs closed.");
     }
 
     fn move_runtime_manager_selection(&mut self, direction: CompletionDirection) {
@@ -2841,10 +2852,6 @@ impl App {
                     Some(RuntimeManagerAction::RemoveSelected) => {
                         self.request_runtime_manager_uninstall()
                     }
-                    Some(RuntimeManagerAction::Refresh) => {
-                        self.refresh_runtime_manager();
-                        self.status = "Runtime list refreshed.".to_owned();
-                    }
                     Some(RuntimeManagerAction::AdvancedOptions) => {
                         self.open_runtime_advanced_options()
                     }
@@ -2974,7 +2981,7 @@ impl App {
             return;
         }
         self.install_manager = None;
-        self.status = "Install screen closed.".to_owned();
+        self.return_to_home_after_surface_close("Install closed.");
     }
 
     fn move_install_manager_selection(&mut self, direction: CompletionDirection) {
@@ -3328,7 +3335,7 @@ impl App {
             return;
         }
         self.engine_manager = None;
-        self.status = "Engine screen closed.".to_owned();
+        self.return_to_home_after_surface_close("Engines closed.");
     }
 
     fn refresh_engine_manager(&mut self) {
@@ -3342,10 +3349,6 @@ impl App {
                     .or_else(|| state.items.get(state.last_item_selected))
             })
             .map(|item| item.name.clone());
-        let message = self
-            .engine_manager
-            .as_ref()
-            .and_then(|state| state.message.clone());
         self.refresh_config();
         let items = engine_manager_items(&self.paths, &self.config);
         let selected = selected_name
@@ -3357,7 +3360,7 @@ impl App {
             selected,
             last_item_selected: selected,
             detail_scroll: 0,
-            message,
+            message: None,
         });
     }
 
@@ -3365,14 +3368,25 @@ impl App {
         let Some(state) = self.engine_manager.as_mut() else {
             return;
         };
-        let count = engine_manager_choice_count(state);
+        let rows = engine_manager_rows(state);
+        let count = rows.len();
         if count == 0 {
             self.status = "No engines are available.".to_owned();
             return;
         }
-        state.selected = cycle_index(state.selected, count, direction);
-        if state.selected < state.items.len() {
-            state.last_item_selected = state.selected;
+        let selected = cycle_index(state.selected, count, direction);
+        match rows
+            .get(selected)
+            .copied()
+            .unwrap_or(EngineManagerRow::Item(0))
+        {
+            EngineManagerRow::Item(index) => {
+                state.last_item_selected = index;
+                state.selected = index;
+            }
+            EngineManagerRow::Action(_) => {
+                state.selected = selected;
+            }
         }
         state.detail_scroll = 0;
         self.status = "Engine option selected. Press Enter to continue.".to_owned();
@@ -3380,24 +3394,27 @@ impl App {
 
     fn selected_engine_manager_item(&self) -> Option<EngineManagerItem> {
         let state = self.engine_manager.as_ref()?;
-        state.items.get(state.selected).cloned()
+        match engine_manager_selected_row(state)? {
+            EngineManagerRow::Item(index) => state.items.get(index).cloned(),
+            EngineManagerRow::Action(_) => None,
+        }
     }
 
     fn selected_engine_manager_target_item(&self) -> Option<EngineManagerItem> {
         let state = self.engine_manager.as_ref()?;
         state
             .items
-            .get(state.selected)
-            .or_else(|| state.items.get(state.last_item_selected))
+            .get(state.last_item_selected)
+            .or_else(|| state.items.first())
             .cloned()
     }
 
     fn selected_engine_manager_action(&self) -> Option<EngineManagerAction> {
         let state = self.engine_manager.as_ref()?;
-        state
-            .selected
-            .checked_sub(state.items.len())
-            .and_then(|index| engine_manager_actions(state).get(index).copied())
+        match engine_manager_selected_row(state)? {
+            EngineManagerRow::Action(action) => Some(action),
+            EngineManagerRow::Item(_) => None,
+        }
     }
 
     fn select_engine_manager_item(&mut self, engine: &str) -> bool {
@@ -3438,10 +3455,6 @@ impl App {
                 self.request_selected_engine_install(true)
             }
             Some(EngineManagerAction::InstallRocm) => self.open_install_manager(),
-            Some(EngineManagerAction::Refresh) => {
-                self.refresh_engine_manager();
-                self.status = "Engine list refreshed.".to_owned();
-            }
             Some(EngineManagerAction::Back) => self.close_engine_manager(),
             None => self.perform_selected_engine_item_action(),
         }
@@ -3573,7 +3586,7 @@ impl App {
                 state.selected = index;
                 state.detail_scroll = 0;
                 state.message = None;
-                self.status = "Model selected. Press Enter to review a serve plan.".to_owned();
+                self.status = "Model selected. Press Enter to start setup.".to_owned();
             }
             None => {
                 state.message = Some(format!(
@@ -3612,7 +3625,7 @@ impl App {
             }
         };
         state.detail_scroll = 0;
-        self.status = "Model selected. Press Enter to review a serve plan.".to_owned();
+        self.status = "Model selected. Press Enter to start setup.".to_owned();
     }
 
     fn selected_model_recipe(&self) -> Option<ModelRecipeRecord> {
@@ -3630,8 +3643,19 @@ impl App {
             self.status = "No model recipe is selected.".to_owned();
             return;
         };
-        let request = format!("serve {}", recipe.canonical_model_id);
-        self.push_freeform_plan_inline("Plan", &request);
+        let plan = ServeCommandPlan {
+            model: Some(recipe.canonical_model_id),
+            engine: None,
+            device: None,
+            runtime_id: None,
+            env_id: None,
+            host: None,
+            port: None,
+            foreground: false,
+            managed: true,
+            allow_public_bind: false,
+        };
+        self.open_serve_wizard_from_plan(plan);
     }
 
     fn open_serve_wizard(&mut self) {
@@ -4268,7 +4292,7 @@ impl App {
             return;
         }
         self.update_manager = None;
-        self.status = "Update screen closed.".to_owned();
+        self.return_to_home_after_surface_close("Updates closed.");
     }
 
     fn refresh_update_manager(&mut self) {
@@ -4461,7 +4485,7 @@ impl App {
         }
         self.automations_manager = None;
         self.pending_approval = None;
-        self.status = "Automations closed.".to_owned();
+        self.return_to_home_after_surface_close("Automations closed.");
     }
 
     fn refresh_automations_manager(&mut self) {
@@ -4904,7 +4928,7 @@ impl App {
             return;
         }
         self.provider_manager = None;
-        self.status = "Provider screen closed.".to_owned();
+        self.return_to_home_after_surface_close("Providers closed.");
     }
 
     fn open_config_manager(&mut self) {
@@ -4937,7 +4961,7 @@ impl App {
             return;
         }
         self.config_manager = None;
-        self.status = "Settings closed.".to_owned();
+        self.return_to_home_after_surface_close("Settings closed.");
     }
 
     fn move_config_manager_selection(&mut self, direction: CompletionDirection) {
@@ -5684,7 +5708,7 @@ impl App {
         self.provider_manager = None;
         self.config_manager = None;
         self.command_screen = None;
-        let items = load_managed_services(&self.paths).unwrap_or_default();
+        let items = load_visible_managed_services(&self.paths);
         self.services_manager = Some(ServicesManagerState {
             items,
             selected: 0,
@@ -5701,7 +5725,7 @@ impl App {
             return;
         }
         self.services_manager = None;
-        self.status = "Services closed.".to_owned();
+        self.return_to_home_after_surface_close("Services closed.");
     }
 
     fn refresh_services_manager(&mut self) {
@@ -5719,7 +5743,7 @@ impl App {
             .services_manager
             .as_ref()
             .and_then(|state| state.message.clone());
-        let items = load_managed_services(&self.paths).unwrap_or_default();
+        let items = load_visible_managed_services(&self.paths);
         let selected = selected_id
             .and_then(|id| items.iter().position(|record| record.service_id == id))
             .unwrap_or(0)
@@ -5772,8 +5796,7 @@ impl App {
     }
 
     fn first_ready_builtin_assistant_service(&self) -> Option<ManagedServiceRecord> {
-        load_managed_services(&self.paths)
-            .ok()?
+        load_visible_managed_services(&self.paths)
             .into_iter()
             .find(|record| {
                 managed_service_is_chat_ready(record) && tui_service_is_builtin_assistant(record)
@@ -5821,7 +5844,9 @@ impl App {
             self.status = "No managed services found.".to_owned();
             return;
         };
-        self.open_service_logs_browser(record.service_id);
+        let detail = render_service_logs_text_for_tui(&self.paths, &record.service_id, false)
+            .unwrap_or_else(|error| format!("Service log lookup failed.\n\n{error}"));
+        self.open_log_output_card("Service Logs", detail);
     }
 
     fn open_selected_service_chat(&mut self) {
@@ -5844,7 +5869,7 @@ impl App {
                             .to_owned()
                     }
                     _ => {
-                        "This server is still starting.\n\nOpen logs to watch progress, or refresh this screen until it is ready."
+                        "This server is still starting.\n\nOpen logs to watch progress, or press F5 until it is ready."
                             .to_owned()
                     }
                 });
@@ -5900,14 +5925,16 @@ impl App {
             }
             if service_id.is_some() || endpoint_url.is_some() {
                 session.service_id = service_id;
-                session.endpoint_url = endpoint_url;
+                session.endpoint_url = endpoint_url.clone();
             }
             state.chat_model = session.model.clone();
             state.chat_tools = true;
             state.chat_session = Some(session);
         }
         self.sync_chat_session_actions();
-        self.status = "Local assistant ready. Type a message below and press Enter.".to_owned();
+        self.status = endpoint_url
+            .map(|url| format!("Local assistant ready at {url}."))
+            .unwrap_or_else(|| "Local assistant ready.".to_owned());
     }
 
     fn open_local_assistant_start_flow(&mut self, model: Option<String>) {
@@ -5931,10 +5958,7 @@ impl App {
     }
 
     fn ready_local_chat_records(&self) -> Vec<ManagedServiceRecord> {
-        let Ok(services) = load_managed_services(&self.paths) else {
-            return Vec::new();
-        };
-        services
+        load_visible_managed_services(&self.paths)
             .into_iter()
             .filter(managed_service_is_chat_ready)
             .collect()
@@ -6007,6 +6031,9 @@ impl App {
 
     fn handle_managed_serve_completion(&mut self, rendered: &str) {
         let service_id = managed_serve_service_id(rendered);
+        if let Some(service_id) = service_id.as_ref() {
+            self.tui_owned_service_ids.insert(service_id.clone());
+        }
         if let Some(service_id) = service_id.as_deref()
             && let Some(record) = load_managed_services(&self.paths).ok().and_then(|records| {
                 records
@@ -6016,6 +6043,7 @@ impl App {
             && managed_service_is_chat_ready(&record)
         {
             if self.command_screen_is_chat_session() {
+                let endpoint = record.endpoint_url.clone();
                 if let Some(state) = self.command_screen.as_mut()
                     && let Some(session) = state.chat_session.as_mut()
                 {
@@ -6025,7 +6053,7 @@ impl App {
                     session.endpoint_url = Some(record.endpoint_url.clone());
                 }
                 self.sync_chat_session_actions();
-                self.status = "Local assistant server is ready. You can keep chatting.".to_owned();
+                self.status = format!("Local assistant ready at {endpoint}.");
                 return;
             }
             self.open_local_rocm_tools_chat_session(Some(record));
@@ -6036,27 +6064,30 @@ impl App {
         if let Some(service_id) = service_id.as_deref() {
             self.select_service_by_id(service_id);
         }
-        let selected_status = self
-            .selected_service_target_record()
-            .map(|record| record.status)
+        let selected_record = self.selected_service_target_record();
+        let selected_status = selected_record
+            .as_ref()
+            .map(|record| record.status.clone())
             .unwrap_or_default();
         if let Some(state) = self.services_manager.as_mut() {
             state.message = Some(match selected_status.as_str() {
                 "failed" | "unreachable" | "exited" => {
-                    "Local assistant did not start.\n\nOpen the selected logs to see the error, then choose Restart selected server after fixing it."
-                        .to_owned()
+                    "Local assistant did not start.\n\nOpen logs for the reason.".to_owned()
                 }
-                _ => {
-                    "Local assistant is starting.\n\nOpen logs to watch progress, or refresh until it is ready. ROCm CLI opens chat automatically once the service is ready."
-                        .to_owned()
-                }
+                _ => selected_record
+                    .as_ref()
+                    .map(|record| format!("Starting at {}.", record.endpoint_url))
+                    .unwrap_or_else(|| "Local assistant is starting.".to_owned()),
             });
         }
         self.status = match selected_status.as_str() {
             "failed" | "unreachable" | "exited" => {
                 "Local assistant failed to start. Open logs for the reason.".to_owned()
             }
-            _ => "Local assistant is starting. Refresh until it is ready.".to_owned(),
+            _ => selected_record
+                .as_ref()
+                .map(|record| format!("Local assistant starting at {}.", record.endpoint_url))
+                .unwrap_or_else(|| "Local assistant is starting.".to_owned()),
         };
     }
 
@@ -6101,7 +6132,6 @@ impl App {
             Some(ServicesManagerAction::Restart) => {
                 self.request_selected_service_lifecycle(ServiceLifecycleAction::Restart)
             }
-            Some(ServicesManagerAction::Refresh) => self.refresh_services_manager(),
             Some(ServicesManagerAction::Back) => self.close_services_manager(),
             None => self.open_selected_service_logs(),
         }
@@ -6234,8 +6264,7 @@ impl App {
         } else {
             self.onboarding_active = true;
             self.reset_onboarding_selection();
-            self.status =
-                "Setup is required before using local ROCm. Press Ctrl-C to quit.".to_owned();
+            self.status = "Finish setup to continue, or choose Quit setup.".to_owned();
         }
     }
 
@@ -6358,6 +6387,7 @@ impl App {
         self.config.setup.therock_venv = Some(path);
         match self.config.save(&self.paths) {
             Ok(()) => {
+                self.rebase_paths_to_saved_setup_folder();
                 self.onboarding_path_editing = false;
                 self.clear_input();
                 self.select_onboarding_choice(OnboardingMenuChoice::Primary);
@@ -6400,6 +6430,7 @@ impl App {
         self.config.setup.therock_venv = Some(next_path);
         match self.config.save(&self.paths) {
             Ok(()) => {
+                self.rebase_paths_to_saved_setup_folder();
                 self.onboarding_setup_error = None;
                 self.status =
                     "Install folder changed. Press Left/Right for another, or Down to install."
@@ -6474,8 +6505,17 @@ impl App {
         if line.is_empty() {
             return;
         }
+        let following_live_output =
+            self.onboarding_install_log_scroll == 0 && self.running_job_log_scroll == 0;
         self.onboarding_install_log.push_back(line);
-        self.onboarding_install_log_scroll = 0;
+        if following_live_output {
+            self.onboarding_install_log_scroll = 0;
+            self.running_job_log_scroll = 0;
+        } else {
+            self.onboarding_install_log_scroll =
+                self.onboarding_install_log_scroll.saturating_add(1);
+            self.running_job_log_scroll = self.running_job_log_scroll.saturating_add(1);
+        }
         while self.onboarding_install_log.len() > 80 {
             self.onboarding_install_log.pop_front();
         }
@@ -6500,16 +6540,6 @@ impl App {
             LogPageDirection::Next => self.onboarding_install_log_scroll.saturating_sub(8),
             LogPageDirection::Refresh => 0,
         };
-        let noun = if self.onboarding_show_log_location {
-            "setup log"
-        } else {
-            "installer output"
-        };
-        self.status = if self.onboarding_install_log_scroll == 0 {
-            format!("Showing latest {noun}.")
-        } else {
-            format!("Showing earlier {noun}.")
-        };
     }
 
     fn scroll_onboarding_install_log_by(&mut self, lines: i16) {
@@ -6533,16 +6563,6 @@ impl App {
                 .onboarding_install_log_scroll
                 .saturating_sub(lines as usize);
         }
-        let noun = if self.onboarding_show_log_location {
-            "setup log"
-        } else {
-            "installer output"
-        };
-        self.status = if self.onboarding_install_log_scroll == 0 {
-            format!("Showing latest {noun}.")
-        } else {
-            format!("Showing earlier {noun}.")
-        };
     }
 
     fn scroll_running_job_log(&mut self, lines: i16) {
@@ -6551,20 +6571,19 @@ impl App {
             self.status = "No live output to scroll yet.".to_owned();
             return;
         }
-        if lines.is_negative() {
-            self.running_job_log_scroll = self
-                .running_job_log_scroll
-                .saturating_add(usize::from(lines.unsigned_abs()))
-                .min(RUNNING_JOB_OUTPUT_LINES.saturating_mul(20));
+        let max_offset = self.running_job_log_max_offset();
+        if self.onboarding_install_running() {
+            self.onboarding_install_log_scroll =
+                scroll_latest_offset_by(self.onboarding_install_log_scroll, lines, max_offset);
+            self.running_job_log_scroll = self.onboarding_install_log_scroll;
         } else {
             self.running_job_log_scroll =
-                self.running_job_log_scroll.saturating_sub(lines as usize);
+                scroll_latest_offset_by(self.running_job_log_scroll, lines, max_offset);
         }
-        self.status = if self.running_job_log_scroll == 0 {
-            "Showing latest live output.".to_owned()
-        } else {
-            "Showing earlier live output.".to_owned()
-        };
+    }
+
+    fn running_job_log_max_offset(&self) -> usize {
+        running_job_output_visual_line_count(self, 8).saturating_sub(1)
     }
 
     fn onboarding_scrollable_log_len(&self) -> usize {
@@ -6639,6 +6658,7 @@ impl App {
 
     fn request_onboarding_install(&mut self, title: &str) {
         self.reset_onboarding_install_output();
+        self.rebase_paths_to_saved_setup_folder();
         let mut args = vec![
             "install".to_owned(),
             "sdk".to_owned(),
@@ -6738,6 +6758,9 @@ impl App {
             OnboardingMenuChoice::Back if self.running_job.is_none() => {
                 self.return_from_onboarding()
             }
+            OnboardingMenuChoice::Quit if self.running_job.is_none() => {
+                self.request_quit_overlay_or_wait()
+            }
             _ => {}
         }
     }
@@ -6770,15 +6793,11 @@ impl App {
     }
 
     fn sidebar_text(&self) -> String {
-        let mut output = format!(
-            "mode: {}\n{}",
-            self.mode.label(),
-            render_sidebar_text(
-                &self.paths,
-                &self.config,
-                &self.provider,
-                setup_runtime_ready_for_sidebar(&self.paths, &self.config),
-            )
+        let mut output = render_sidebar_text(
+            &self.paths,
+            &self.config,
+            &self.provider,
+            setup_runtime_ready_for_sidebar(&self.paths, &self.config),
         );
         let gpu_text = if self.config.telemetry.local_inspection_enabled() {
             self.gpu_telemetry.sidebar_text()
@@ -6872,10 +6891,24 @@ impl App {
     }
 
     fn max_scroll(&self) -> u16 {
+        if let Ok((terminal_width, terminal_height)) = size() {
+            let area = main_content_area(self, terminal_width, terminal_height);
+            return self.transcript_max_scroll_for_area(area);
+        }
         self.transcript
             .len()
             .saturating_sub(1)
             .min(u16::MAX as usize) as u16
+    }
+
+    fn transcript_max_scroll_for_area(&self, area: Rect) -> u16 {
+        text_scroll_metrics(
+            &self.transcript_text(),
+            area.width.saturating_sub(2).max(1) as usize,
+            area.height.saturating_sub(2).max(1) as usize,
+            u16::MAX,
+        )
+        .offset_u16()
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -6883,7 +6916,7 @@ impl App {
     }
 
     fn scroll_to_line(&mut self, line: usize) {
-        self.transcript_scroll = line.min(self.max_scroll() as usize) as u16;
+        self.transcript_scroll = line.min(u16::MAX as usize) as u16;
     }
 
     fn clear_transcript(&mut self) {
@@ -6923,6 +6956,15 @@ impl App {
         self.status = "Home opened. Use arrow keys, then Enter.".to_owned();
     }
 
+    fn return_to_home_after_surface_close(&mut self, status: impl Into<String>) {
+        self.clear_input();
+        self.home_dashboard_visible = true;
+        self.home_selection = self
+            .home_selection
+            .min(home_dashboard_actions(self).len().saturating_sub(1));
+        self.status = status.into();
+    }
+
     fn selected_home_dashboard_action(&self) -> Option<HomeDashboardAction> {
         let actions = home_dashboard_actions(self);
         actions
@@ -6956,6 +6998,14 @@ impl App {
             self.status = "Choose an action first.".to_owned();
             return;
         };
+        if action == HomeDashboardAction::Quit {
+            self.request_quit_overlay_or_wait();
+            return;
+        }
+        if action == HomeDashboardAction::Help {
+            self.open_interactive_help_overlay();
+            return;
+        }
         let command = home_dashboard_action_command(action);
         self.handle_command(command);
     }
@@ -7012,6 +7062,7 @@ impl App {
         actions: Vec<CommandScreenAction>,
     ) {
         self.remember_current_chat_session();
+        self.command_screen_last_area.set(None);
         self.overlay_card = None;
         self.doctor_manager = None;
         self.logs_view = None;
@@ -7070,6 +7121,19 @@ impl App {
         self.status = "Command list opened. Use arrows, then Enter.".to_owned();
     }
 
+    fn open_interactive_help_overlay(&mut self) {
+        self.folder_browser = None;
+        self.overlay_card = Some(OverlayCardState {
+            title: "Help".to_owned(),
+            detail: "Choose a topic on the left. Use PageUp/PageDown or the mouse wheel to scroll."
+                .to_owned(),
+            selected: 0,
+            detail_scroll: 0,
+            actions: help_topic_actions(),
+        });
+        self.status = "Help opened. Choose a topic, or press Esc to close.".to_owned();
+    }
+
     fn open_clear_overlay(&mut self) {
         self.overlay_card = Some(OverlayCardState {
             title: "Clear".to_owned(),
@@ -7082,14 +7146,40 @@ impl App {
     }
 
     fn open_quit_overlay(&mut self) {
+        let owned = self.tui_owned_running_processes();
+        let detail = if owned.is_empty() {
+            "Leave ROCm CLI?".to_owned()
+        } else {
+            let mut detail = "Leave ROCm CLI?\n\nThese will close too:".to_owned();
+            for item in owned {
+                detail.push_str("\n  ");
+                detail.push_str(&item);
+            }
+            detail
+        };
         self.overlay_card = Some(OverlayCardState {
             title: "Quit".to_owned(),
-            detail: "Leave ROCm CLI?\n\nRunning installs or server actions should finish or be cancelled before exiting.".to_owned(),
+            detail,
             selected: 0,
             detail_scroll: 0,
             actions: vec![OverlayCardAction::Close, OverlayCardAction::Quit],
         });
         self.status = "Quit ROCm CLI? Choose an option.".to_owned();
+    }
+
+    fn open_stop_chat_assistant_overlay(&mut self, service_id: String) {
+        self.chat_stop_service_id = Some(service_id.clone());
+        self.overlay_card = Some(OverlayCardState {
+            title: "Stop Assistant".to_owned(),
+            detail: format!("Stop the local assistant?\n\nServer: {service_id}"),
+            selected: 0,
+            detail_scroll: 0,
+            actions: vec![
+                OverlayCardAction::Close,
+                OverlayCardAction::StopChatAssistant,
+            ],
+        });
+        self.status = "Stop assistant? Choose an option.".to_owned();
     }
 
     fn open_detail_overlay(&mut self, title: impl Into<String>, detail: impl Into<String>) {
@@ -7120,6 +7210,72 @@ impl App {
             return;
         }
         self.open_quit_overlay();
+    }
+
+    fn tui_owned_running_processes(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        for record in self.tui_owned_running_service_records() {
+            items.push(format!(
+                "{}: {} at {}",
+                record.engine, record.canonical_model_id, record.endpoint_url
+            ));
+        }
+        if self.tui_started_comfyui
+            && let Ok(Some(url)) = crate::comfyui::running_url(&self.paths)
+        {
+            items.push(format!("ComfyUI at {url}"));
+        }
+        items
+    }
+
+    fn tui_owned_running_service_records(&self) -> Vec<ManagedServiceRecord> {
+        if self.tui_owned_service_ids.is_empty() {
+            return Vec::new();
+        }
+        load_managed_services(&self.paths)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| self.tui_owned_service_ids.contains(&record.service_id))
+            .filter(managed_service_is_live)
+            .collect()
+    }
+
+    fn stop_tui_owned_processes_for_quit(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        for record in self.tui_owned_running_service_records() {
+            match crate::run_internal_sandbox_tool(
+                &self.paths,
+                crate::SandboxToolArg::StopServer,
+                Some(record.service_id.clone()),
+                true,
+            ) {
+                Ok(_) => {
+                    self.tui_owned_service_ids.remove(&record.service_id);
+                }
+                Err(error) => {
+                    errors.push(format!("{}: {error}", record.service_id));
+                }
+            }
+        }
+        if self.tui_started_comfyui {
+            match crate::comfyui::running_url(&self.paths) {
+                Ok(Some(_)) => match crate::comfyui::stop(&self.paths) {
+                    Ok(_) => {
+                        self.tui_started_comfyui = false;
+                    }
+                    Err(error) => errors.push(format!("ComfyUI: {error}")),
+                },
+                Ok(None) => {
+                    self.tui_started_comfyui = false;
+                }
+                Err(error) => errors.push(format!("ComfyUI: {error}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(errors.join("\n"))
+        }
     }
 
     fn open_unknown_command_overlay(&mut self, command: &str) {
@@ -7157,10 +7313,15 @@ impl App {
 
     fn close_overlay_card(&mut self) -> bool {
         if let Some(state) = self.overlay_card.take() {
+            if state.title == "Stop Assistant" {
+                self.chat_stop_service_id = None;
+            }
             self.status = if state.title == "Clear API Key" {
                 "API key was kept.".to_owned()
             } else if state.title == "First-time Setup" {
                 "Setup settings were kept.".to_owned()
+            } else if state.title == "Stop Assistant" {
+                "Assistant kept running.".to_owned()
             } else {
                 "Card closed.".to_owned()
             };
@@ -7196,10 +7357,8 @@ impl App {
         };
         if lines.is_negative() {
             state.detail_scroll = state.detail_scroll.saturating_sub(lines.unsigned_abs());
-            self.status = "Card scrolled up.".to_owned();
         } else {
             state.detail_scroll = state.detail_scroll.saturating_add(lines as u16);
-            self.status = "Card scrolled down.".to_owned();
         }
     }
 
@@ -7218,6 +7377,9 @@ impl App {
                 self.overlay_card = None;
                 self.handle_command(command);
             }
+            OverlayCardAction::HelpTopic(_) => {
+                self.status = "Choose a topic, then scroll the details on the right.".to_owned();
+            }
             OverlayCardAction::ClearTranscript => {
                 self.overlay_card = None;
                 self.clear_transcript();
@@ -7230,10 +7392,24 @@ impl App {
                 self.overlay_card = None;
                 self.show_setup_again();
             }
-            OverlayCardAction::Quit => {
-                self.should_quit = true;
-                self.status = "Exiting ROCm CLI.".to_owned();
+            OverlayCardAction::StopChatAssistant => {
+                self.stop_chat_assistant_from_overlay();
             }
+            OverlayCardAction::Quit => match self.stop_tui_owned_processes_for_quit() {
+                Ok(()) => {
+                    self.should_quit = true;
+                    self.status = "Exiting ROCm CLI.".to_owned();
+                }
+                Err(error) => {
+                    if let Some(state) = self.overlay_card.as_mut() {
+                        state.detail =
+                            format!("ROCm CLI could not close everything it started.\n\n{error}");
+                        state.selected = 0;
+                        state.detail_scroll = 0;
+                    }
+                    self.status = "Quit paused. A service could not be stopped.".to_owned();
+                }
+            },
             OverlayCardAction::Close => {
                 self.close_overlay_card();
             }
@@ -7248,6 +7424,7 @@ impl App {
                     OverlayCardAction::ClearTranscript
                         | OverlayCardAction::ClearProviderKey
                         | OverlayCardAction::ShowSetupAgain
+                        | OverlayCardAction::StopChatAssistant
                         | OverlayCardAction::Quit
                 )
             })
@@ -7309,6 +7486,7 @@ impl App {
             current_dir,
             entries,
             selected: 0,
+            scroll_offset: 0,
             message,
             context,
         });
@@ -7332,6 +7510,7 @@ impl App {
             return;
         };
         state.selected = cycle_index(state.selected, state.entries.len(), direction);
+        state.scroll_offset = state.scroll_offset.min(state.selected);
         self.status = folder_browser_selected_status(state);
     }
 
@@ -7348,10 +7527,15 @@ impl App {
         let step = lines.unsigned_abs() as usize;
         if lines.is_negative() {
             state.selected = state.selected.saturating_sub(step);
+            state.scroll_offset = state.scroll_offset.saturating_sub(step);
             self.status = "Folder list moved up.".to_owned();
         } else {
             state.selected = state
                 .selected
+                .saturating_add(step)
+                .min(len.saturating_sub(1));
+            state.scroll_offset = state
+                .scroll_offset
                 .saturating_add(step)
                 .min(len.saturating_sub(1));
             self.status = "Folder list moved down.".to_owned();
@@ -7376,6 +7560,7 @@ impl App {
         state.current_dir = current_dir;
         state.entries = entries;
         state.selected = 0;
+        state.scroll_offset = 0;
         state.message = message;
         self.status = "Folder opened.".to_owned();
     }
@@ -7434,6 +7619,7 @@ impl App {
         self.config.setup.therock_venv = Some(folder.clone());
         match self.config.save(&self.paths) {
             Ok(()) => {
+                self.rebase_paths_to_saved_setup_folder();
                 self.onboarding_setup_error = None;
                 self.select_onboarding_choice(OnboardingMenuChoice::Primary);
                 self.status = "ROCm folder saved. Press Enter to install.".to_owned();
@@ -7536,8 +7722,66 @@ impl App {
             return;
         }
         self.remember_current_chat_session();
+        self.command_screen_last_area.set(None);
         self.command_screen = None;
-        self.status = "Screen closed.".to_owned();
+        self.return_to_home_after_surface_close("Screen closed.");
+    }
+
+    fn request_stop_chat_assistant_or_close(&mut self) {
+        if !self.command_screen_is_chat_session() {
+            self.close_command_screen();
+            return;
+        }
+        if self.running_job_blocks_screen_close() {
+            return;
+        }
+        let service_id = self
+            .command_screen
+            .as_ref()
+            .and_then(|state| state.chat_session.as_ref())
+            .and_then(|session| {
+                session.service_id.clone().or_else(|| {
+                    self.ready_local_chat_record_for_session(session)
+                        .map(|record| record.service_id)
+                })
+            })
+            .or_else(|| {
+                self.first_ready_builtin_assistant_service()
+                    .map(|record| record.service_id)
+            });
+        if let Some(service_id) = service_id {
+            self.open_stop_chat_assistant_overlay(service_id);
+        } else {
+            self.close_command_screen();
+        }
+    }
+
+    fn stop_chat_assistant_from_overlay(&mut self) {
+        let Some(service_id) = self.chat_stop_service_id.take() else {
+            self.close_overlay_card();
+            self.close_command_screen();
+            return;
+        };
+        self.overlay_card = None;
+        self.remember_current_chat_session();
+        self.command_screen_last_area.set(None);
+        self.command_screen = None;
+        self.home_dashboard_visible = true;
+        let args = vec![
+            "services".to_owned(),
+            "stop".to_owned(),
+            service_id.clone(),
+            "--yes".to_owned(),
+        ];
+        self.start_cli_command_with_kind(
+            "Services",
+            args,
+            RunningJobKind::ServiceLifecycle {
+                action: ServiceLifecycleAction::Stop,
+                service_id,
+            },
+            None,
+        );
     }
 
     fn command_screen_actions_for_target(
@@ -7548,13 +7792,11 @@ impl App {
             CommandScreenTarget::Permissions if self.config.permissions.full_access_enabled() => {
                 vec![
                     CommandScreenAction::ResetPermissions,
-                    CommandScreenAction::Refresh,
                     CommandScreenAction::Back,
                 ]
             }
             CommandScreenTarget::Permissions => vec![
                 CommandScreenAction::EnableFullAccess,
-                CommandScreenAction::Refresh,
                 CommandScreenAction::Back,
             ],
             CommandScreenTarget::Help => help_command_screen_actions(),
@@ -7567,16 +7809,13 @@ impl App {
             CommandScreenTarget::ChatProvider => vec![
                 CommandScreenAction::OpenCommand("provider"),
                 CommandScreenAction::OpenCommand("config"),
-                CommandScreenAction::Refresh,
                 CommandScreenAction::Back,
             ],
             CommandScreenTarget::Gpu => vec![
-                CommandScreenAction::Refresh,
                 CommandScreenAction::OpenCommand("config"),
                 CommandScreenAction::Back,
             ],
             CommandScreenTarget::Daemon => vec![
-                CommandScreenAction::Refresh,
                 CommandScreenAction::OpenCommand("automations"),
                 CommandScreenAction::OpenCommand("services"),
                 CommandScreenAction::Back,
@@ -7709,37 +7948,46 @@ impl App {
         }
         if lines.is_negative() {
             *scroll = scroll.saturating_sub(lines.unsigned_abs());
-            self.status = "Details scrolled up.".to_owned();
         } else {
             *scroll = scroll.saturating_add(lines as u16);
             if let Some(max_scroll) = chat_detail_max_scroll {
                 *scroll = (*scroll).min(max_scroll);
             }
-            self.status = "Details scrolled down.".to_owned();
         }
     }
 
     fn command_screen_chat_detail_max_scroll(&self) -> u16 {
+        if let Some(area) = self.command_screen_last_area.get() {
+            return bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX);
+        }
         let Ok((terminal_width, terminal_height)) = size() else {
             return CHAT_SESSION_FOLLOW_SCROLL;
         };
-        let completion_height = self
-            .slash_completion_menu()
-            .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
-            .unwrap_or(0);
-        let input_height = chat_input_area_height(self, terminal_width, terminal_height);
-        let detail_height = terminal_height
-            .saturating_sub(completion_height)
-            .saturating_sub(input_height)
-            .saturating_sub(1)
-            .max(1);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: terminal_width,
-            height: detail_height,
-        };
+        let area = main_content_area(self, terminal_width, terminal_height);
         bounded_chat_session_scroll(&command_screen_detail_text(self), area, u16::MAX)
+    }
+
+    fn command_screen_chat_should_follow_latest(&self) -> bool {
+        let Some(state) = self.command_screen.as_ref() else {
+            return false;
+        };
+        if state.chat_session.is_none() {
+            return false;
+        }
+        state.detail_scroll == CHAT_SESSION_FOLLOW_SCROLL
+            || state.detail_scroll
+                >= self
+                    .command_screen_chat_detail_max_scroll()
+                    .saturating_sub(1)
+    }
+
+    fn set_chat_session_follow_if_needed(&mut self, should_follow: bool) {
+        if should_follow
+            && let Some(state) = self.command_screen.as_mut()
+            && state.chat_session.is_some()
+        {
+            state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
+        }
     }
 
     fn scroll_chat_input(&mut self, lines: i16) {
@@ -7761,13 +8009,11 @@ impl App {
         self.chat_input_scroll = self.chat_input_scroll.min(max_scroll);
         if lines.is_negative() {
             self.chat_input_scroll = self.chat_input_scroll.saturating_sub(lines.unsigned_abs());
-            self.status = "Message scrolled up.".to_owned();
         } else {
             self.chat_input_scroll = self
                 .chat_input_scroll
                 .saturating_add(lines as u16)
                 .min(max_scroll);
-            self.status = "Message scrolled down.".to_owned();
         }
     }
 
@@ -7783,6 +8029,17 @@ impl App {
                 scroll: 0,
             });
         }
+    }
+
+    fn open_log_output_card(&mut self, title: impl Into<String>, detail: impl Into<String>) {
+        self.overlay_card = Some(OverlayCardState {
+            title: title.into(),
+            detail: detail.into(),
+            selected: 0,
+            detail_scroll: 0,
+            actions: Vec::new(),
+        });
+        self.status = "Log opened. Scroll or press Esc to close.".to_owned();
     }
 
     fn close_command_screen_detail_modal(&mut self) -> bool {
@@ -7837,10 +8094,8 @@ impl App {
         };
         if lines.is_negative() {
             *scroll = scroll.saturating_sub(lines.unsigned_abs());
-            self.status = "Details scrolled up.".to_owned();
         } else {
             *scroll = scroll.saturating_add(lines as u16);
-            self.status = "Details scrolled down.".to_owned();
         }
     }
 
@@ -7918,7 +8173,6 @@ impl App {
             CommandScreenAction::EditChat => self.edit_selected_chat_prompt(),
             CommandScreenAction::ViewChatConnection => self.open_chat_connection_detail(),
             CommandScreenAction::ViewChatResult => self.open_chat_result_detail(),
-            CommandScreenAction::Refresh => self.refresh_command_screen(),
             CommandScreenAction::EnableFullAccess => {
                 if self.config.permissions.full_access_enabled() {
                     self.refresh_command_screen();
@@ -8220,7 +8474,7 @@ impl App {
                     "--managed".to_owned(),
                 ],
                 "Sure. I can start the recommended Lemonade assistant on your AMD GPU. Nothing launches until you approve it.",
-                "Start the recommended low-VRAM Lemonade assistant.",
+                "Start the recommended Lemonade assistant.",
             ))
         } else {
             None
@@ -8384,6 +8638,7 @@ impl App {
         content: impl Into<String>,
         detail: Option<String>,
     ) {
+        let should_follow = self.command_screen_chat_should_follow_latest();
         let Some(session) = self
             .command_screen
             .as_mut()
@@ -8404,7 +8659,7 @@ impl App {
         if keep_from > 0 {
             session.turns.drain(0..keep_from);
         }
-        if let Some(state) = self.command_screen.as_mut() {
+        if should_follow && let Some(state) = self.command_screen.as_mut() {
             state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         }
         self.sync_chat_session_actions();
@@ -8609,6 +8864,7 @@ impl App {
         };
     }
 
+    #[cfg(test)]
     fn open_service_logs_browser(&mut self, service_id: String) {
         let rendered = render_service_logs_text_for_tui(&self.paths, &service_id, false)
             .unwrap_or_else(|error| format!("Service log lookup failed.\n\n{error}"));
@@ -8637,7 +8893,7 @@ impl App {
             editing_search: false,
             detail_modal: None,
         });
-        self.status = "Service logs opened. Choose Refresh or Back.".to_owned();
+        self.status = "Service logs opened. Use F5 to refresh or Back.".to_owned();
     }
 
     fn stop_following_logs(&mut self) {
@@ -8719,7 +8975,7 @@ impl App {
                 self.status = "Service logs refreshed.".to_owned();
             } else {
                 self.logs_view = Some(current);
-                self.status = "Service logs have one page. Choose Refresh or Back.".to_owned();
+                self.status = "Service logs have one page. Use F5 to refresh or Back.".to_owned();
             }
             return;
         }
@@ -8792,14 +9048,13 @@ impl App {
         } else {
             state.detail_scroll = state.detail_scroll.saturating_add(lines as u16);
         }
-        self.status = "Log details scrolled.".to_owned();
     }
 
     fn selected_logs_view_action(&self) -> LogsViewAction {
         self.logs_view
             .as_ref()
             .and_then(|state| logs_view_actions().get(state.selected).copied())
-            .unwrap_or(LogsViewAction::Refresh)
+            .unwrap_or(LogsViewAction::Back)
     }
 
     fn logs_view_editing_text(&self) -> bool {
@@ -8867,7 +9122,6 @@ impl App {
         match self.selected_logs_view_action() {
             LogsViewAction::PreviousPage => self.page_logs_browser(LogPageDirection::Previous),
             LogsViewAction::NextPage => self.page_logs_browser(LogPageDirection::Next),
-            LogsViewAction::Refresh => self.page_logs_browser(LogPageDirection::Refresh),
             LogsViewAction::Search => self.start_logs_search_edit(),
             LogsViewAction::ClearSearch => self.clear_logs_search(),
             LogsViewAction::ToggleFollow => {
@@ -8982,7 +9236,6 @@ impl App {
         } else {
             modal.scroll = modal.scroll.saturating_add(lines as u16);
         }
-        self.status = "File location card scrolled.".to_owned();
     }
 
     fn scroll_up(&mut self, lines: u16) {
@@ -9974,55 +10227,85 @@ impl App {
                     args.as_slice(),
                     ["log-files"] | ["logs", "files"] | ["log", "files"]
                 );
-                let detail = if showing_logs || showing_log_files {
-                    crate::comfyui::render_tui_logs(&self.paths, 80, false)
+                if showing_logs || showing_log_files {
+                    let (title, detail, status) = if showing_logs {
+                        (
+                            "ComfyUI Logs",
+                            crate::comfyui::render_tui_logs(&self.paths, 160, false)
+                                .unwrap_or_else(|error| {
+                                    format!("ComfyUI logs could not be opened.\n\n{error}")
+                                }),
+                            "ComfyUI logs shown.",
+                        )
+                    } else {
+                        (
+                            "ComfyUI Log Files",
+                            crate::comfyui::render_tui_logs(&self.paths, 80, true).unwrap_or_else(
+                                |error| {
+                                    format!(
+                                        "ComfyUI log file locations could not be opened.\n\n{error}"
+                                    )
+                                },
+                            ),
+                            "ComfyUI log file locations shown.",
+                        )
+                    };
+                    self.open_log_output_card(title, detail);
+                    self.status = status.to_owned();
+                    return true;
+                }
+                let showing_models_path = matches!(args.as_slice(), ["models-path"] | ["models"]);
+                let mut detail = if showing_models_path {
+                    crate::comfyui::render_models_path(&self.paths)
+                        .map(|path| format!("Models path\n\n{}", path.trim()))
                 } else {
                     crate::comfyui::render_tui_status(&self.paths, &self.config)
                 }
                 .unwrap_or_else(|error| {
-                    if showing_logs || showing_log_files {
-                        format!("ComfyUI logs could not be opened.\n\n{error}")
+                    if showing_models_path {
+                        format!("ComfyUI models path could not be opened.\n\n{error}")
                     } else {
                         format!("ComfyUI status failed.\n\n{error}")
                     }
                 });
-                let detail_modal = if showing_log_files {
-                    Some(
-                        crate::comfyui::render_tui_logs(&self.paths, 80, true).unwrap_or_else(
-                            |error| {
-                                format!(
-                                    "ComfyUI log file locations could not be opened.\n\n{error}"
-                                )
-                            },
-                        ),
-                    )
-                } else {
-                    None
-                };
-                let selected = match args.as_slice() {
-                    ["install"] => 0,
-                    ["start"] => 1,
-                    ["logs"] | ["log"] => 2,
-                    ["log-files"] | ["logs", "files"] | ["log", "files"] => 3,
-                    _ => 0,
-                };
-                self.open_command_screen(
-                    "ComfyUI",
-                    detail,
-                    None,
-                    vec![
-                        CommandScreenAction::OpenCommand("comfyui install"),
-                        CommandScreenAction::OpenCommand("comfyui start"),
-                        CommandScreenAction::OpenCommand("comfyui logs"),
-                        CommandScreenAction::OpenCommand("comfyui log-files"),
-                        CommandScreenAction::Back,
-                    ],
-                );
-                if let Some(state) = self.command_screen.as_mut() {
-                    state.selected = selected.min(state.actions.len().saturating_sub(1));
+                if !showing_logs && !showing_log_files && !showing_models_path {
+                    append_comfyui_tui_paths(&mut detail, &self.paths, None);
                 }
-                if let Some(detail) = detail_modal {
-                    self.open_command_screen_detail_modal("ComfyUI Log Files", detail);
+                let installed = crate::comfyui::is_installed(&self.paths).unwrap_or(false);
+                let running = crate::comfyui::running_url(&self.paths)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let actions = if showing_models_path {
+                    vec![
+                        CommandScreenAction::OpenCommand("comfyui models-path"),
+                        CommandScreenAction::Back,
+                    ]
+                } else {
+                    comfyui_command_screen_actions(installed, running)
+                };
+                let selected_command = match args.as_slice() {
+                    ["install"] => "comfyui install",
+                    ["start"] => "comfyui start",
+                    ["models-path"] | ["models"] => "comfyui models-path",
+                    ["logs"] | ["log"] => "comfyui logs",
+                    ["log-files"] | ["logs", "files"] | ["log", "files"] => "comfyui log-files",
+                    _ => "comfyui start",
+                };
+                self.open_command_screen("ComfyUI", detail, None, actions);
+                if let Some(state) = self.command_screen.as_mut() {
+                    state.selected = state
+                        .actions
+                        .iter()
+                        .position(|action| {
+                            matches!(
+                                action,
+                                CommandScreenAction::OpenCommand(command)
+                                    if *command == selected_command
+                            )
+                        })
+                        .unwrap_or(0)
+                        .min(state.actions.len().saturating_sub(1));
                 }
                 match args.as_slice() {
                     [] | ["status"] => {
@@ -10033,6 +10316,9 @@ impl App {
                     }
                     ["log-files"] | ["logs", "files"] | ["log", "files"] => {
                         self.status = "ComfyUI log file locations shown.".to_owned();
+                    }
+                    ["models-path"] | ["models"] => {
+                        self.status = "ComfyUI models path shown.".to_owned();
                     }
                     ["install"] => {
                         self.request_screen_cli_approval(
@@ -10127,7 +10413,7 @@ impl App {
                     }
                     _ => {
                         self.set_active_screen_message(
-                            "Choose a service from this list.\n\nUse the action rows to open logs, stop, restart, refresh, or go back.",
+                            "Choose a service from this list.\n\nUse the action rows to open logs, stop, restart, or go back. Press F5 to refresh.",
                         );
                         self.status = "Choose a service from the list.".to_owned();
                     }
@@ -10146,7 +10432,12 @@ impl App {
                         self.stop_following_logs();
                     }
                     Ok(LogsCommandTarget::Service(service_id)) => {
-                        self.open_service_logs_browser(service_id);
+                        let detail =
+                            render_service_logs_text_for_tui(&self.paths, &service_id, false)
+                                .unwrap_or_else(|error| {
+                                    format!("Service log lookup failed.\n\n{error}")
+                                });
+                        self.open_log_output_card("Service Logs", detail);
                     }
                     Ok(LogsCommandTarget::Browser { query }) => {
                         self.open_logs_browser(query, 0);
@@ -10171,7 +10462,7 @@ impl App {
                     _ => {
                         self.open_command_screen(
                             "GPU",
-                            "GPU status is shown here.\n\nChoose Refresh to update the snapshot, or Back to leave.",
+                            "GPU status is shown here.\n\nPress F5 to update the snapshot, or Back to leave.",
                             Some(CommandScreenTarget::Gpu),
                             self.command_screen_actions_for_target(CommandScreenTarget::Gpu),
                         );
@@ -10828,6 +11119,9 @@ impl App {
         };
         if self.onboarding_handles_command_output(title) {
             self.push_onboarding_install_log(&line);
+            if self.running_job_uses_foreground_output(title) {
+                self.push_running_job_output_line(&line);
+            }
             return;
         }
         if self.active_screen_handles_command_output(title) {
@@ -10887,7 +11181,11 @@ impl App {
                     .collect::<Vec<String>>()
             })
             .unwrap_or_default();
-        lines.push(format!("{}: {line}", stream.screen_label()));
+        let line = match stream {
+            CommandOutputStream::Stdout => line.to_owned(),
+            CommandOutputStream::Stderr => format!("Warning: {line}"),
+        };
+        lines.push(line);
         let keep_from = lines
             .len()
             .saturating_sub(ACTIVE_SCREEN_RECENT_OUTPUT_LINES);
@@ -10904,6 +11202,7 @@ impl App {
         if content.is_empty() {
             return;
         }
+        let should_follow = self.command_screen_chat_should_follow_latest();
         if let Some(state) = self.command_screen.as_mut()
             && state.chat_session.is_some()
         {
@@ -10919,7 +11218,9 @@ impl App {
                     detail: None,
                 });
             }
-            state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
+            if should_follow {
+                state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
+            }
             return;
         }
         if let Some(state) = self.command_screen.as_mut()
@@ -11178,7 +11479,7 @@ impl App {
                     )
                 });
                 if screen_command {
-                    if let Some(summary) = screen_summary.as_deref() {
+                    if !output_ok && let Some(summary) = screen_summary.as_deref() {
                         self.set_active_screen_message(summary.to_owned());
                     }
                 } else if onboarding_command {
@@ -11229,7 +11530,18 @@ impl App {
                     if self.automations_manager.is_some() {
                         self.refresh_automations_manager();
                     }
-                    if let Some(summary) = screen_summary.as_deref() {
+                    let screen_success_message = if output_ok {
+                        terse_screen_command_success_text(&self.paths, &title, &rendered)
+                    } else {
+                        None
+                    };
+                    if output_ok {
+                        if let Some(message) = screen_success_message {
+                            self.set_active_screen_message(message);
+                        } else {
+                            self.clear_active_screen_message();
+                        }
+                    } else if let Some(summary) = screen_summary.as_deref() {
                         self.set_active_screen_message(summary.to_owned());
                     }
                     if output_ok {
@@ -11243,23 +11555,72 @@ impl App {
                             "Update action finished.".to_owned()
                         } else if title == "Automations" || title == "Review" {
                             "Automation action finished.".to_owned()
+                        } else if title == "ComfyUI" {
+                            comfyui_success_status(&rendered)
+                                .unwrap_or_else(|| "ComfyUI is ready.".to_owned())
                         } else if self.command_screen.is_some() {
                             format!("{title} finished.")
                         } else {
                             "Runtime change completed.".to_owned()
                         };
                     }
+                    if output_ok && title == "ComfyUI" {
+                        let installed = crate::comfyui::is_installed(&self.paths).unwrap_or(false)
+                            || rendered.lines().any(|line| line.trim() == "installed: yes")
+                            || keyed_output_value(&rendered, "URL").is_some();
+                        let running = crate::comfyui::running_url(&self.paths)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                            || keyed_output_value(&rendered, "URL").is_some();
+                        if let Some(state) = self.command_screen.as_mut() {
+                            state.actions = comfyui_command_screen_actions(installed, running);
+                            state.selected =
+                                state.selected.min(state.actions.len().saturating_sub(1));
+                        }
+                    }
+                    if output_ok
+                        && title == "ComfyUI"
+                        && keyed_output_value(&rendered, "URL").is_some()
+                    {
+                        self.tui_started_comfyui = true;
+                    }
                 }
                 if self.command_screen_is_chat_session()
                     && chat_session_owns_command_title(title.as_str())
                 {
-                    let summary = match screen_summary.clone() {
-                        Some(summary) if !final_output.trim().is_empty() => {
-                            format!("{summary}\n\nCommand result\n{final_output}")
-                        }
-                        Some(summary) => summary,
-                        None => final_output.clone(),
+                    let should_follow = self.command_screen_chat_should_follow_latest();
+                    let recent_live_output = if !self.running_job_output.is_empty() {
+                        self.running_job_output
+                            .iter()
+                            .map(|line| format!("  {}", display_stream_log_line(line)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        recent_screen_output
+                            .as_deref()
+                            .unwrap_or_default()
+                            .lines()
+                            .map(|line| format!("  {}", display_stream_log_line(line.trim())))
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     };
+                    let mut summary_parts = Vec::new();
+                    if let Some(summary) = screen_summary.clone()
+                        && !summary.trim().is_empty()
+                    {
+                        summary_parts.push(summary);
+                    }
+                    if !recent_live_output.trim().is_empty() {
+                        summary_parts.push(format!("Recent output\n{recent_live_output}"));
+                    }
+                    if !final_output.trim().is_empty() {
+                        summary_parts.push(format!("Command result\n{final_output}"));
+                    }
+                    if summary_parts.is_empty() {
+                        summary_parts.push(final_output.clone());
+                    }
+                    let summary = summary_parts.join("\n\n");
                     self.push_chat_session_turn_with_detail(
                         ChatSessionRole::Tool,
                         chat_session_command_result_text(&title, output_ok, &summary),
@@ -11269,8 +11630,8 @@ impl App {
                     );
                     if let Some(state) = self.command_screen.as_mut() {
                         state.message = None;
-                        state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.set_chat_session_follow_if_needed(should_follow);
                     self.status = if output_ok {
                         "ROCm command finished. You can keep chatting.".to_owned()
                     } else {
@@ -11320,6 +11681,7 @@ impl App {
                 if self.command_screen_is_chat_session()
                     && chat_session_owns_command_title(title.as_str())
                 {
+                    let should_follow = self.command_screen_chat_should_follow_latest();
                     let summary = format!("{title} failed to start.\n\n{error}");
                     self.push_chat_session_turn_with_detail(
                         ChatSessionRole::Tool,
@@ -11328,8 +11690,8 @@ impl App {
                     );
                     if let Some(state) = self.command_screen.as_mut() {
                         state.message = None;
-                        state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.set_chat_session_follow_if_needed(should_follow);
                     self.status = format!("{title} failed to start. The result is in the chat.");
                     chat_auto_follow_up = true;
                 }
@@ -11344,6 +11706,7 @@ impl App {
             ) => {
                 let chat_approval = output.chat_approval.clone();
                 if self.command_screen_is_chat_session() {
+                    let should_follow = self.command_screen_chat_should_follow_latest();
                     if !chat_output_is_stream_completion_marker(&output.rendered) {
                         self.push_chat_session_turn(
                             ChatSessionRole::Assistant,
@@ -11352,8 +11715,8 @@ impl App {
                     }
                     if let Some(state) = self.command_screen.as_mut() {
                         state.message = None;
-                        state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.set_chat_session_follow_if_needed(should_follow);
                 } else if rocm_tools {
                     if self.active_screen_handles_command_output("Chat") {
                         self.set_active_screen_message(output.rendered.clone());
@@ -11394,14 +11757,15 @@ impl App {
             }
             (RunningJobKind::Chat { provider, .. }, Err(error)) => {
                 if self.command_screen_is_chat_session() {
+                    let should_follow = self.command_screen_chat_should_follow_latest();
                     self.push_chat_session_turn(
                         ChatSessionRole::Assistant,
                         format!("Chat request failed.\n\n{error}"),
                     );
                     if let Some(state) = self.command_screen.as_mut() {
                         state.message = None;
-                        state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.set_chat_session_follow_if_needed(should_follow);
                 } else if self.active_screen_handles_command_output("Chat") {
                     self.set_active_screen_message(format!("Chat request failed.\n\n{error}"));
                 } else {
@@ -11481,16 +11845,21 @@ impl App {
             }
             (RunningJobKind::ServiceLifecycle { action, service_id }, Ok(output)) => {
                 let final_output = final_output_for_transcript(&output.rendered, streamed);
-                if self.active_screen_handles_command_output("Services") {
-                    self.set_active_screen_message(if output.ok {
-                        format!("{}\n\n{final_output}", action.success_title())
-                    } else {
-                        format!("{}\n\n{final_output}", action.failure_title())
-                    });
-                } else {
+                if self.active_screen_handles_command_output("Services") && !output.ok {
+                    self.set_active_screen_message(format!(
+                        "{}\n\n{final_output}",
+                        action.failure_title()
+                    ));
+                } else if !output.ok {
                     self.push_final_output_block("Services", &final_output, streamed.total);
                 }
                 self.refresh_services_manager();
+                if output.ok {
+                    self.clear_active_screen_message();
+                    if action == ServiceLifecycleAction::Stop {
+                        self.tui_owned_service_ids.remove(&service_id);
+                    }
+                }
                 self.status = if output.ok {
                     action.success_title().to_owned()
                 } else {
@@ -11560,6 +11929,7 @@ impl App {
             ));
             return false;
         }
+        self.rebase_paths_to_saved_setup_folder();
         true
     }
 
@@ -11869,14 +12239,15 @@ impl App {
         match pending.action {
             ApprovalAction::CliCommand { .. } | ApprovalAction::RocmdCommand { .. } => {
                 if self.command_screen_is_chat_session() {
+                    let should_follow = self.command_screen_chat_should_follow_latest();
                     self.push_chat_session_turn(
                         ChatSessionRole::Tool,
                         chat_session_cancelled_command_text(&pending.title),
                     );
                     if let Some(state) = self.command_screen.as_mut() {
                         state.message = None;
-                        state.detail_scroll = CHAT_SESSION_FOLLOW_SCROLL;
                     }
+                    self.set_chat_session_follow_if_needed(should_follow);
                     self.status = "Approval cancelled. You can keep chatting.".to_owned();
                 } else if self.runtime_manager.is_none()
                     && !self.onboarding_active
@@ -11899,6 +12270,7 @@ impl App {
                         self.status =
                             "Serve cancelled. Choose Start when you are ready.".to_owned();
                     } else if self.onboarding_active {
+                        self.reset_onboarding_selection();
                         self.status =
                             format!("{} cancelled. You're still in setup.", pending.title);
                     } else {
@@ -11951,6 +12323,21 @@ impl App {
                 }
                 self.status = "Review unchanged.".to_owned();
             }
+        }
+    }
+
+    fn cancel_focused_action_to_home(&mut self) {
+        let title = self
+            .pending_approval
+            .as_ref()
+            .map(|pending| pending.title.clone())
+            .unwrap_or_else(|| "Approval".to_owned());
+        let stay_in_chat = self.command_screen_is_chat_session();
+        let stay_in_setup = self.onboarding_active;
+        self.cancel_focused_action();
+        if !stay_in_chat && !stay_in_setup && self.pending_approval.is_none() {
+            self.open_home_dashboard();
+            self.status = format!("{title} cancelled. Back at the main menu.");
         }
     }
 
@@ -12798,6 +13185,7 @@ enum OnboardingMenuChoice {
     Uninstall,
     ShowLog,
     Back,
+    Quit,
 }
 
 fn load_onboarding_runtimes(paths: &AppPaths) -> Vec<OnboardingRuntime> {
@@ -12828,6 +13216,7 @@ fn load_onboarding_runtimes(paths: &AppPaths) -> Vec<OnboardingRuntime> {
 
 fn setup_venv_ready(paths: &AppPaths, config: &RocmCliConfig) -> bool {
     if let Some(venv_path) = config.setup.therock_venv.as_ref()
+        && !folder_browser_is_internal_rocm_dir(paths, venv_path)
         && setup_install_root_ready(venv_path)
     {
         return true;
@@ -12932,7 +13321,11 @@ fn latest_setup_runtime(paths: &AppPaths) -> Option<OnboardingRuntime> {
 }
 
 fn current_setup_runtime(paths: &AppPaths, config: &RocmCliConfig) -> Option<OnboardingRuntime> {
-    let configured_root = config.setup.therock_venv.as_ref();
+    let configured_root = config
+        .setup
+        .therock_venv
+        .as_ref()
+        .filter(|path| !folder_browser_is_internal_rocm_dir(paths, path));
     let active_key = config.active_runtime_key.as_deref();
     if let Some(configured_root) = configured_root
         && let Some(mut runtime) = load_local_onboarding_runtime(configured_root)
@@ -13017,7 +13410,33 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn folder_browser_is_internal_rocm_dir(paths: &AppPaths, path: &Path) -> bool {
+    let path = normalize_runtime_folder_path(path.to_path_buf());
+    [
+        "apps",
+        "audit",
+        "automations",
+        "cache",
+        "engines",
+        "launcher",
+        "logs",
+        "tools",
+    ]
+    .into_iter()
+    .map(|name| normalize_runtime_folder_path(paths.data_dir.join(name)))
+    .any(|internal| path_is_same_or_inside(&path, &internal))
+}
+
 fn default_setup_venv_path(paths: &AppPaths) -> PathBuf {
+    let config_dir = normalize_runtime_folder_path(paths.config_dir.clone());
+    let data_dir = normalize_runtime_folder_path(paths.data_dir.clone());
+    if data_dir == config_dir || path_is_same_or_inside(&data_dir, &config_dir) {
+        return config_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join("rocm_venvs").join("default"))
+            .unwrap_or_else(|| config_dir.join("rocm_venvs").join("default"));
+    }
     paths.data_dir.join("envs").join("default")
 }
 
@@ -13026,7 +13445,12 @@ fn setup_install_root(paths: &AppPaths, config: &RocmCliConfig) -> PathBuf {
         .setup
         .therock_venv
         .clone()
-        .or_else(|| latest_setup_runtime(paths).and_then(|runtime| runtime.install_root))
+        .filter(|path| !folder_browser_is_internal_rocm_dir(paths, path))
+        .or_else(|| {
+            latest_setup_runtime(paths)
+                .and_then(|runtime| runtime.install_root)
+                .filter(|path| !folder_browser_is_internal_rocm_dir(paths, path))
+        })
         .unwrap_or_else(|| default_setup_venv_path(paths))
 }
 
@@ -13353,57 +13777,15 @@ fn validate_onboarding_install_folder(input: &str) -> Result<PathBuf> {
 }
 
 fn normalize_runtime_folder_path(path: PathBuf) -> PathBuf {
-    if !runtime_is_windows() {
-        return path;
-    }
-    PathBuf::from(windows_runtime_drive_path_storage_text(
-        &path.display().to_string(),
-    ))
-}
-
-fn normalize_windows_drive_path_text(value: &str) -> String {
-    let value = value.trim();
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        let drive = (bytes[0] as char).to_ascii_uppercase();
-        let rest = value[2..].replace('\\', "/");
-        let rest = rest.trim_start_matches('/');
-        if rest.is_empty() {
-            return format!("{drive}:/");
-        }
-        return format!("{drive}:/{rest}");
-    }
-    value.to_owned()
-}
-
-fn windows_runtime_drive_path_storage_text(value: &str) -> String {
-    let value = normalize_windows_drive_path_text(value);
-    if std::path::MAIN_SEPARATOR == '\\' && windows_drive_path_is_absolute_text(&value) {
-        value.replace('/', "\\")
-    } else {
-        value
-    }
+    rocm_core::normalize_runtime_path_for_host(&path)
 }
 
 fn display_runtime_folder_path(path: &Path) -> String {
-    let value = normalize_runtime_folder_path(path.to_path_buf())
-        .display()
-        .to_string();
-    if runtime_is_windows() && windows_drive_path_is_absolute_text(&value) {
-        value.replace('/', "\\")
-    } else {
-        value
-    }
+    rocm_core::normalize_runtime_path_text_for_storage(&path.display().to_string())
 }
 
 fn runtime_folder_path_is_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        || (runtime_is_windows() && windows_path_is_absolute_text(&path.display().to_string()))
-}
-
-fn windows_path_is_absolute_text(value: &str) -> bool {
-    let value = normalize_windows_drive_path_text(value);
-    windows_drive_path_is_absolute_text(&value) || windows_unc_path_is_absolute_text(&value)
+    rocm_core::runtime_path_text_is_absolute_for_host(&path.display().to_string())
 }
 
 fn windows_drive_path_is_absolute_text(value: &str) -> bool {
@@ -13418,14 +13800,8 @@ fn windows_drive_path_is_root(path: &Path) -> bool {
     if !runtime_is_windows() {
         return false;
     }
-    let value = normalize_windows_drive_path_text(&path.display().to_string());
+    let value = rocm_core::normalize_runtime_path_text_for_host(&path.display().to_string());
     windows_drive_path_is_absolute_text(&value) && value[3..].is_empty()
-}
-
-fn windows_unc_path_is_absolute_text(value: &str) -> bool {
-    let normalized = value.replace('\\', "/");
-    let mut parts = normalized.split('/').filter(|part| !part.is_empty());
-    normalized.starts_with("//") && parts.next().is_some() && parts.next().is_some()
 }
 
 fn ensure_onboarding_folder_writable(dir: &Path) -> Result<()> {
@@ -13668,6 +14044,11 @@ fn engine_runtime_ready(paths: &AppPaths, config: &RocmCliConfig, engine: &str) 
 
 fn ready_engine_env_id(paths: &AppPaths, config: &RocmCliConfig, engine: &str) -> Option<String> {
     let runtime_selectors = onboarding_runtime_selectors(paths, config)?;
+    if engine == "pytorch"
+        && let Some(runtime_id) = ready_pytorch_runtime_id(paths, &runtime_selectors)
+    {
+        return Some(runtime_id);
+    }
     let entry = config.engine_config(engine)?;
     let mut env_ids = Vec::new();
     if let Some(env_id) = entry.preferred_env_id.as_ref() {
@@ -13691,6 +14072,24 @@ fn ready_engine_env_id(paths: &AppPaths, config: &RocmCliConfig, engine: &str) -
             }
         })
     })
+}
+
+fn ready_pytorch_runtime_id(paths: &AppPaths, runtime_selectors: &[String]) -> Option<String> {
+    load_onboarding_runtimes(paths)
+        .into_iter()
+        .filter(runtime_install_root_ready)
+        .find_map(|runtime| {
+            let runtime_key = runtime.runtime_key.as_deref();
+            let selector_matches = runtime_selectors.iter().any(|selector| {
+                runtime_key.is_some_and(|key| selector == key)
+                    || selector.eq_ignore_ascii_case(&runtime.runtime_id)
+            });
+            selector_matches.then_some(
+                runtime
+                    .runtime_key
+                    .unwrap_or_else(|| runtime.runtime_id.clone()),
+            )
+        })
 }
 
 fn onboarding_runtime_selectors(paths: &AppPaths, config: &RocmCliConfig) -> Option<Vec<String>> {
@@ -13779,6 +14178,7 @@ fn onboarding_menu_choices(app: &App) -> Vec<OnboardingMenuChoice> {
     }
     let mut choices = vec![OnboardingMenuChoice::Folder, OnboardingMenuChoice::Primary];
     choices.extend(maybe_show_log);
+    choices.push(OnboardingMenuChoice::Quit);
     choices
 }
 
@@ -13854,6 +14254,7 @@ fn onboarding_selection_status(app: &App) -> String {
             "Press Enter to return to ROCm CLI.".to_owned()
         }
         OnboardingMenuChoice::Back => "Press Enter to return without changing setup.".to_owned(),
+        OnboardingMenuChoice::Quit => "Press Enter to quit ROCm CLI.".to_owned(),
     }
 }
 
@@ -13883,31 +14284,11 @@ fn onboarding_menu_label(app: &App, choice: OnboardingMenuChoice) -> String {
         OnboardingMenuChoice::ShowLog => "Show install log".to_owned(),
         OnboardingMenuChoice::Back if app.pending_approval.is_some() => "Cancel".to_owned(),
         OnboardingMenuChoice::Back => "Back".to_owned(),
+        OnboardingMenuChoice::Quit => "Quit setup".to_owned(),
     }
 }
 
-fn onboarding_install_progress_bar(app: &App) -> String {
-    let Some(job) = app.running_job.as_ref() else {
-        return "[----------------------------]".to_owned();
-    };
-    let width = ONBOARDING_PROGRESS_BAR_WIDTH;
-    let elapsed_ticks = (job.started_at.elapsed().as_millis() / 250) as usize;
-    let head = elapsed_ticks % width;
-    let mut bar = String::with_capacity(width + 2);
-    bar.push('[');
-    for index in 0..width {
-        if index == head {
-            bar.push('>');
-        } else if index.abs_diff(head) <= 3 {
-            bar.push('=');
-        } else {
-            bar.push('-');
-        }
-    }
-    bar.push(']');
-    bar
-}
-
+#[cfg(test)]
 fn onboarding_install_current_step(app: &App) -> String {
     let Some(line) = app.onboarding_install_log.back() else {
         return "Starting the installer...".to_owned();
@@ -14169,16 +14550,15 @@ fn render_onboarding_screen_text_with_log_limit(app: &App, install_log_limit: us
     append_onboarding_gpu_section(&mut output, app);
     let _ = writeln!(output);
     let _ = writeln!(output, "Install location");
-    let folder_label = if app.config.setup.therock_venv.is_some() {
-        "Selected"
-    } else {
-        "Recommended"
-    };
-    let _ = writeln!(output, "  {folder_label}: {}", install_folder.display());
     let _ = writeln!(
         output,
-        "  Downloads stay inside: {}",
-        pip_cache_dir.display()
+        "  Folder: {}",
+        display_runtime_folder_path(&install_folder)
+    );
+    let _ = writeln!(
+        output,
+        "  Downloaded files: {}",
+        display_runtime_folder_path(&pip_cache_dir)
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Status");
@@ -14220,37 +14600,8 @@ fn render_onboarding_screen_text_with_log_limit(app: &App, install_log_limit: us
     }
 
     if app.running_job.is_some() {
-        if should_draw_running_job_modal(app) {
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Setup is running.");
-            return output.trim_end().to_owned();
-        }
         let _ = writeln!(output);
-        let job_title = app
-            .running_job
-            .as_ref()
-            .map(|job| job.title.as_str())
-            .unwrap_or("Install");
-        let running_label = if job_title == "Uninstall" {
-            "Uninstalling ROCm"
-        } else if job_title == "Reinstall" {
-            "Reinstalling ROCm"
-        } else {
-            "Installing ROCm"
-        };
-        let _ = writeln!(output, "{running_label}");
-        let _ = writeln!(output, "  {}", onboarding_install_progress_bar(app));
-        let _ = writeln!(output, "  {}", onboarding_install_current_step(app));
-        let lines = render_onboarding_install_output(app, install_log_limit);
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Installer output");
-        if lines.is_empty() {
-            let _ = writeln!(output, "  Starting setup...");
-        } else {
-            for line in lines {
-                let _ = writeln!(output, "  {}", display_stream_log_line(&line));
-            }
-        }
+        let _ = writeln!(output, "Setup is running.");
         return output.trim_end().to_owned();
     }
 
@@ -14466,19 +14817,32 @@ fn append_gpu_summary_section(output: &mut String, summary: &HostGpuSummary) {
         (Some(name), Some(gfx), None) => {
             let _ = writeln!(output, "  GPU: {name}");
             let _ = writeln!(output, "  Target: {gfx}");
-            let _ = writeln!(output, "  ROCm package: will be chosen during install");
+            let _ = writeln!(
+                output,
+                "  ROCm package: selected automatically during install"
+            );
         }
-        (Some(name), None, _) => {
+        (Some(name), None, Some(family)) => {
             let _ = writeln!(output, "  GPU: {name}");
-            let _ = writeln!(output, "  ROCm package: will be chosen during install");
+            let _ = writeln!(output, "  ROCm package: {family}");
+        }
+        (Some(name), None, None) => {
+            let _ = writeln!(output, "  GPU: {name}");
+            let _ = writeln!(
+                output,
+                "  ROCm package: selected automatically during install"
+            );
         }
         (None, Some(gfx), Some(family)) => {
-            let _ = writeln!(output, "  AMD GPU target: {gfx}");
+            let _ = writeln!(output, "  Target: {gfx}");
             let _ = writeln!(output, "  ROCm package: {family}");
         }
         (None, Some(gfx), None) => {
-            let _ = writeln!(output, "  AMD GPU target: {gfx}");
-            let _ = writeln!(output, "  ROCm package: will be chosen during install");
+            let _ = writeln!(output, "  Target: {gfx}");
+            let _ = writeln!(
+                output,
+                "  ROCm package: selected automatically during install"
+            );
         }
         (None, None, Some(family)) => {
             let _ = writeln!(output, "  ROCm package: {family}");
@@ -14502,24 +14866,22 @@ fn onboarding_gpu_install_sentence(summary: &HostGpuSummary) -> String {
         .filter(|value| !value.trim().is_empty());
 
     match (name, gfx, family) {
-        (Some(name), Some(gfx), Some(family)) => {
-            format!("It will install {family} for {name} ({gfx}).")
+        (Some(name), Some(_gfx), Some(_family)) => {
+            format!("It will install the matching ROCm package for {name}.")
         }
-        (Some(name), Some(gfx), None) => {
-            format!("It will choose the ROCm package for {name} ({gfx}).")
+        (Some(name), Some(_gfx), None) => {
+            format!("It will choose the matching ROCm package for {name}.")
         }
         (Some(name), None, _) => {
-            format!("It will choose the ROCm package for {name}.")
+            format!("It will choose the matching ROCm package for {name}.")
         }
-        (None, Some(gfx), Some(family)) => {
-            format!("It will install {family} for AMD GPU target {gfx}.")
+        (None, Some(gfx), Some(_family)) => {
+            format!("It will install the matching ROCm package for AMD GPU target {gfx}.")
         }
         (None, Some(gfx), None) => {
-            format!("It will choose the ROCm package for AMD GPU target {gfx}.")
+            format!("It will choose the matching ROCm package for AMD GPU target {gfx}.")
         }
-        (None, None, Some(family)) => {
-            format!("It will install ROCm package {family}.")
-        }
+        (None, None, Some(_family)) => "It will install the matching ROCm package.".to_owned(),
         (None, None, None) => "It will detect the AMD GPU package before installing.".to_owned(),
     }
 }
@@ -14847,6 +15209,7 @@ fn slash_argument_candidates(
             "status".to_owned(),
             "install".to_owned(),
             "start".to_owned(),
+            "models-path".to_owned(),
             "logs".to_owned(),
             "log-files".to_owned(),
         ],
@@ -15395,6 +15758,207 @@ fn input_viewport(input: &str, cursor: usize, width: u16) -> (String, u16) {
     (visible, cursor_column as u16)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollMetrics {
+    content_len: usize,
+    viewport_len: usize,
+    offset: usize,
+}
+
+impl ScrollMetrics {
+    #[cfg(test)]
+    fn max_offset(self) -> usize {
+        self.content_len.saturating_sub(self.viewport_len)
+    }
+
+    fn offset_u16(self) -> u16 {
+        self.offset.min(u16::MAX as usize) as u16
+    }
+
+    fn should_draw(self) -> bool {
+        self.content_len > self.viewport_len
+    }
+}
+
+fn scroll_metrics(
+    content_len: usize,
+    viewport_len: usize,
+    requested_offset: usize,
+) -> ScrollMetrics {
+    let viewport_len = viewport_len.max(1);
+    let content_len = content_len.max(1);
+    let max_offset = content_len.saturating_sub(viewport_len);
+    ScrollMetrics {
+        content_len,
+        viewport_len,
+        offset: requested_offset.min(max_offset),
+    }
+}
+
+fn text_scroll_metrics(
+    text: &str,
+    content_width: usize,
+    viewport_height: usize,
+    requested_offset: u16,
+) -> ScrollMetrics {
+    let content_len = paragraph_visual_line_count(text, content_width);
+    let viewport_height = scrollable_text_viewport_len(content_len, viewport_height);
+    scroll_metrics(content_len, viewport_height, usize::from(requested_offset))
+}
+
+fn scrollable_text_viewport_len(content_len: usize, viewport_height: usize) -> usize {
+    let viewport_height = viewport_height.max(1);
+    if content_len > viewport_height {
+        viewport_height.saturating_sub(1).max(1)
+    } else {
+        viewport_height
+    }
+}
+
+fn scroll_latest_offset_by(current: usize, lines: i16, max_offset: usize) -> usize {
+    let current = current.min(max_offset);
+    if lines.is_negative() {
+        current
+            .saturating_add(usize::from(lines.unsigned_abs()))
+            .min(max_offset)
+    } else {
+        current.saturating_sub(lines as usize)
+    }
+}
+
+fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, metrics: ScrollMetrics) {
+    if area.width == 0 || area.height == 0 || !metrics.should_draw() {
+        return;
+    }
+    let mut scrollbar_state = ScrollbarState::new(metrics.content_len)
+        .position(metrics.offset)
+        .viewport_content_length(metrics.viewport_len);
+    frame.render_stateful_widget(
+        Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+        area,
+        &mut scrollbar_state,
+    );
+}
+
+fn draw_completion_menu(frame: &mut Frame<'_>, menu: &CompletionMenu, area: Rect) {
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    let (visible_start, visible_end) = completion_visible_range(menu);
+    let items = menu
+        .items
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+        .map(|(index, item)| {
+            let style = if menu
+                .replacements
+                .get(index)
+                .is_some_and(|replacement| replacement.is_some())
+            {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(item.as_str()).style(style)
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if menu
+        .replacements
+        .get(menu.selected)
+        .is_some_and(|replacement| replacement.is_some())
+    {
+        state.select(Some(menu.selected.saturating_sub(visible_start)));
+    }
+    let completions = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(menu.title.clone())
+                .border_style(Style::default().fg(THEME_ACCENT)),
+        )
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL))
+        .highlight_symbol("> ")
+        .highlight_style(selection_style());
+    frame.render_stateful_widget(completions, area, &mut state);
+    let visible_len = visible_end.saturating_sub(visible_start);
+    draw_scrollbar(
+        frame,
+        area,
+        scroll_metrics(menu.items.len(), visible_len.max(1), visible_start),
+    );
+}
+
+fn centered_size_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    }
+}
+
+fn draw_command_prompt_popup(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    completion_menu: Option<&CompletionMenu>,
+) {
+    if area.width < 12 || area.height < 8 {
+        return;
+    }
+    let completion_height = completion_menu
+        .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
+        .unwrap_or(0);
+    let wanted_width = area.width.saturating_sub(4).min(96).max(48.min(area.width));
+    let wanted_height = completion_height
+        .saturating_add(6)
+        .min(area.height.saturating_sub(2).max(8))
+        .max(7);
+    let modal = centered_size_rect(wanted_width, wanted_height, area);
+    draw_modal_clear(frame, modal, area);
+    let block = surface_block(" Command ", THEME_ACCENT);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(completion_height),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    if let Some(menu) = completion_menu {
+        draw_completion_menu(frame, menu, rows[0]);
+    }
+
+    let input_inner_width = rows[1].width.saturating_sub(2);
+    let (visible_input, visible_cursor) =
+        input_viewport(&app.input, app.input_cursor, input_inner_width);
+    let input = Paragraph::new(visible_input)
+        .block(surface_block("Run a / command", THEME_ACCENT))
+        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3));
+    frame.render_widget(input, rows[1]);
+    let hint = Paragraph::new("Tab suggestions | Enter run | Esc close")
+        .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL_3));
+    frame.render_widget(hint, rows[2]);
+    frame.set_cursor_position((
+        rows[1]
+            .x
+            .saturating_add(1)
+            .saturating_add(visible_cursor)
+            .min(rows[1].right().saturating_sub(2)),
+        rows[1].y.saturating_add(1),
+    ));
+}
+
 fn chat_input_area_height(app: &App, terminal_width: u16, terminal_height: u16) -> u16 {
     if !app.command_screen_is_chat_session() || app.input.is_empty() {
         return 3;
@@ -15403,7 +15967,7 @@ fn chat_input_area_height(app: &App, terminal_width: u16, terminal_height: u16) 
     let wanted = chat_input_visual_line_count(&app.input, app.input_cursor, inner_width)
         .min(6)
         .saturating_add(2) as u16;
-    let max_height = terminal_height.saturating_sub(10).max(3).min(8);
+    let max_height = terminal_height.saturating_sub(10).clamp(3, 8);
     wanted.max(3).min(max_height)
 }
 
@@ -15544,8 +16108,7 @@ fn fallback_terminal_event(
     error: std::io::Error,
 ) -> Result<Option<Event>> {
     if receiver.is_none() {
-        *status = "Terminal input is using the portable fallback. Arrow keys and Enter still work."
-            .to_owned();
+        *status = "Keyboard ready. Arrow keys and Enter still work.".to_owned();
         *receiver = Some(spawn_fallback_terminal_reader());
         let _ = error;
     }
@@ -15564,9 +16127,21 @@ fn fallback_terminal_event(
 fn spawn_fallback_terminal_reader() -> Receiver<Event> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut stdin = stdin.lock();
-        while let Some(event) = read_fallback_terminal_event(&mut stdin) {
+        let (byte_sender, byte_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            let mut byte = [0u8; 1];
+            while stdin.read_exact(&mut byte).is_ok() {
+                if byte_sender.send(byte[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        while let Some(event) = read_fallback_terminal_event_from_receiver(
+            &byte_receiver,
+            FALLBACK_ESCAPE_SEQUENCE_TIMEOUT,
+        ) {
             if sender.send(event).is_err() {
                 break;
             }
@@ -15575,10 +16150,31 @@ fn spawn_fallback_terminal_reader() -> Receiver<Event> {
     receiver
 }
 
+fn read_fallback_terminal_event_from_receiver(
+    receiver: &Receiver<u8>,
+    escape_timeout: Duration,
+) -> Option<Event> {
+    let byte = receiver.recv().ok()?;
+    fallback_terminal_event_from_byte(byte, &mut |timeout| {
+        receiver.recv_timeout(timeout.min(escape_timeout)).ok()
+    })
+}
+
 fn read_fallback_terminal_event<R: Read>(reader: &mut R) -> Option<Event> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte).ok()?;
-    match byte[0] {
+    fallback_terminal_event_from_byte(byte[0], &mut |_| {
+        let mut next = [0u8; 1];
+        reader.read_exact(&mut next).ok()?;
+        Some(next[0])
+    })
+}
+
+fn fallback_terminal_event_from_byte(
+    byte: u8,
+    next_byte: &mut impl FnMut(Duration) -> Option<u8>,
+) -> Option<Event> {
+    match byte {
         b'\r' | b'\n' => Some(fallback_key(KeyCode::Enter)),
         b'\t' => Some(fallback_key(KeyCode::Tab)),
         0x08 | 0x7f => Some(fallback_key(KeyCode::Backspace)),
@@ -15586,51 +16182,105 @@ fn read_fallback_terminal_event<R: Read>(reader: &mut R) -> Option<Event> {
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         ))),
-        0x1b => read_fallback_escape_sequence(reader).or_else(|| Some(fallback_key(KeyCode::Esc))),
+        0x1b => {
+            read_fallback_escape_sequence(next_byte).or_else(|| Some(fallback_key(KeyCode::Esc)))
+        }
         value if value.is_ascii_control() => None,
         value => Some(fallback_key(KeyCode::Char(value as char))),
     }
 }
 
-fn read_fallback_escape_sequence<R: Read>(reader: &mut R) -> Option<Event> {
-    let mut second = [0u8; 1];
-    reader.read_exact(&mut second).ok()?;
-    if second[0] != b'[' {
+fn read_fallback_escape_sequence(
+    next_byte: &mut impl FnMut(Duration) -> Option<u8>,
+) -> Option<Event> {
+    let second = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?;
+    if second == b'O' {
+        let third = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?;
+        return Some(fallback_key(match third {
+            b'P' => KeyCode::F(1),
+            b'Q' => KeyCode::F(2),
+            b'R' => KeyCode::F(3),
+            b'S' => KeyCode::F(4),
+            _ => KeyCode::Esc,
+        }));
+    }
+    if second != b'[' {
         return Some(fallback_key(KeyCode::Esc));
     }
-    let mut third = [0u8; 1];
-    reader.read_exact(&mut third).ok()?;
-    match third[0] {
+    let third = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?;
+    match third {
         b'A' => Some(fallback_key(KeyCode::Up)),
         b'B' => Some(fallback_key(KeyCode::Down)),
         b'C' => Some(fallback_key(KeyCode::Right)),
         b'D' => Some(fallback_key(KeyCode::Left)),
-        b'<' => read_fallback_sgr_mouse_sequence(reader),
-        b'M' => read_fallback_x10_mouse_sequence(reader),
+        b'<' => read_fallback_sgr_mouse_sequence(next_byte),
+        b'M' => read_fallback_x10_mouse_sequence(next_byte),
         b'5' => {
-            let _ = reader.read_exact(&mut [0u8; 1]);
+            let _ = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT);
             Some(fallback_key(KeyCode::PageUp))
         }
         b'6' => {
-            let _ = reader.read_exact(&mut [0u8; 1]);
+            let _ = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT);
             Some(fallback_key(KeyCode::PageDown))
         }
+        value if value.is_ascii_digit() => read_fallback_csi_numbered_key(next_byte, value),
         _ => Some(fallback_key(KeyCode::Esc)),
     }
 }
 
-fn read_fallback_sgr_mouse_sequence<R: Read>(reader: &mut R) -> Option<Event> {
+fn read_fallback_csi_numbered_key(
+    next_byte: &mut impl FnMut(Duration) -> Option<u8>,
+    first: u8,
+) -> Option<Event> {
+    let mut bytes = vec![first];
+    loop {
+        let byte = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?;
+        if byte == b'~' {
+            break;
+        }
+        if !byte.is_ascii_digit() || bytes.len() > 3 {
+            return Some(fallback_key(KeyCode::Esc));
+        }
+        bytes.push(byte);
+    }
+    let number = std::str::from_utf8(&bytes).ok()?.parse::<u16>().ok()?;
+    let code = match number {
+        1 => KeyCode::Home,
+        2 => KeyCode::Insert,
+        3 => KeyCode::Delete,
+        4 => KeyCode::End,
+        15 => KeyCode::F(5),
+        17 => KeyCode::F(6),
+        18 => KeyCode::F(7),
+        19 => KeyCode::F(8),
+        20 => KeyCode::F(9),
+        21 => KeyCode::F(10),
+        23 => KeyCode::F(11),
+        24 => KeyCode::F(12),
+        11 => KeyCode::F(1),
+        12 => KeyCode::F(2),
+        13 => KeyCode::F(3),
+        14 => KeyCode::F(4),
+        5 => KeyCode::PageUp,
+        6 => KeyCode::PageDown,
+        _ => KeyCode::Esc,
+    };
+    Some(fallback_key(code))
+}
+
+fn read_fallback_sgr_mouse_sequence(
+    next_byte: &mut impl FnMut(Duration) -> Option<u8>,
+) -> Option<Event> {
     let mut bytes = Vec::new();
     let final_byte = loop {
-        let mut byte = [0u8; 1];
-        reader.read_exact(&mut byte).ok()?;
-        if matches!(byte[0], b'M' | b'm') {
-            break byte[0];
+        let byte = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?;
+        if matches!(byte, b'M' | b'm') {
+            break byte;
         }
         if bytes.len() > 64 {
             return Some(fallback_noop_event());
         }
-        bytes.push(byte[0]);
+        bytes.push(byte);
     };
     let text = String::from_utf8(bytes).ok()?;
     let mut parts = text.split(';');
@@ -15640,17 +16290,18 @@ fn read_fallback_sgr_mouse_sequence<R: Read>(reader: &mut R) -> Option<Event> {
     fallback_mouse_event(code, column, row, final_byte)
 }
 
-fn read_fallback_x10_mouse_sequence<R: Read>(reader: &mut R) -> Option<Event> {
-    let mut bytes = [0u8; 3];
-    reader.read_exact(&mut bytes).ok()?;
-    let code = bytes[0].saturating_sub(32) as u16;
-    let column = u16::from(bytes[1].saturating_sub(33));
-    let row = u16::from(bytes[2].saturating_sub(33));
+fn read_fallback_x10_mouse_sequence(
+    next_byte: &mut impl FnMut(Duration) -> Option<u8>,
+) -> Option<Event> {
+    let code = next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(32) as u16;
+    let column = u16::from(next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(33));
+    let row = u16::from(next_byte(FALLBACK_ESCAPE_SEQUENCE_TIMEOUT)?.saturating_sub(33));
     fallback_mouse_event(code, column, row, b'M')
 }
 
 fn fallback_mouse_event(code: u16, column: u16, row: u16, final_byte: u8) -> Option<Event> {
-    let kind = match code & 0b11_1111 {
+    let button = code & !(4 | 8 | 16 | 32);
+    let kind = match button {
         64 => MouseEventKind::ScrollUp,
         65 => MouseEventKind::ScrollDown,
         _ => return Some(fallback_noop_event()),
@@ -15734,7 +16385,9 @@ fn handle_terminal_event(app: &mut App, event: Event) {
                 app.insert_input_char(ch);
             }
         }
-        Event::Paste(text) if should_draw_prompt_box(app) => app.paste_text(&text),
+        Event::Paste(text) if surface_command_prompt_active(app) || should_draw_prompt_box(app) => {
+            app.paste_text(&text)
+        }
         Event::Paste(_) => {
             app.status =
                 "Use the visible choices here; there is no text box on this screen.".to_owned();
@@ -15854,10 +16507,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         app.scroll_command_screen_detail(lines);
     } else if lines.is_negative() {
         app.scroll_up(lines.unsigned_abs());
-        app.status = "Conversation scrolled up.".to_owned();
     } else {
         app.scroll_down(lines as u16);
-        app.status = "Conversation scrolled down.".to_owned();
     }
 }
 
@@ -15903,6 +16554,7 @@ fn click_folder_browser(app: &mut App, column: u16, row: u16, width: u16, height
     }
     if let Some(state) = app.folder_browser.as_mut() {
         state.selected = index;
+        state.scroll_offset = visible_start;
     }
     app.perform_folder_browser_selection();
     true
@@ -15915,7 +16567,8 @@ fn main_content_area(app: &App, width: u16, height: u16) -> Rect {
         width,
         height,
     };
-    let prompt_box_visible = should_draw_prompt_box(app);
+    let command_prompt_popup = surface_command_prompt_active(app);
+    let prompt_box_visible = should_draw_prompt_box(app) && !command_prompt_popup;
     let completion_height = if prompt_box_visible {
         app.slash_completion_menu()
             .as_ref()
@@ -16033,11 +16686,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if app.folder_browser.is_some() && handle_folder_browser_key(app, key) {
+    if matches!(key.code, KeyCode::F(1)) {
+        app.open_interactive_help_overlay();
         return;
     }
 
     if app.overlay_card.is_some() && handle_overlay_card_key(app, key) {
+        return;
+    }
+
+    if app.folder_browser.is_some() && handle_folder_browser_key(app, key) {
         return;
     }
 
@@ -16046,6 +16704,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.onboarding_active && handle_onboarding_key(app, key) {
+        return;
+    }
+    if app.onboarding_active {
         return;
     }
 
@@ -16133,6 +16794,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
             app.refresh_status();
         }
+        (_, KeyCode::F(5)) => {
+            app.refresh_status();
+        }
         (_, KeyCode::Tab) => {
             if !app.cycle_completion(CompletionDirection::Next) {
                 app.status = "No completion menu available.".to_owned();
@@ -16152,6 +16816,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
         | (_, KeyCode::Char('\n' | '\r'))
         | (_, KeyCode::Enter) => {
+            if surface_command_prompt_active(app) && command_popup_should_submit_on_enter(app) {
+                app.submit();
+                return;
+            }
             if app.accept_completion() {
                 return;
             }
@@ -16194,11 +16862,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::PageUp) => {
             app.scroll_up(10);
-            app.status = "Transcript scrolled up.".to_owned();
         }
         (_, KeyCode::PageDown) => {
             app.scroll_down(10);
-            app.status = "Transcript scrolled down.".to_owned();
         }
         (_, KeyCode::Home) => {
             if app.input.is_empty() {
@@ -16258,8 +16924,12 @@ fn handle_home_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
-        (_, KeyCode::Esc | KeyCode::Backspace) => {
-            app.status = "Main menu is open. Use arrows, mouse, or Ctrl-C to quit.".to_owned();
+        (_, KeyCode::Esc) => {
+            app.request_quit_overlay_or_wait();
+            true
+        }
+        (_, KeyCode::Backspace) => {
+            app.status = "Main menu is open. Use arrows or mouse.".to_owned();
             true
         }
         _ => false,
@@ -16267,10 +16937,18 @@ fn handle_home_dashboard_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_hidden_prompt_key(app: &mut App, key: KeyEvent) -> bool {
+    if surface_command_prompt_active(app) {
+        return false;
+    }
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => false,
         (_, KeyCode::Esc) => {
             app.open_home_dashboard();
+            true
+        }
+        (_, KeyCode::Char('/')) if app.input.is_empty() => {
+            app.insert_input_char('/');
+            app.status = "Command prompt opened. Type a / command, then Enter.".to_owned();
             true
         }
         (_, KeyCode::Char('?')) if app.input.is_empty() => {
@@ -16293,7 +16971,44 @@ fn handle_hidden_prompt_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn active_surface_should_defer_to_prompt(app: &App, key: KeyEvent) -> bool {
-    app.pending_approval.is_some() || (!app.input.is_empty() && !active_surface_navigation_key(key))
+    app.pending_approval.is_some()
+        || surface_command_prompt_active(app)
+        || (app.input.is_empty()
+            && !app.onboarding_active
+            && matches!(key.code, KeyCode::Char('/')))
+        || (!app.input.is_empty() && !active_surface_navigation_key(key))
+}
+
+fn command_popup_should_submit_on_enter(app: &App) -> bool {
+    let trimmed = app.input.trim();
+    let Some(name) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    if app
+        .slash_completion_menu()
+        .as_ref()
+        .and_then(CompletionMenu::selected_replacement)
+        .is_some()
+    {
+        return false;
+    }
+    if name.chars().any(char::is_whitespace) {
+        return true;
+    }
+    SLASH_COMMANDS.iter().any(|command| command.name == name)
+}
+
+fn surface_command_prompt_active(app: &App) -> bool {
+    app.input.starts_with('/')
+        && !app.onboarding_active
+        && !should_draw_prompt_box(app)
+        && app.pending_approval.is_none()
+        && app.overlay_card.is_none()
+        && app.folder_browser.is_none()
+        && !should_draw_running_job_modal(app)
 }
 
 fn active_surface_navigation_key(key: KeyEvent) -> bool {
@@ -16308,8 +17023,10 @@ fn active_surface_navigation_key(key: KeyEvent) -> bool {
                 | KeyCode::End
                 | KeyCode::PageUp
                 | KeyCode::PageDown
+                | KeyCode::F(5)
                 | KeyCode::Left
                 | KeyCode::Right
+                | KeyCode::Esc
         )
 }
 
@@ -16336,6 +17053,7 @@ fn clear_prompt_for_active_surface_action(app: &mut App, key: KeyEvent) {
         || app.serve_wizard_editing_text()
         || app.automations_manager_editing_text()
         || app.config_manager_editing_secret()
+        || surface_command_prompt_active(app)
     {
         return;
     }
@@ -16410,10 +17128,7 @@ fn handle_pending_approval_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         (_, KeyCode::Esc) => {
-            app.cancel_focused_action();
-            if !app.onboarding_active {
-                app.open_home_dashboard();
-            }
+            app.cancel_focused_action_to_home();
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
@@ -16579,7 +17294,16 @@ fn handle_running_job_modal_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Wait for this work to finish before leaving this screen.".to_owned();
         }
         (_, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab) => {
-            app.status = "This work is still running. Choices are paused for now.".to_owned();
+            if app.onboarding_install_running() {
+                let lines = if matches!(key.code, KeyCode::Up | KeyCode::BackTab) {
+                    -1
+                } else {
+                    1
+                };
+                app.scroll_running_job_log(lines);
+            } else {
+                app.status = "This work is still running. Choices are paused for now.".to_owned();
+            }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
         | (_, KeyCode::Char('\n' | '\r'))
@@ -16635,7 +17359,7 @@ fn handle_doctor_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last doctor choice.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_doctor_manager();
             true
         }
@@ -16721,7 +17445,7 @@ fn handle_runtime_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last choice.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_runtime_manager();
             app.status = "Runtime list refreshed.".to_owned();
             true
@@ -17070,7 +17794,7 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last model.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.open_model_picker();
             true
         }
@@ -17140,7 +17864,7 @@ fn handle_serve_wizard_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to back.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.open_serve_wizard();
             true
         }
@@ -17225,7 +17949,7 @@ fn handle_update_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last update option.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_update_manager();
             true
         }
@@ -17319,7 +18043,7 @@ fn handle_automations_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last automation item.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_automations_manager();
             true
         }
@@ -17484,7 +18208,7 @@ fn handle_config_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last setting.".to_owned();
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_config();
             if let Some(state) = app.config_manager.as_mut() {
                 state.message = None;
@@ -17646,7 +18370,7 @@ fn handle_services_manager_key(app: &mut App, key: KeyEvent) -> bool {
             app.status = "Moved to last service choice.".to_owned();
             true
         }
-        (_, KeyCode::Char('r')) => {
+        (_, KeyCode::F(5)) => {
             app.refresh_services_manager();
             true
         }
@@ -17712,7 +18436,7 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
                     true
                 }
                 (_, KeyCode::Esc) => {
-                    app.close_command_screen();
+                    app.request_stop_chat_assistant_or_close();
                     true
                 }
                 _ => false,
@@ -17721,12 +18445,32 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
         if !app.input.is_empty() {
             return match (key.modifiers, key.code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('c')) => false,
-                (_, KeyCode::PageUp) => {
+                (KeyModifiers::CONTROL, KeyCode::PageUp) => {
                     app.scroll_chat_input(-10);
                     true
                 }
-                (_, KeyCode::PageDown) => {
+                (KeyModifiers::CONTROL, KeyCode::PageDown) => {
                     app.scroll_chat_input(10);
+                    true
+                }
+                (_, KeyCode::Up) => {
+                    app.scroll_command_screen_detail(-1);
+                    true
+                }
+                (_, KeyCode::Down) => {
+                    app.scroll_command_screen_detail(1);
+                    true
+                }
+                (_, KeyCode::PageUp) => {
+                    app.scroll_command_screen_detail(-10);
+                    true
+                }
+                (_, KeyCode::PageDown) => {
+                    app.scroll_command_screen_detail(10);
+                    true
+                }
+                (_, KeyCode::Esc) => {
+                    app.request_stop_chat_assistant_or_close();
                     true
                 }
                 _ => false,
@@ -17773,7 +18517,7 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
                 true
             }
             (_, KeyCode::Esc) => {
-                app.close_command_screen();
+                app.request_stop_chat_assistant_or_close();
                 true
             }
             _ => false,
@@ -17815,6 +18559,10 @@ fn handle_command_screen_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (_, KeyCode::PageDown) => {
             app.scroll_command_screen_detail(10);
+            true
+        }
+        (_, KeyCode::F(5)) => {
+            app.refresh_command_screen();
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
@@ -17954,7 +18702,7 @@ fn handle_logs_view_key(app: &mut App, key: KeyEvent) -> bool {
             app.page_logs_browser(LogPageDirection::Next);
             true
         }
-        (_, KeyCode::Char('r' | 'R')) => {
+        (_, KeyCode::F(5)) => {
             app.page_logs_browser(LogPageDirection::Refresh);
             true
         }
@@ -18228,9 +18976,7 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
             app.start_onboarding_path_edit();
         }
         (_, KeyCode::Char('?')) if app.pending_approval.is_none() && app.running_job.is_none() => {
-            app.status =
-                "Setup is open. Use arrows to choose a row, Enter to select, or Esc to go back."
-                    .to_owned();
+            app.status = "Setup is open. Use Up/Down, then Enter.".to_owned();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('j' | 'm'))
         | (_, KeyCode::Char('\n' | '\r'))
@@ -18242,16 +18988,20 @@ fn handle_onboarding_key(app: &mut App, key: KeyEvent) -> bool {
         (_, KeyCode::Char('s' | 'S'))
             if app.pending_approval.is_none() && app.running_job.is_none() =>
         {
-            app.status =
-                "Setup is required before using local ROCm. Press Ctrl-C to quit.".to_owned();
+            app.status = "Finish setup to continue, or choose Quit setup.".to_owned();
         }
         (_, KeyCode::Esc) if app.pending_approval.is_none() && app.running_job.is_none() => {
-            app.return_from_onboarding();
+            if onboarding_can_return(app) {
+                app.return_from_onboarding();
+            } else {
+                app.select_onboarding_choice(OnboardingMenuChoice::Quit);
+                app.status = "Quit setup selected. Press Enter to confirm.".to_owned();
+            }
         }
         (_, KeyCode::Char('q' | 'Q'))
             if app.pending_approval.is_none() && app.running_job.is_none() =>
         {
-            app.should_quit = true;
+            app.request_quit_overlay_or_wait();
         }
         _ => {}
     }
@@ -18295,23 +19045,28 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     frame.render_widget(Clear, frame.area());
 
-    let prompt_box_visible = should_draw_prompt_box(app);
-    let completion_menu = if !prompt_box_visible
-        || app.overlay_card.is_some()
-        || app.folder_browser.is_some()
-        || should_draw_running_job_modal(app)
+    let command_prompt_popup = surface_command_prompt_active(app);
+    let prompt_box_visible = should_draw_prompt_box(app) && !command_prompt_popup;
+    let completion_menu = if (prompt_box_visible || command_prompt_popup)
+        && app.overlay_card.is_none()
+        && app.folder_browser.is_none()
+        && !should_draw_running_job_modal(app)
     {
-        None
-    } else {
         app.slash_completion_menu()
+    } else {
+        None
     };
     let completion_open = completion_menu
         .as_ref()
         .is_some_and(|menu| !menu.selectable_indices().is_empty());
-    let completion_height = completion_menu
-        .as_ref()
-        .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
-        .unwrap_or(0);
+    let completion_height = if command_prompt_popup {
+        0
+    } else {
+        completion_menu
+            .as_ref()
+            .map(|menu| menu.items.len().min(MAX_COMPLETION_MENU_ITEMS) as u16 + 2)
+            .unwrap_or(0)
+    };
     let input_height = if prompt_box_visible {
         chat_input_area_height(app, frame.area().width, frame.area().height)
     } else {
@@ -18365,11 +19120,14 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     } else if app.should_draw_home_dashboard() {
         draw_home_dashboard(frame, app, body[0]);
     } else {
-        let transcript = Paragraph::new(app.transcript_text())
-            .block(surface_block(transcript_title(app), THEME_MUTED))
-            .wrap(Wrap { trim: false })
-            .scroll((app.transcript_scroll, 0));
-        frame.render_widget(transcript, body[0]);
+        draw_scrollable_text_with_block(
+            frame,
+            app.transcript_text(),
+            body[0],
+            surface_block(transcript_title(app), THEME_MUTED),
+            Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+            app.transcript_scroll,
+        );
     }
 
     if sidebar_width > 0 {
@@ -18380,51 +19138,10 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(sidebar, body[1]);
     }
 
-    if let Some(menu) = completion_menu.as_ref() {
-        let (visible_start, visible_end) = completion_visible_range(menu);
-        let items = menu
-            .items
-            .iter()
-            .enumerate()
-            .skip(visible_start)
-            .take(visible_end.saturating_sub(visible_start))
-            .map(|(index, item)| {
-                let style = if menu
-                    .replacements
-                    .get(index)
-                    .is_some_and(|replacement| replacement.is_some())
-                {
-                    Style::default()
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                ListItem::new(item.as_str()).style(style)
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default();
-        if menu
-            .replacements
-            .get(menu.selected)
-            .is_some_and(|replacement| replacement.is_some())
-        {
-            state.select(Some(menu.selected.saturating_sub(visible_start)));
-        }
-        let completions = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(
-                        "{} {}/{}",
-                        menu.title,
-                        menu.selected.saturating_add(1).min(menu.items.len()),
-                        menu.items.len()
-                    ))
-                    .border_style(Style::default().fg(THEME_ACCENT)),
-            )
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL))
-            .highlight_symbol("> ")
-            .highlight_style(selection_style());
-        frame.render_stateful_widget(completions, layout[1], &mut state);
+    if let Some(menu) = completion_menu.as_ref()
+        && !command_prompt_popup
+    {
+        draw_completion_menu(frame, menu, layout[1]);
     }
 
     let input_area = layout[2];
@@ -18478,21 +19195,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 app.input_cursor,
                 usize::from(input_inner_width.max(1)),
             );
-            if line_count > usize::from(input_inner_height) {
-                let scrollbar_area = Rect {
-                    x: input_area.right().saturating_sub(1),
-                    y: input_area.y.saturating_add(1),
-                    width: 1,
-                    height: input_area.height.saturating_sub(2),
-                };
-                let mut scrollbar_state =
-                    ScrollbarState::new(line_count).position(usize::from(chat_input_scroll));
-                frame.render_stateful_widget(
-                    Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
-                    scrollbar_area,
-                    &mut scrollbar_state,
-                );
-            }
+            draw_scrollbar(
+                frame,
+                input_area,
+                scroll_metrics(
+                    line_count,
+                    usize::from(input_inner_height),
+                    usize::from(chat_input_scroll),
+                ),
+            );
         }
     }
 
@@ -18502,6 +19213,8 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         overlay_card_key_hint(app)
     } else if should_draw_running_job_modal(app) {
         "running | live output shown | wait for finish"
+    } else if command_prompt_popup {
+        "Command popup | Tab suggestions | Enter run | Esc close"
     } else if completion_open {
         "Tab/Down next | Shift+Tab/Up previous | Enter choose | Ctrl-C quit"
     } else if app.config_manager_editing_secret() {
@@ -18525,7 +19238,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     {
         "Up/Down scroll | PageUp/PageDown scroll | Esc close"
     } else if app.doctor_manager.is_some() {
-        "Up/Down choose | Enter select | PageUp/PageDown scroll | R refresh | Esc back"
+        "Up/Down choose | Enter select | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.runtime_manager.is_some() && app.pending_approval.is_none() {
         "Up/Down choose | Enter use highlighted row | PageUp/PageDown scroll | Esc back"
     } else if app.install_manager.is_some() && app.pending_approval.is_none() {
@@ -18533,15 +19246,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     } else if app.engine_manager.is_some() && app.pending_approval.is_none() {
         "Up/Down choose | Enter use highlighted row | PageUp/PageDown scroll | Esc back"
     } else if app.model_picker.is_some() {
-        "Up/Down choose | Enter plan | PageUp/PageDown scroll | R refresh | Esc back"
+        "Up/Down choose | Enter start | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.serve_wizard.is_some() && app.pending_approval.is_none() {
-        "Up/Down choose row | Left/Right change | Enter edit/start | PageUp/PageDown scroll | R refresh | Esc back"
+        "Up/Down choose row | Left/Right change | Enter edit/start | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.update_manager.is_some() && app.pending_approval.is_none() {
-        "Up/Down choose | Enter select | PageUp/PageDown scroll | R refresh | Esc back"
+        "Up/Down choose | Enter select | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.automations_manager.is_some() && app.pending_approval.is_none() {
-        "Up/Down choose | Left/Right change | Enter select/edit | PageUp/PageDown scroll | Y yes/approve | N no/reject | R refresh | Esc back"
+        "Up/Down choose | Left/Right change | Enter select/edit | PageUp/PageDown scroll | Y yes/approve | N no/reject | F5 refresh | Esc back"
     } else if app.config_manager.is_some() {
-        "Up/Down choose | Enter change | PageUp/PageDown scroll | R refresh | Esc back"
+        "Up/Down choose | Enter change | PageUp/PageDown scroll | F5 refresh | Esc back"
     } else if app.provider_manager.is_some() {
         "Up/Down choose | Enter use | PageUp/PageDown scroll | Esc back"
     } else if app.services_manager.is_some() && app.pending_approval.is_none() {
@@ -18549,15 +19262,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     } else if app.command_screen.is_some() && app.pending_approval.is_none() {
         if app.command_screen_is_chat_session() {
             if app.input.is_empty() {
-                "Type message, then Enter sends | Up/Down scroll chat | Ctrl+D details | Esc back"
+                "Type message, Enter sends | Up/Down/PageUp/PageDown scroll chat | Esc back"
             } else {
-                "Enter sends | PageUp/PageDown scroll message | Esc back"
+                "Enter sends | PageUp/PageDown scroll chat | Ctrl+PageUp/PageDown scroll draft | Esc back"
             }
         } else {
             "Up/Down choose | Enter select | PageUp/PageDown scroll | Esc back"
         }
     } else if app.logs_view.is_some() {
-        "Up/Down choose | Enter select/search | PageUp/PageDown scroll | Left/Right page | R refresh | Esc back"
+        "Up/Down choose | Enter select/search | PageUp/PageDown scroll | Left/Right page | F5 refresh | Esc back"
     } else if app
         .pending_approval
         .as_ref()
@@ -18575,11 +19288,11 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     } else if app.running_job.is_some() {
         "command running | live log shown | wait for finish"
     } else if app.should_draw_home_dashboard() {
-        "Up/Down choose | Enter open | Tab next | ? help | Ctrl-L clear | Ctrl-C quit"
+        "Up/Down choose | Enter open | Tab next | F1 help | Ctrl-L clear | Ctrl-C quit"
     } else {
-        "Enter submit | Tab complete | ? help | Ctrl-R refresh | Ctrl-L clear | Ctrl-C quit"
+        "Enter submit | Tab suggestions | F1 help | F5 refresh | Ctrl-L clear | Ctrl-C quit"
     };
-    let footer = Paragraph::new(format!("{} | {}", app.status, key_hint)).style(
+    let footer = Paragraph::new(footer_line(&app.status, key_hint, layout[3].width)).style(
         Style::default()
             .fg(THEME_MUTED)
             .bg(THEME_BG)
@@ -18627,6 +19340,43 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     if app.pending_approval.is_some() && should_draw_modal_approval(app) {
         draw_pending_approval_modal(frame, app, body[0]);
     }
+
+    if command_prompt_popup {
+        draw_command_prompt_popup(frame, app, frame.area(), completion_menu.as_ref());
+    }
+}
+
+fn footer_line(status: &str, key_hint: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
+    }
+    let key_hint_len = key_hint.chars().count();
+    if status.trim().is_empty() {
+        return truncate_chars(key_hint, width);
+    }
+    if key_hint_len >= width {
+        return truncate_chars(key_hint, width);
+    }
+    let separator = " | ";
+    let reserved = key_hint_len + separator.chars().count();
+    if reserved >= width {
+        return truncate_chars(key_hint, width);
+    }
+    let status = truncate_chars(status.trim(), width - reserved);
+    format!("{status}{separator}{key_hint}")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let mut output = value.chars().take(max_chars - 3).collect::<String>();
+    output.push_str("...");
+    output
 }
 
 fn input_title(app: &App) -> &'static str {
@@ -18822,7 +19572,7 @@ fn render_home_dashboard_overview_text(app: &App) -> String {
     let runtime_count = therock::load_runtime_manifests(&app.paths)
         .map(|manifests| manifests.len())
         .unwrap_or(0);
-    let services = load_managed_services(&app.paths).unwrap_or_default();
+    let services = load_visible_managed_services(&app.paths);
     let service_counts = managed_service_sidebar_counts(&services);
     let default_engine = app
         .config
@@ -18852,9 +19602,6 @@ fn render_home_dashboard_overview_text(app: &App) -> String {
     }
     if service_counts.starting > 0 {
         server_bits.push(format!("{} starting", service_counts.starting));
-    }
-    if service_counts.past_attempts > 0 {
-        server_bits.push(format!("{} recent run(s)", service_counts.past_attempts));
     }
     if server_bits.is_empty() {
         server_bits.push("none yet".to_owned());
@@ -18907,15 +19654,20 @@ fn render_home_dashboard_detail_text(app: &App) -> String {
             "Choose whether rocm-cli asks before changes or can run with full access.\n\nYou can reset this whenever you want."
         }
         HomeDashboardAction::Help => {
-            "Browse every command in a popup card.\n\nUse arrows to pick a command and Enter to open it."
+            "Open the interactive help browser.\n\nUse F1 anytime to see topics, shortcuts, and common commands."
         }
+        HomeDashboardAction::Quit => "Exit ROCm CLI.",
     };
     let assistant_line = home_dashboard_assistant_line(app);
-    format!("{title}\n\n{body}\n\nStatus\n  {assistant_line}\n\nPress Enter for this. Esc returns.")
+    if action == HomeDashboardAction::Quit {
+        format!("{title}\n\n{body}\n\nPress Enter to quit.")
+    } else {
+        format!("{title}\n\n{body}\n\nStatus\n  {assistant_line}")
+    }
 }
 
 fn home_dashboard_assistant_line(app: &App) -> String {
-    let services = load_managed_services(&app.paths).unwrap_or_default();
+    let services = load_visible_managed_services(&app.paths);
     let service_counts = managed_service_sidebar_counts(&services);
     if service_counts.ready > 0 {
         format!("{} local model(s) ready to chat.", service_counts.ready)
@@ -18936,6 +19688,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
             HomeDashboardAction::Doctor,
             HomeDashboardAction::Engine,
             HomeDashboardAction::Help,
+            HomeDashboardAction::Quit,
         ]
     } else {
         vec![
@@ -18943,6 +19696,7 @@ fn home_dashboard_actions(app: &App) -> Vec<HomeDashboardAction> {
             HomeDashboardAction::Doctor,
             HomeDashboardAction::Permissions,
             HomeDashboardAction::Help,
+            HomeDashboardAction::Quit,
         ]
     }
 }
@@ -18954,10 +19708,11 @@ fn home_dashboard_action_label(action: HomeDashboardAction) -> &'static str {
         HomeDashboardAction::Serve => "Start a local model",
         HomeDashboardAction::Chat => "Chat with assistant",
         HomeDashboardAction::ComfyUi => "Open ComfyUI",
-        HomeDashboardAction::Services => "Running models",
+        HomeDashboardAction::Services => "List currently running models",
         HomeDashboardAction::Engine => "Choose model runner",
         HomeDashboardAction::Permissions => "Permissions",
-        HomeDashboardAction::Help => "Command list",
+        HomeDashboardAction::Help => "Help",
+        HomeDashboardAction::Quit => "Quit",
     }
 }
 
@@ -18968,10 +19723,11 @@ fn home_dashboard_action_status(action: HomeDashboardAction) -> &'static str {
         HomeDashboardAction::Serve => "Start a local model selected. Press Enter.",
         HomeDashboardAction::Chat => "Local assistant selected. Press Enter.",
         HomeDashboardAction::ComfyUi => "ComfyUI selected. Press Enter.",
-        HomeDashboardAction::Services => "Running models selected. Press Enter.",
+        HomeDashboardAction::Services => "Running model list selected. Press Enter.",
         HomeDashboardAction::Engine => "Model runner picker selected. Press Enter.",
         HomeDashboardAction::Permissions => "Permissions selected. Press Enter.",
-        HomeDashboardAction::Help => "Command list selected. Press Enter.",
+        HomeDashboardAction::Help => "Help selected. Press Enter.",
+        HomeDashboardAction::Quit => "Quit selected. Press Enter.",
     }
 }
 
@@ -18986,6 +19742,7 @@ fn home_dashboard_action_command(action: HomeDashboardAction) -> &'static str {
         HomeDashboardAction::Engine => "engine",
         HomeDashboardAction::Permissions => "permissions",
         HomeDashboardAction::Help => "help",
+        HomeDashboardAction::Quit => "quit",
     }
 }
 
@@ -19006,6 +19763,79 @@ fn surface_block<'a>(title: &'a str, color: Color) -> Block<'a> {
 
 fn detail_block<'a>(title: &'a str) -> Block<'a> {
     surface_block(title, THEME_BORDER)
+}
+
+fn draw_scrollable_text_with_block<'a>(
+    frame: &mut Frame<'_>,
+    text: String,
+    area: Rect,
+    block: Block<'a>,
+    style: Style,
+    requested_scroll: u16,
+) -> ScrollMetrics {
+    let inner = block.inner(area);
+    let metrics = text_scroll_metrics(
+        &text,
+        usize::from(inner.width.max(1)),
+        usize::from(inner.height.max(1)),
+        requested_scroll,
+    );
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .scroll((metrics.offset_u16(), 0));
+    frame.render_widget(paragraph, area);
+    draw_scrollbar(frame, area, metrics);
+    metrics
+}
+
+fn draw_scrollable_text(
+    frame: &mut Frame<'_>,
+    text: String,
+    area: Rect,
+    style: Style,
+    requested_scroll: u16,
+) -> ScrollMetrics {
+    let metrics = text_scroll_metrics(
+        &text,
+        usize::from(area.width.max(1)),
+        usize::from(area.height.max(1)),
+        requested_scroll,
+    );
+    let paragraph = Paragraph::new(text)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .scroll((metrics.offset_u16(), 0));
+    frame.render_widget(paragraph, area);
+    draw_scrollbar(frame, area, metrics);
+    metrics
+}
+
+fn draw_scrollable_styled_text_with_block<'a>(
+    frame: &mut Frame<'_>,
+    styled_text: Text<'static>,
+    measurement_text: &str,
+    area: Rect,
+    block: Block<'a>,
+    style: Style,
+    requested_scroll: u16,
+) -> ScrollMetrics {
+    let inner = block.inner(area);
+    let metrics = text_scroll_metrics(
+        measurement_text,
+        usize::from(inner.width.max(1)),
+        usize::from(inner.height.max(1)),
+        requested_scroll,
+    );
+    let paragraph = Paragraph::new(styled_text)
+        .block(block)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .scroll((metrics.offset_u16(), 0));
+    frame.render_widget(paragraph, area);
+    draw_scrollbar(frame, area, metrics);
+    metrics
 }
 
 fn draw_modal_shadow(frame: &mut Frame<'_>, modal: Rect, bounds: Rect) {
@@ -19093,14 +19923,15 @@ fn draw_pending_approval_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let modal = centered_rect(72, 82, area);
     draw_modal_clear(frame, modal, area);
     let title = format!(" Review: {} ", pending.title);
-    let text = render_modal_approval_text(app, pending);
-    let paragraph = Paragraph::new(text)
-        .block(surface_block(&title, approval_modal_border_color(pending)))
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
-        .scroll((modal_detail_scroll(app), 0));
-    frame.render_widget(paragraph, modal);
+    draw_scrollable_styled_text_with_block(
+        frame,
+        render_modal_approval_text(app, pending),
+        &render_modal_approval(app, pending),
+        modal,
+        surface_block(&title, approval_modal_border_color(pending)),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+        modal_detail_scroll(app),
+    );
 }
 
 fn render_modal_approval_text(app: &App, pending: &PendingApproval) -> Text<'static> {
@@ -19142,11 +19973,13 @@ fn draw_overlay_card(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
     if state.actions.is_empty() {
-        let details = Paragraph::new(state.detail.clone())
-            .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-            .wrap(Wrap { trim: false })
-            .scroll((state.detail_scroll, 0));
-        frame.render_widget(details, inner);
+        draw_scrollable_text(
+            frame,
+            state.detail.clone(),
+            inner,
+            Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+            state.detail_scroll,
+        );
         return;
     }
 
@@ -19167,12 +20000,14 @@ fn draw_overlay_card(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let detail = Paragraph::new(overlay_card_detail_text(state))
-        .block(detail_block("Details"))
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(detail, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        overlay_card_detail_text(state),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+        state.detail_scroll,
+    );
 }
 
 fn draw_folder_browser_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19226,14 +20061,11 @@ fn draw_folder_browser_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_symbol("  ")
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
-    if state.entries.len() > list_inner_height.max(1) {
-        let mut scrollbar_state = ScrollbarState::new(state.entries.len()).position(state.selected);
-        frame.render_stateful_widget(
-            Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
-            panes[0],
-            &mut scrollbar_state,
-        );
-    }
+    draw_scrollbar(
+        frame,
+        panes[0],
+        scroll_metrics(state.entries.len(), list_inner_height.max(1), visible_start),
+    );
 
     let detail = Paragraph::new(folder_browser_detail_text(state))
         .block(detail_block("Selected"))
@@ -19241,10 +20073,9 @@ fn draw_folder_browser_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
     frame.render_widget(detail, panes[1]);
 
-    let footer = Paragraph::new(
-        "Enter select | Backspace up | type C or D for drive | PageUp/PageDown scroll | Esc cancel",
-    )
-    .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL));
+    let footer =
+        Paragraph::new("Enter open/select | Backspace up | PageUp/PageDown scroll | Esc cancel")
+            .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL));
     frame.render_widget(footer, rows[2]);
 }
 
@@ -19359,7 +20190,13 @@ fn folder_browser_visible_range(state: &FolderBrowserState, visible_len: usize) 
     }
     let selected = state.selected.min(state.entries.len().saturating_sub(1));
     let max_start = state.entries.len().saturating_sub(visible_len);
-    let start = selected.saturating_sub(visible_len / 2).min(max_start);
+    let mut start = state.scroll_offset.min(max_start);
+    if selected < start {
+        start = selected;
+    } else if selected >= start.saturating_add(visible_len) {
+        start = selected.saturating_add(1).saturating_sub(visible_len);
+    }
+    start = start.min(max_start);
     let end = start.saturating_add(visible_len).min(state.entries.len());
     (start, end)
 }
@@ -19380,16 +20217,17 @@ fn should_draw_running_job_modal(app: &App) -> bool {
         })
 }
 
-fn draw_running_job_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(job) = app.running_job.as_ref() else {
-        return;
-    };
+#[derive(Debug, Clone, Copy)]
+struct RunningJobModalLayout {
+    header_area: Rect,
+    log_area: Rect,
+    live_output_width: usize,
+    compact: bool,
+}
+
+fn running_job_modal_layout(app: &App, job: &RunningJob, area: Rect) -> RunningJobModalLayout {
     let modal = centered_rect(92, 88, area);
-    draw_modal_clear(frame, modal, area);
-    let title = format!(" {} ", job.title);
-    let block = surface_block(&title, THEME_WARN);
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+    let inner = rect_inner(modal);
     let live_output_width = inner.width.saturating_sub(3).max(8) as usize;
     let compact = inner.height < 10;
     let header = running_job_modal_header_text(app, job, compact);
@@ -19410,64 +20248,41 @@ fn draw_running_job_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         width: inner.width,
         height: inner.height.saturating_sub(header_height),
     };
+    RunningJobModalLayout {
+        header_area,
+        log_area,
+        live_output_width,
+        compact,
+    }
+}
+
+fn draw_running_job_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(job) = app.running_job.as_ref() else {
+        return;
+    };
+    let modal = centered_rect(92, 88, area);
+    draw_modal_clear(frame, modal, area);
+    let title = format!(" {} ", job.title);
+    let block = surface_block(&title, THEME_WARN);
+    frame.render_widget(block, modal);
+    let layout = running_job_modal_layout(app, job, area);
+    let header = running_job_modal_header_text(app, job, layout.compact);
     let header = Paragraph::new(header)
         .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
         .wrap(Wrap { trim: false })
         .scroll((0, 0));
-    frame.render_widget(header, header_area);
-    if log_area.height == 0 {
+    frame.render_widget(header, layout.header_area);
+    if layout.log_area.height == 0 {
         return;
     }
-    let live_output_limit = usize::from(log_area.height).max(1);
-    let output = Paragraph::new(running_job_modal_output_text(
-        app,
-        live_output_limit,
-        live_output_width,
-    ))
-    .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-    .wrap(Wrap { trim: false })
-    .scroll((0, 0));
-    frame.render_widget(output, log_area);
-    let line_count = running_job_output_visual_line_count(app, live_output_width);
-    if line_count > live_output_limit {
-        let position = running_job_visible_output_start(app, live_output_limit, live_output_width);
-        draw_running_job_log_scrollbar(frame, log_area, line_count, live_output_limit, position);
-    }
-}
-
-fn draw_running_job_log_scrollbar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    content_len: usize,
-    viewport_len: usize,
-    position: usize,
-) {
-    if area.height < 3 || area.width == 0 {
-        return;
-    }
-    let symbols = running_job_scrollbar_symbols(content_len, viewport_len, position, area.height);
-    let lines = symbols
-        .into_iter()
-        .map(|symbol| {
-            let fg = match symbol {
-                '#' => THEME_WARN,
-                _ => THEME_MUTED,
-            };
-            Line::from(Span::styled(
-                symbol.to_string(),
-                Style::default().fg(fg).bg(THEME_PANEL_3),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let scrollbar_area = Rect {
-        x: area.x + area.width.saturating_sub(1),
-        y: area.y,
-        width: 1,
-        height: area.height,
-    };
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().bg(THEME_PANEL_3)),
-        scrollbar_area,
+    let viewport = usize::from(layout.log_area.height).max(1);
+    let scroll = running_job_visible_output_start(app, viewport, layout.live_output_width);
+    draw_scrollable_text(
+        frame,
+        running_job_modal_full_output_text(app, layout.live_output_width),
+        layout.log_area,
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+        scroll.min(u16::MAX as usize) as u16,
     );
 }
 
@@ -19514,11 +20329,14 @@ fn draw_doctor_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(doctor_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        doctor_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_runtime_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19540,11 +20358,14 @@ fn draw_runtime_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(runtime_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        runtime_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_install_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19587,11 +20408,14 @@ fn draw_install_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(install_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        install_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_engine_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19602,33 +20426,35 @@ fn draw_engine_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Min(34)])
         .split(area);
-    let mut items = state
-        .items
+    let rows = engine_manager_rows(state);
+    let items = rows
         .iter()
-        .map(|item| ListItem::new(engine_manager_row_label(item)))
+        .map(|row| match row {
+            EngineManagerRow::Item(index) => state
+                .items
+                .get(*index)
+                .map(engine_manager_row_label)
+                .unwrap_or_else(|| "Engine".to_owned()),
+            EngineManagerRow::Action(action) => engine_manager_action_label(*action).to_owned(),
+        })
+        .map(ListItem::new)
         .collect::<Vec<_>>();
-    items.extend(
-        engine_manager_actions(state)
-            .iter()
-            .map(|action| ListItem::new(engine_manager_action_label(*action))),
-    );
     let mut list_state = ListState::default();
-    list_state.select(Some(
-        state
-            .selected
-            .min(engine_manager_choice_count(state).saturating_sub(1)),
-    ));
+    list_state.select(Some(state.selected.min(rows.len().saturating_sub(1))));
     let list = List::new(items)
         .block(surface_block("Engines", THEME_ACCENT))
         .highlight_symbol("> ")
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(engine_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        engine_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19665,11 +20491,14 @@ fn draw_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(model_picker_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        model_picker_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_serve_wizard(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19693,11 +20522,14 @@ fn draw_serve_wizard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(serve_wizard_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        serve_wizard_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn serve_wizard_list_item(app: &App, choice: ServeWizardChoice) -> ListItem<'static> {
@@ -19737,11 +20569,14 @@ fn draw_update_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(update_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        update_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_automations_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19778,11 +20613,14 @@ fn draw_automations_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(automations_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        automations_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_config_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19803,11 +20641,14 @@ fn draw_config_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(config_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        config_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_provider_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19831,11 +20672,14 @@ fn draw_provider_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(provider_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        provider_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_services_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19876,11 +20720,14 @@ fn draw_services_manager(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(services_manager_detail_text(app))
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        services_manager_detail_text(app),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 }
 
 fn draw_command_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -19888,32 +20735,17 @@ fn draw_command_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
     if state.chat_session.is_some() {
+        app.command_screen_last_area.set(Some(area));
         let detail_text = command_screen_detail_text(app);
-        let detail_scroll = bounded_chat_session_scroll(&detail_text, area, state.detail_scroll);
-        let details = Paragraph::new(styled_chat_detail_text(&detail_text))
-            .block(surface_block("ROCm Assistant", THEME_ACCENT))
-            .style(Style::default().fg(THEME_TEXT))
-            .wrap(Wrap { trim: false })
-            .scroll((detail_scroll, 0));
-        frame.render_widget(details, area);
-        let inner_width = area.width.saturating_sub(2).max(1) as usize;
-        let inner_height = area.height.saturating_sub(2).max(1) as usize;
-        let visual_lines = paragraph_visual_line_count(&detail_text, inner_width);
-        if visual_lines > inner_height {
-            let scrollbar_area = Rect {
-                x: area.right().saturating_sub(1),
-                y: area.y.saturating_add(1),
-                width: 1,
-                height: area.height.saturating_sub(2),
-            };
-            let mut scrollbar_state =
-                ScrollbarState::new(visual_lines).position(usize::from(detail_scroll));
-            frame.render_stateful_widget(
-                Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
-                scrollbar_area,
-                &mut scrollbar_state,
-            );
-        }
+        draw_scrollable_styled_text_with_block(
+            frame,
+            styled_chat_detail_text(&detail_text),
+            &detail_text,
+            area,
+            surface_block("ROCm Assistant", THEME_ACCENT),
+            Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+            state.detail_scroll,
+        );
         if let Some(title) = command_screen_detail_modal_title(app, state) {
             draw_command_screen_detail_modal(frame, app, area, title);
         }
@@ -19939,45 +20771,31 @@ fn draw_command_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
     let detail_text = command_screen_detail_text(app);
-    let detail_scroll = bounded_command_screen_scroll(&detail_text, panes[1], state.detail_scroll);
-    let details = Paragraph::new(detail_text)
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        detail_text,
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 
     if let Some(title) = command_screen_detail_modal_title(app, state) {
         draw_command_screen_detail_modal(frame, app, area, title);
     }
 }
 
-fn bounded_command_screen_scroll(text: &str, area: Rect, requested: u16) -> u16 {
-    if requested == 0 || text.trim().is_empty() {
-        return 0;
-    }
-    let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let inner_height = area.height.saturating_sub(2).max(1) as usize;
-    let visual_lines = paragraph_visual_line_count(text, inner_width);
-    let max_scroll = visual_lines
-        .saturating_sub(inner_height.saturating_sub(1).max(1))
-        .min(u16::MAX as usize) as u16;
-    requested.min(max_scroll)
-}
-
 fn bounded_chat_session_scroll(text: &str, area: Rect, requested: u16) -> u16 {
     if requested == 0 || text.trim().is_empty() {
         return 0;
     }
-    let inner_width = area.width.saturating_sub(3).max(1) as usize;
-    let inner_height = area.height.saturating_sub(2).max(1) as usize;
-    let visual_lines = paragraph_visual_line_count(text, inner_width);
-    if visual_lines <= inner_height {
-        return 0;
-    }
-    let max_scroll = visual_lines
-        .saturating_sub(inner_height)
-        .min(u16::MAX as usize) as u16;
-    requested.min(max_scroll)
+    let metrics = text_scroll_metrics(
+        text,
+        area.width.saturating_sub(2).max(1) as usize,
+        area.height.saturating_sub(2).max(1) as usize,
+        requested,
+    );
+    metrics.offset_u16()
 }
 
 fn paragraph_visual_line_count(text: &str, width: usize) -> usize {
@@ -19985,8 +20803,8 @@ fn paragraph_visual_line_count(text: &str, width: usize) -> usize {
     let count = text
         .lines()
         .map(|line| {
-            let chars = line.chars().count();
-            chars.saturating_sub(1) / width + 1
+            let display_width = UnicodeWidthStr::width(line);
+            display_width.saturating_sub(1) / width + 1
         })
         .sum::<usize>();
     count.max(1)
@@ -20019,11 +20837,14 @@ fn draw_logs_view(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style());
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
-    let details = Paragraph::new(state.last_rendered.clone())
-        .block(detail_block("Details"))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(details, panes[1]);
+    draw_scrollable_text_with_block(
+        frame,
+        state.last_rendered.clone(),
+        panes[1],
+        detail_block("Details"),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL),
+        state.detail_scroll,
+    );
 
     if state.detail_modal.is_some() {
         draw_logs_view_detail_modal(frame, app, area);
@@ -20054,12 +20875,14 @@ fn draw_command_screen_detail_modal(frame: &mut Frame<'_>, app: &App, area: Rect
     let modal = centered_rect(78, 72, area);
     draw_modal_clear(frame, modal, area);
     let block_title = format!(" {title} ");
-    let details = Paragraph::new(modal_state.detail.clone())
-        .block(surface_block(&block_title, THEME_ACCENT))
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-        .wrap(Wrap { trim: false })
-        .scroll((modal_state.scroll, 0));
-    frame.render_widget(details, modal);
+    draw_scrollable_text_with_block(
+        frame,
+        modal_state.detail.clone(),
+        modal,
+        surface_block(&block_title, THEME_ACCENT),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+        modal_state.scroll,
+    );
 }
 
 fn draw_logs_view_detail_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -20073,12 +20896,14 @@ fn draw_logs_view_detail_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let modal = centered_rect(78, 72, area);
     draw_modal_clear(frame, modal, area);
     let block_title = format!(" {} ", modal_state.title);
-    let details = Paragraph::new(modal_state.detail.clone())
-        .block(surface_block(&block_title, THEME_ACCENT))
-        .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
-        .wrap(Wrap { trim: false })
-        .scroll((modal_state.scroll, 0));
-    frame.render_widget(details, modal);
+    draw_scrollable_text_with_block(
+        frame,
+        modal_state.detail.clone(),
+        modal,
+        surface_block(&block_title, THEME_ACCENT),
+        Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3),
+        modal_state.scroll,
+    );
 }
 
 fn doctor_manager_choices() -> &'static [DoctorManagerChoice] {
@@ -20134,7 +20959,6 @@ fn runtime_manager_actions(state: &RuntimeManagerState) -> Vec<RuntimeManagerAct
     if !state.items.is_empty() {
         actions.push(RuntimeManagerAction::RemoveSelected);
     }
-    actions.push(RuntimeManagerAction::Refresh);
     actions.push(RuntimeManagerAction::AdvancedOptions);
     actions
 }
@@ -20245,7 +21069,6 @@ fn runtime_manager_action_label(action: RuntimeManagerAction) -> String {
     match action {
         RuntimeManagerAction::Install => "Install ROCm".to_owned(),
         RuntimeManagerAction::RemoveSelected => "Uninstall selected install".to_owned(),
-        RuntimeManagerAction::Refresh => "Refresh installs".to_owned(),
         RuntimeManagerAction::AdvancedOptions => "Add existing install".to_owned(),
     }
 }
@@ -20314,16 +21137,12 @@ fn engine_manager_row_label(item: &EngineManagerItem) -> String {
     } else {
         "Not set up"
     };
-    format!("{:<10} {}", state, item.name)
+    format!("{state} {}", item.name)
 }
 
-fn engine_manager_actions(state: &EngineManagerState) -> Vec<EngineManagerAction> {
-    let target = state
-        .items
-        .get(state.selected)
-        .or_else(|| state.items.get(state.last_item_selected));
+fn engine_manager_actions_for_item(item: Option<&EngineManagerItem>) -> Vec<EngineManagerAction> {
     let mut actions = Vec::new();
-    if let Some(item) = target {
+    if let Some(item) = item {
         if item.installed_env_id.is_some() {
             actions.push(EngineManagerAction::UseSelected);
             actions.push(EngineManagerAction::ReinstallSelected);
@@ -20333,13 +21152,41 @@ fn engine_manager_actions(state: &EngineManagerState) -> Vec<EngineManagerAction
             actions.push(EngineManagerAction::InstallRocm);
         }
     }
-    actions.push(EngineManagerAction::Refresh);
     actions.push(EngineManagerAction::Back);
     actions
 }
 
+fn engine_manager_rows(state: &EngineManagerState) -> Vec<EngineManagerRow> {
+    let selected_item = state
+        .last_item_selected
+        .min(state.items.len().saturating_sub(1));
+    let mut rows = Vec::new();
+    for (index, item) in state.items.iter().enumerate() {
+        rows.push(EngineManagerRow::Item(index));
+        if index == selected_item {
+            rows.extend(
+                engine_manager_actions_for_item(Some(item))
+                    .into_iter()
+                    .map(EngineManagerRow::Action),
+            );
+        }
+    }
+    if state.items.is_empty() {
+        rows.extend(
+            engine_manager_actions_for_item(None)
+                .into_iter()
+                .map(EngineManagerRow::Action),
+        );
+    }
+    rows
+}
+
+fn engine_manager_selected_row(state: &EngineManagerState) -> Option<EngineManagerRow> {
+    engine_manager_rows(state).get(state.selected).copied()
+}
+
 fn engine_manager_choice_count(state: &EngineManagerState) -> usize {
-    state.items.len() + engine_manager_actions(state).len()
+    engine_manager_rows(state).len()
 }
 
 fn engine_manager_action_label(action: EngineManagerAction) -> &'static str {
@@ -20348,7 +21195,6 @@ fn engine_manager_action_label(action: EngineManagerAction) -> &'static str {
         EngineManagerAction::InstallSelected => "Install selected engine",
         EngineManagerAction::ReinstallSelected => "Reinstall selected engine",
         EngineManagerAction::InstallRocm => "Install ROCm first",
-        EngineManagerAction::Refresh => "Refresh engines",
         EngineManagerAction::Back => "Back",
     }
 }
@@ -20916,7 +21762,6 @@ fn services_manager_actions(state: &ServicesManagerState) -> Vec<ServicesManager
         actions.push(ServicesManagerAction::Stop);
         actions.push(ServicesManagerAction::Restart);
     }
-    actions.push(ServicesManagerAction::Refresh);
     actions.push(ServicesManagerAction::Back);
     actions
 }
@@ -20941,7 +21786,6 @@ fn services_manager_action_label(action: ServicesManagerAction) -> &'static str 
         ServicesManagerAction::OpenLogs => "Show server logs",
         ServicesManagerAction::Stop => "Stop selected server",
         ServicesManagerAction::Restart => "Restart selected server",
-        ServicesManagerAction::Refresh => "Check again",
         ServicesManagerAction::Back => "Back",
     }
 }
@@ -21592,7 +22436,6 @@ fn command_screen_action_label(action: CommandScreenAction) -> &'static str {
         CommandScreenAction::EditChat => "Edit prompt",
         CommandScreenAction::ViewChatConnection => "Server info",
         CommandScreenAction::ViewChatResult => "ROCm result",
-        CommandScreenAction::Refresh => "Refresh",
         CommandScreenAction::EnableFullAccess => "Allow full access",
         CommandScreenAction::ResetPermissions => "Ask before changes",
         CommandScreenAction::OpenCommand(command) => help_command_label(command),
@@ -21610,6 +22453,23 @@ fn overlay_action_from_command_screen_action(
     }
 }
 
+fn help_topic_actions() -> Vec<OverlayCardAction> {
+    [
+        HelpTopic::GettingStarted,
+        HelpTopic::TuiBasics,
+        HelpTopic::Setup,
+        HelpTopic::LocalModels,
+        HelpTopic::Assistant,
+        HelpTopic::ComfyUi,
+        HelpTopic::Commands,
+        HelpTopic::KeyboardShortcuts,
+        HelpTopic::Troubleshooting,
+    ]
+    .into_iter()
+    .map(OverlayCardAction::HelpTopic)
+    .collect()
+}
+
 fn overlay_card_key_hint(app: &App) -> &'static str {
     let Some(state) = app.overlay_card.as_ref() else {
         return "Up/Down choose | Enter select | Esc close";
@@ -21620,10 +22480,17 @@ fn overlay_card_key_hint(app: &App) -> &'static str {
             OverlayCardAction::ClearTranscript
                 | OverlayCardAction::ClearProviderKey
                 | OverlayCardAction::ShowSetupAgain
+                | OverlayCardAction::StopChatAssistant
                 | OverlayCardAction::Quit
         )
     }) {
         "Up/Down choose | Enter select | Y confirm | N/Esc close"
+    } else if state
+        .actions
+        .iter()
+        .any(|action| matches!(action, OverlayCardAction::HelpTopic(_)))
+    {
+        "Up/Down topic | PageUp/PageDown or wheel scroll | Esc close"
     } else if state.actions.is_empty() {
         "PageUp/PageDown scroll | Esc close"
     } else {
@@ -21634,16 +22501,20 @@ fn overlay_card_key_hint(app: &App) -> &'static str {
 fn overlay_card_action_label(state: &OverlayCardState, action: OverlayCardAction) -> &'static str {
     match action {
         OverlayCardAction::OpenCommand(command) => help_command_label(command),
+        OverlayCardAction::HelpTopic(topic) => help_topic_label(topic),
         OverlayCardAction::ClearTranscript => "Clear transcript",
         OverlayCardAction::ClearProviderKey => "Clear API key",
         OverlayCardAction::ShowSetupAgain => "Show setup again",
+        OverlayCardAction::StopChatAssistant => "Stop assistant",
         OverlayCardAction::Quit => "Quit ROCm CLI",
         OverlayCardAction::Close if state.title == "Clear" => "Keep transcript",
         OverlayCardAction::Close if state.title == "Quit" => "Stay in ROCm CLI",
+        OverlayCardAction::Close if state.title == "Stop Assistant" => "Keep chatting",
         OverlayCardAction::Close if state.title == "Clear API Key" => "Keep key",
         OverlayCardAction::Close if state.title == "First-time Setup" => "Keep settings",
         OverlayCardAction::Close if state.title == "Command Not Found" => "Stay here",
         OverlayCardAction::Close if state.title == "Command Needs Fix" => "Stay here",
+        OverlayCardAction::Close if state.title == "Help" => "Close help",
         OverlayCardAction::Close => "Back",
     }
 }
@@ -21651,8 +22522,257 @@ fn overlay_card_action_label(state: &OverlayCardState, action: OverlayCardAction
 fn overlay_card_detail_text(state: &OverlayCardState) -> String {
     match state.actions.get(state.selected).copied() {
         Some(OverlayCardAction::OpenCommand(command)) => help_command_detail(command),
+        Some(OverlayCardAction::HelpTopic(topic)) => help_topic_detail(topic),
         _ => state.detail.clone(),
     }
+}
+
+fn help_topic_label(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::GettingStarted => "Start here",
+        HelpTopic::TuiBasics => "Using the TUI",
+        HelpTopic::Setup => "ROCm setup",
+        HelpTopic::LocalModels => "Local models",
+        HelpTopic::Assistant => "Assistant",
+        HelpTopic::ComfyUi => "ComfyUI",
+        HelpTopic::Commands => "CLI commands",
+        HelpTopic::KeyboardShortcuts => "Keyboard shortcuts",
+        HelpTopic::Troubleshooting => "Troubleshooting",
+    }
+}
+
+fn help_topic_detail(topic: HelpTopic) -> String {
+    match topic {
+        HelpTopic::GettingStarted => [
+            "Start here",
+            "",
+            "ROCm CLI helps set up AMD GPU software for local AI.",
+            "",
+            "Normal first run:",
+            "1. Choose Set up ROCm.",
+            "2. Pick the folder where ROCm/TheRock should live.",
+            "3. Review the install card.",
+            "4. Approve it and watch the live install log.",
+            "5. Continue into ROCm CLI when setup finishes.",
+            "",
+            "After setup:",
+            "- Start a local model.",
+            "- Chat with the assistant.",
+            "- Open ComfyUI.",
+            "- Check this computer with Doctor.",
+            "",
+            "ROCm CLI keeps settings in ~/.rocm.",
+            "The pip cache stays inside the ROCm install folder you choose.",
+        ]
+        .join("\n"),
+        HelpTopic::TuiBasics => [
+            "Using the TUI",
+            "",
+            "Use the arrow keys to move through menus.",
+            "Press Enter to open the highlighted row.",
+            "Press Esc once to go back. From the main menu it opens Quit.",
+            "Press / on any normal menu to open a command popup.",
+            "The command popup is disabled during setup so setup stays simple.",
+            "",
+            "Mouse basics:",
+            "- Click a menu row to open it.",
+            "- Use the mouse wheel to scroll long text and logs.",
+            "",
+            "Logs are only shown while work is running or in a foreground log card.",
+            "Use PageUp/PageDown or the mouse wheel inside log cards.",
+            "Most screens keep details short so the app stays readable.",
+            "",
+            "When a command changes your computer, ROCm CLI shows a review card first.",
+            "Read-only checks do not need approval.",
+        ]
+        .join("\n"),
+        HelpTopic::Setup => [
+            "ROCm setup",
+            "",
+            "Setup installs TheRock ROCm wheels into a Python folder managed by ROCm CLI.",
+            "",
+            "In the TUI:",
+            "- Choose Set up ROCm.",
+            "- Pick an install folder with the folder picker.",
+            "- Approve the install card.",
+            "- Live pip output appears only while installation is running.",
+            "",
+            "From a terminal:",
+            "  rocm setup reset",
+            "  rocm install sdk --channel release --format pip --prefix D:\\jam\\temp\\therock_venvs",
+            "  rocm runtimes list",
+            "  rocm runtimes activate <runtime_key>",
+            "",
+            "Use a full path for --prefix.",
+            "On Linux or WSL, use a Linux path such as /home/jam/rocm_venvs.",
+        ]
+        .join("\n"),
+        HelpTopic::LocalModels => [
+            "Local models",
+            "",
+            "The default model runner is Lemonade.",
+            "Start a model only after ROCm setup is ready.",
+            "",
+            "In the TUI:",
+            "- Choose Start a local model.",
+            "- Review the model, engine, device, address, and ROCm install.",
+            "- Approve the start request.",
+            "- After it starts, choose Chat with assistant.",
+            "",
+            "From a terminal:",
+            "  rocm serve qwen --engine lemonade --device gpu_required --managed",
+            "  rocm services list",
+            "  rocm services list --all",
+            "  rocm services stop <service_id>",
+            "",
+            "The Services screen lists running or starting servers.",
+            "Use services list --all when you need old failed or stopped records.",
+        ]
+        .join("\n"),
+        HelpTopic::Assistant => [
+            "Assistant",
+            "",
+            "The assistant is for ROCm setup, local models, ComfyUI, and basic troubleshooting.",
+            "",
+            "Good prompts:",
+            "- Is ROCm installed?",
+            "- Where is ROCm installed?",
+            "- What GPU is on this machine?",
+            "- What models can this machine support?",
+            "- Set up ComfyUI.",
+            "",
+            "If the assistant needs to change something, it shows a review card first.",
+            "For questions that do not need ROCm commands, it should answer naturally.",
+            "",
+            "From a terminal:",
+            "  rocm chat --tools --provider local",
+        ]
+        .join("\n"),
+        HelpTopic::ComfyUi => [
+            "ComfyUI",
+            "",
+            "ComfyUI is installed into ROCm CLI's managed app folder.",
+            "Starting ComfyUI shows the local URL to open.",
+            "",
+            "In the TUI:",
+            "- Choose Open ComfyUI.",
+            "- If it is not installed, choose Install ComfyUI.",
+            "- If it is installed, choose Start ComfyUI.",
+            "- When it runs, ROCm CLI shows the URL and models folder.",
+            "",
+            "From a terminal:",
+            "  rocm comfyui install",
+            "  rocm comfyui start",
+            "  rocm comfyui models-path",
+            "  rocm comfyui logs",
+            "",
+            "Download ComfyUI model files yourself and put them in the models path.",
+        ]
+        .join("\n"),
+        HelpTopic::Commands => [
+            "CLI commands",
+            "",
+            "Common commands:",
+            "  rocm",
+            "  rocm doctor",
+            "  rocm setup reset",
+            "  rocm install sdk --channel release --format pip --prefix <folder>",
+            "  rocm runtimes list",
+            "  rocm runtimes activate <runtime_key>",
+            "  rocm engine list",
+            "  rocm serve qwen --engine lemonade --device gpu_required --managed",
+            "  rocm services list",
+            "  rocm services list --all",
+            "  rocm comfyui install",
+            "  rocm comfyui start",
+            "  rocm comfyui models-path",
+            "",
+            "Inside the TUI, slash commands still work:",
+            "  /setup",
+            "  /doctor",
+            "  /engine",
+            "  /serve",
+            "  /comfyui",
+            "  /comfyui logs",
+            "  /services",
+            "  /permissions",
+            "",
+            "Press / on a normal menu to open a command popup with suggestions.",
+            "Use /help for the full command picker.",
+        ]
+        .join("\n"),
+        HelpTopic::KeyboardShortcuts => [
+            "Keyboard shortcuts",
+            "",
+            "Everywhere:",
+            "  F1       open this help",
+            "  F5       refresh the current screen",
+            "  Esc      go back or close the current card",
+            "  Ctrl-C   quit or ask to quit safely",
+            "",
+            "Menus:",
+            "  Up/Down  move selection",
+            "  Enter    open or choose",
+            "  Tab      next item when available",
+            "  /        open command popup",
+            "",
+            "Long details and logs:",
+            "  PageUp/PageDown  scroll",
+            "  Mouse wheel      scroll",
+            "  Home/End         jump to top or bottom where supported",
+            "",
+            "Text boxes:",
+            "  Left/Right move cursor",
+            "  Ctrl-A/Ctrl-E move to start/end",
+            "  Ctrl-U clear input",
+            "  Ctrl-W delete previous word",
+            "",
+            "Review cards:",
+            "  Enter or Y approve",
+            "  N or Esc cancel",
+        ]
+        .join("\n"),
+        HelpTopic::Troubleshooting => [
+            "Troubleshooting",
+            "",
+            "If setup did not start:",
+            "- Make sure you chose a full folder path.",
+            "- Open the install log from the setup screen.",
+            "- Use F5 to refresh setup status.",
+            "",
+            "If GPU checks fail:",
+            "- Run rocm doctor.",
+            "- On Windows, make sure the AMD driver is installed.",
+            "- On WSL, run from the Linux filesystem when possible, not /mnt.",
+            "",
+            "If a local model does not start:",
+            "- Check that a ROCm runtime is active.",
+            "- Open Services and inspect the running server.",
+            "- Use rocm services list --all for failed records.",
+            "",
+            "If ComfyUI starts but you do not see models:",
+            "- Run rocm comfyui models-path.",
+            "- Put model files in that folder.",
+        ]
+        .join("\n"),
+    }
+}
+
+fn comfyui_command_screen_actions(installed: bool, running: bool) -> Vec<CommandScreenAction> {
+    let commands = if installed {
+        if running {
+            vec!["comfyui models-path"]
+        } else {
+            vec!["comfyui start", "comfyui models-path"]
+        }
+    } else {
+        vec!["comfyui install"]
+    };
+    commands
+        .into_iter()
+        .map(CommandScreenAction::OpenCommand)
+        .chain(std::iter::once(CommandScreenAction::Back))
+        .collect()
 }
 
 fn help_command_screen_actions() -> Vec<CommandScreenAction> {
@@ -21703,12 +22823,13 @@ fn help_command_label(command: &str) -> &'static str {
         "comfyui" => "ComfyUI",
         "comfyui install" => "Install ComfyUI",
         "comfyui start" => "Start ComfyUI",
+        "comfyui models-path" => "Show models path",
         "comfyui logs" => "Open ComfyUI logs",
         "comfyui log-files" => "Show ComfyUI log files",
         "model" => "Choose model",
         "serve" => "Start a local model",
         "plan" => "Plan a request",
-        "services" => "Local servers",
+        "services" => "List currently running models",
         "logs" => "Recent logs",
         "automations" => "Automations",
         "reviews" => "Review requests",
@@ -21772,6 +22893,10 @@ fn help_command_detail(command: &str) -> String {
             "Start ComfyUI",
             "Start ComfyUI on this computer, open the browser when possible, and show the local URL.",
         ),
+        "comfyui models-path" => (
+            "Show models path",
+            "Print the folder where ComfyUI looks for downloaded models.",
+        ),
         "comfyui logs" => (
             "Open ComfyUI logs",
             "Read the latest ComfyUI install and run output here without copying a file path.",
@@ -21793,7 +22918,7 @@ fn help_command_detail(command: &str) -> String {
             "Review what rocm-cli would do for a plain English request before running anything.",
         ),
         "services" => (
-            "Local servers",
+            "List currently running models",
             "View local model servers, open logs, stop a server, or restart it.",
         ),
         "logs" => (
@@ -21869,7 +22994,6 @@ fn logs_view_actions() -> &'static [LogsViewAction] {
     &[
         LogsViewAction::PreviousPage,
         LogsViewAction::NextPage,
-        LogsViewAction::Refresh,
         LogsViewAction::Search,
         LogsViewAction::ClearSearch,
         LogsViewAction::ToggleFollow,
@@ -21886,7 +23010,6 @@ fn logs_view_action_label(
     match action {
         LogsViewAction::PreviousPage => "Previous page",
         LogsViewAction::NextPage => "Next page",
-        LogsViewAction::Refresh => "Refresh",
         LogsViewAction::Search => "Search logs",
         LogsViewAction::ClearSearch => "Clear search",
         LogsViewAction::ToggleFollow if follow => "Stop following",
@@ -21965,10 +23088,10 @@ fn services_manager_detail_text(app: &App) -> String {
         .or_else(|| state.items.first())
     else {
         return [
-            "No managed services found.",
+            "No local model servers are running.",
             "",
-            "Start one from /serve when you are ready.",
-            "Choose Check again below to reload the list.",
+            "Start one from the main menu when you are ready.",
+            "Press F5 to check again.",
         ]
         .join("\n");
     };
@@ -21997,7 +23120,7 @@ fn services_manager_detail_text(app: &App) -> String {
     );
     let _ = writeln!(
         output,
-        "  Use the rows below to chat, open logs, stop, restart, refresh, or go back."
+        "  Use the rows below to chat, open logs, stop, restart, or go back."
     );
     output.trim_end().to_owned()
 }
@@ -22071,7 +23194,7 @@ fn services_manager_action_detail_text(app: &App, action: ServicesManagerAction)
                     );
                 } else {
                     let _ = writeln!(output, "This server is not ready yet.");
-                    let _ = writeln!(output, "Open logs or refresh, then try Chat again.");
+                    let _ = writeln!(output, "Open logs or press F5, then try Chat again.");
                 }
             } else {
                 let _ = writeln!(output, "No managed server is selected.");
@@ -22123,13 +23246,6 @@ fn services_manager_action_detail_text(app: &App, action: ServicesManagerAction)
                 let _ = writeln!(output, "No managed server is selected.");
             }
         }
-        ServicesManagerAction::Refresh => {
-            let _ = writeln!(output, "Check again");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Reload the managed server list.");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Press Enter to refresh this screen.");
-        }
         ServicesManagerAction::Back => {
             let _ = writeln!(output, "Back");
             let _ = writeln!(output);
@@ -22154,7 +23270,7 @@ fn automations_manager_detail_text(app: &App) -> String {
     let Some(row) = selected_automation_manager_row(state) else {
         let mut output = String::new();
         let _ = writeln!(output, "No automation checks are available.");
-        let _ = writeln!(output, "Press R to refresh.");
+        let _ = writeln!(output, "Press F5 to refresh.");
         if !state.overview.trim().is_empty() {
             let _ = writeln!(output);
             let _ = writeln!(output, "Details");
@@ -22212,7 +23328,7 @@ fn automations_manager_detail_text(app: &App) -> String {
     let _ = writeln!(output, "This request has already been handled.");
     let _ = writeln!(
         output,
-        "Use Up and Down to choose another request, or R to refresh."
+        "Use Up and Down to choose another request, or F5 to refresh."
     );
     output.trim_end().to_owned()
 }
@@ -22245,7 +23361,7 @@ fn automation_watcher_detail_text(watcher: &AutomationWatcherItem) -> String {
         let _ = writeln!(output, "  Enter or Y: turn this on");
         let _ = writeln!(output, "  N/Delete: leave this off");
     }
-    let _ = writeln!(output, "  R: refresh");
+    let _ = writeln!(output, "  F5: refresh");
     let _ = writeln!(output, "  Esc: back");
     output.trim_end().to_owned()
 }
@@ -22333,11 +23449,11 @@ fn install_sdk_detail_text(app: &App) -> String {
     let _ = writeln!(output);
     let _ = writeln!(output, "Selected folder");
     let _ = writeln!(output, "  {folder}");
-    let _ = writeln!(output, "Downloads stay inside");
+    let _ = writeln!(output, "Downloaded files");
     let _ = writeln!(
         output,
         "  {}",
-        std::path::Path::new(folder).join("pip-cache").display()
+        display_runtime_folder_path(&std::path::Path::new(folder).join("pip-cache"))
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Selected row");
@@ -22421,8 +23537,9 @@ fn doctor_overview_text(report: &str) -> String {
     let _ = writeln!(output, "  Memory: {ram}");
     let _ = writeln!(output);
     let _ = writeln!(output, "GPU");
-    let _ = writeln!(output, "  AMD GPU target: {gfx}");
-    let _ = writeln!(output, "  ROCm package to install: {family}");
+    let _ = writeln!(output, "  AMD GPU: {}", doctor_gpu_display_name(report));
+    let _ = writeln!(output, "  Target: {gfx}");
+    let _ = writeln!(output, "  ROCm package: {family}");
     let _ = writeln!(output, "  Installed ROCm package: {installed_family}");
     let _ = writeln!(output);
     let _ = writeln!(output, "ROCm");
@@ -22440,7 +23557,7 @@ fn doctor_overview_text(report: &str) -> String {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Use Up/Down to inspect a check. Press R to refresh."
+        "Use Up/Down to inspect a check. Press F5 to refresh."
     );
     output.trim_end().to_owned()
 }
@@ -22453,7 +23570,10 @@ fn doctor_gpu_text(report: &str) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "GPU");
     let _ = writeln!(output);
-    let _ = writeln!(output, "Detected AMD GPU target");
+    let _ = writeln!(output, "Detected AMD GPU");
+    let _ = writeln!(output, "  {}", doctor_gpu_display_name(report));
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Target");
     let _ = writeln!(output, "  {gfx}");
     let _ = writeln!(output);
     let _ = writeln!(output, "ROCm package for this GPU");
@@ -22472,6 +23592,18 @@ fn doctor_gpu_text(report: &str) -> String {
         );
     }
     output.trim_end().to_owned()
+}
+
+fn doctor_gpu_display_name(report: &str) -> String {
+    let detail = doctor_report_value(report, "driver_detail");
+    if detail != "not checked" && detail != "not detected" && detail != "none found" {
+        return detail;
+    }
+    let gfx = doctor_report_value(report, "detected_gfx_target");
+    if gfx != "not checked" && gfx != "not detected" && gfx != "none found" {
+        return "detected AMD GPU".to_owned();
+    }
+    "not detected yet".to_owned()
 }
 
 fn doctor_runtimes_text(report: &str) -> String {
@@ -22767,11 +23899,7 @@ fn engine_manager_detail_text(app: &App) -> String {
     if let Some(action) = app.selected_engine_manager_action() {
         return engine_manager_action_detail_text(app, action);
     }
-    let Some(item) = state
-        .items
-        .get(state.selected)
-        .or_else(|| state.items.first())
-    else {
+    let Some(item) = app.selected_engine_manager_item() else {
         return "No engines are available.".to_owned();
     };
     let mut output = String::new();
@@ -22800,14 +23928,17 @@ fn engine_manager_detail_text(app: &App) -> String {
         let _ = writeln!(output, "  Enter: use this engine by default");
         let _ = writeln!(
             output,
-            "  Use the action rows below to reinstall or refresh."
+            "  Use the action rows below to reinstall or go back."
         );
     } else if item.runtime_ready {
         let _ = writeln!(output, "  Enter: install this engine");
-        let _ = writeln!(output, "  Use the action rows below to refresh or go back.");
+        let _ = writeln!(output, "  Use the action rows below to install or go back.");
     } else {
         let _ = writeln!(output, "  Enter: open ROCm install options first");
-        let _ = writeln!(output, "  Use the action rows below to refresh or go back.");
+        let _ = writeln!(
+            output,
+            "  Use the action rows below to open setup or go back."
+        );
     }
     output.trim_end().to_owned()
 }
@@ -22864,13 +23995,6 @@ fn engine_manager_action_detail_text(app: &App, action: EngineManagerAction) -> 
             let _ = writeln!(output);
             let _ = writeln!(output, "Press Enter to open ROCm install options.");
         }
-        EngineManagerAction::Refresh => {
-            let _ = writeln!(output, "Refresh engines");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Reload engine install status.");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Press Enter to refresh this screen.");
-        }
         EngineManagerAction::Back => {
             let _ = writeln!(output, "Back");
             let _ = writeln!(output);
@@ -22892,7 +24016,7 @@ fn model_picker_detail_text(app: &App) -> String {
         .get(state.selected)
         .or_else(|| state.items.first())
     else {
-        return "No model recipes found.\n\nPress R to refresh.".to_owned();
+        return "No model recipes found.\n\nPress F5 to refresh.".to_owned();
     };
     let mut output = String::new();
     let _ = writeln!(output, "Model");
@@ -22926,8 +24050,8 @@ fn model_picker_detail_text(app: &App) -> String {
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Action");
-    let _ = writeln!(output, "  Enter: review a local serve plan for this model");
-    let _ = writeln!(output, "  R: refresh model recipes");
+    let _ = writeln!(output, "  Enter: open local model setup for this model");
+    let _ = writeln!(output, "  F5: refresh model recipes");
     let _ = writeln!(output, "  Esc: back");
     if !recipe.warnings.is_empty() {
         let _ = writeln!(output);
@@ -23222,7 +24346,7 @@ fn runtime_manager_detail_text(app: &App) -> String {
     }
     let _ = writeln!(
         output,
-        "  Choose a row below the list to install, uninstall, refresh, or add an existing install."
+        "  Choose a row below the list to install, uninstall, or add an existing install."
     );
     if item.read_only || item.imported_from.is_some() {
         let _ = writeln!(output, "  Uninstall only forgets this external folder.");
@@ -23276,13 +24400,6 @@ fn runtime_action_detail_text(app: &App, action: RuntimeManagerAction) -> String
                 let _ = writeln!(output, "No ROCm install is selected yet.");
                 let _ = writeln!(output, "Choose an install row first.");
             }
-        }
-        RuntimeManagerAction::Refresh => {
-            let _ = writeln!(output, "Refresh installs");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Reload the saved ROCm install list.");
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Press Enter to refresh this screen.");
         }
         RuntimeManagerAction::AdvancedOptions => {
             let _ = writeln!(output, "Add existing install");
@@ -23482,14 +24599,12 @@ fn render_screen_approval(app: &App, pending: &PendingApproval) -> String {
     }));
     lines.extend([
         String::new(),
-        "Controls".to_owned(),
         format!("  {approve_marker} Enter or Y: approve"),
         format!("  {cancel_marker} {cancel_label}"),
     ]);
     if is_proposal {
         lines.push("  Esc: back without changing".to_owned());
     }
-    lines.push("  PageUp/PageDown: scroll details".to_owned());
     lines.join("\n")
 }
 
@@ -23535,12 +24650,11 @@ fn render_onboarding_approval(app: &App, pending: &PendingApproval) -> String {
         let _ = writeln!(output, "  It will add the local AI pieces ROCm CLI needs.");
         let _ = writeln!(
             output,
-            "  Downloads stay inside: {}",
-            pip_cache_dir.display()
+            "  Downloaded files: {}",
+            display_runtime_folder_path(&pip_cache_dir)
         );
     }
     let _ = writeln!(output);
-    let _ = writeln!(output, "Controls");
     if pending.title == "Uninstall" {
         let _ = writeln!(output, "  {approve_marker} Enter or Y: uninstall ROCm");
     } else {
@@ -23843,8 +24957,8 @@ fn plain_cli_approval_lines_with_gpu(
                 lines.push(format!("Folder: {folder}"));
                 if cli_arg_value(args, "--format").unwrap_or("pip") == "pip" {
                     lines.push(format!(
-                        "Downloads stay inside: {}",
-                        Path::new(folder).join("pip-cache").display()
+                        "Downloaded files: {}",
+                        display_runtime_folder_path(&Path::new(folder).join("pip-cache"))
                     ));
                 }
             }
@@ -23927,6 +25041,9 @@ fn cli_approval_must_show_review(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
         Some("install") if args.get(1).map(String::as_str) == Some("sdk")
+    ) || matches!(
+        args.first().map(String::as_str),
+        Some("serve") if !args.iter().any(|arg| arg == "--foreground")
     ) || matches!(
         (
             args.first().map(String::as_str),
@@ -24103,12 +25220,13 @@ fn runtime_manager_running_text(app: &App, title: &str) -> String {
         let _ = writeln!(output, "  Waiting for output...");
     } else {
         for line in recent {
-            let _ = writeln!(output, "  {line}");
+            let _ = writeln!(output, "  {}", display_stream_log_line(&line));
         }
     }
     output.trim_end().to_owned()
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn running_job_modal_text(
     app: &App,
@@ -24152,6 +25270,7 @@ fn running_job_modal_header_text(app: &App, job: &RunningJob, compact: bool) -> 
     output.trim_end().to_owned()
 }
 
+#[cfg(test)]
 fn running_job_modal_output_text(
     app: &App,
     live_output_limit: usize,
@@ -24160,13 +25279,40 @@ fn running_job_modal_output_text(
     let mut output = String::new();
     let recent = running_job_recent_output_visual_lines(app, live_output_limit, live_output_width);
     if recent.is_empty() {
-        let _ = writeln!(output, "  Starting...");
+        let _ = writeln!(output, "{}", running_job_empty_output_text(app));
     } else {
         for line in recent {
             let _ = writeln!(output, "{line}");
         }
     }
     output.trim_end().to_owned()
+}
+
+fn running_job_modal_full_output_text(app: &App, live_output_width: usize) -> String {
+    let mut output = String::new();
+    let lines = running_job_output_visual_lines(app, live_output_width);
+    if lines.is_empty() {
+        let _ = writeln!(output, "{}", running_job_empty_output_text(app));
+    } else {
+        for line in lines {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+    output.trim_end().to_owned()
+}
+
+fn running_job_empty_output_text(app: &App) -> &'static str {
+    match app.running_job.as_ref().map(|job| &job.kind) {
+        Some(RunningJobKind::ServiceLifecycle {
+            action: ServiceLifecycleAction::Stop,
+            ..
+        }) => "  Stopping...",
+        Some(RunningJobKind::ServiceLifecycle {
+            action: ServiceLifecycleAction::Restart,
+            ..
+        }) => "  Restarting...",
+        _ => "  Starting...",
+    }
 }
 
 fn running_progress_bar(started_at: Instant) -> String {
@@ -24188,17 +25334,20 @@ fn running_progress_bar(started_at: Instant) -> String {
 
 fn running_job_output_lines(app: &App) -> Vec<String> {
     if app.onboarding_install_running() {
-        let lines = app
+        if !app.running_job_output.is_empty() {
+            return app.running_job_output.iter().cloned().collect::<Vec<_>>();
+        }
+        return app
             .onboarding_install_log
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if !lines.is_empty() {
-            return lines;
-        }
-        return app.running_job_output.iter().cloned().collect::<Vec<_>>();
     }
-    let mut lines = active_screen_message_text(app)
+    let mut lines = app.running_job_output.iter().cloned().collect::<Vec<_>>();
+    if !lines.is_empty() {
+        return lines;
+    }
+    lines = active_screen_message_text(app)
         .map(|message| {
             message
                 .lines()
@@ -24214,9 +25363,6 @@ fn running_job_output_lines(app: &App) -> Vec<String> {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-    }
-    if lines.is_empty() {
-        lines = app.running_job_output.iter().cloned().collect::<Vec<_>>();
     }
     lines
 }
@@ -24249,12 +25395,21 @@ fn running_job_visible_output_start(app: &App, limit: usize, width: usize) -> us
         return 0;
     }
     let max_offset = len.saturating_sub(limit);
-    let offset = app.running_job_log_scroll.min(max_offset);
+    let offset = running_job_log_scroll_offset(app).min(max_offset);
     len.saturating_sub(offset)
         .saturating_sub(limit)
         .min(max_offset)
 }
 
+fn running_job_log_scroll_offset(app: &App) -> usize {
+    if app.onboarding_install_running() {
+        app.onboarding_install_log_scroll
+    } else {
+        app.running_job_log_scroll
+    }
+}
+
+#[cfg(test)]
 fn running_job_recent_output_visual_lines(app: &App, limit: usize, width: usize) -> Vec<String> {
     let lines = running_job_output_visual_lines(app, width);
     let len = lines.len();
@@ -24267,50 +25422,6 @@ fn running_job_recent_output_visual_lines(app: &App, limit: usize, width: usize)
         .skip(start)
         .take(limit)
         .collect::<Vec<_>>()
-}
-
-fn running_job_scrollbar_symbols(
-    content_len: usize,
-    viewport_len: usize,
-    position: usize,
-    height: u16,
-) -> Vec<char> {
-    let height = usize::from(height);
-    if height < 3 {
-        return vec!['|'; height];
-    }
-    let track_len = height.saturating_sub(2);
-    let max_scroll = content_len.saturating_sub(viewport_len);
-    let mut symbols = vec!['|'; height];
-    symbols[0] = '^';
-    symbols[height - 1] = 'v';
-    if track_len == 0 {
-        return symbols;
-    }
-    let thumb_len = if content_len == 0 {
-        track_len
-    } else {
-        viewport_len
-            .saturating_mul(track_len)
-            .saturating_add(content_len.saturating_sub(1))
-            / content_len
-    }
-    .clamp(1, track_len);
-    let max_thumb_start = track_len.saturating_sub(thumb_len);
-    let thumb_start = if max_scroll == 0 {
-        0
-    } else {
-        let position = position.min(max_scroll);
-        position
-            .saturating_mul(max_thumb_start)
-            .saturating_add(max_scroll / 2)
-            / max_scroll
-    };
-    let thumb_end = thumb_start.saturating_add(thumb_len).min(track_len);
-    for index in thumb_start..thumb_end {
-        symbols[index + 1] = '#';
-    }
-    symbols
 }
 
 fn display_stream_log_line(line: &str) -> String {
@@ -24452,9 +25563,24 @@ fn active_screen_message_text(app: &App) -> Option<String> {
 }
 
 fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
-    let action_height = if should_draw_running_job_modal(app) {
-        0
-    } else if app.onboarding_success_modal {
+    if app.onboarding_success_modal {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(THEME_BG)),
+            frame.area(),
+        );
+        draw_onboarding_success_modal(frame, app, frame.area());
+        return;
+    }
+    if should_draw_running_job_modal(app) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(THEME_BG)),
+            frame.area(),
+        );
+        draw_running_job_modal(frame, app, frame.area());
+        return;
+    }
+
+    let action_height = if app.onboarding_success_modal {
         0
     } else if app.onboarding_path_editing || app.running_job.is_some() {
         3
@@ -24510,7 +25636,7 @@ fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(action, action_area);
         None
     } else if app.pending_approval.is_some() {
-        let action = Paragraph::new("Review the foreground card.")
+        let action = Paragraph::new("Review is open.")
             .block(surface_block("Choose", THEME_BORDER))
             .style(Style::default().fg(THEME_MUTED).bg(THEME_PANEL))
             .wrap(Wrap { trim: false });
@@ -24536,7 +25662,7 @@ fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
     };
 
     let footer_text = if app.folder_browser.is_some() {
-        "Enter select | Backspace up | PageUp/PageDown scroll | Esc cancel"
+        "Enter open/use | Wheel/Page scroll | Esc"
     } else if app.overlay_card.is_some() {
         overlay_card_key_hint(app)
     } else if app.onboarding_cancel_install_confirm {
@@ -24554,11 +25680,11 @@ fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
     } else if onboarding_can_return(app) {
         "Up/Down choose | Enter select | Esc back"
     } else if onboarding_should_show_log_controls(app) {
-        "Up/Down choose | Left/Right folder | PageUp/PageDown log | Enter select"
+        "Up/Down choose | Left/Right folder | PageUp/PageDown log | Enter select | Esc quit"
     } else {
-        "Up/Down choose | Left/Right folder | Enter select"
+        "Up/Down choose | Left/Right folder | Enter select | Esc quit"
     };
-    let footer = Paragraph::new(format!("{} | {}", app.status, footer_text)).style(
+    let footer = Paragraph::new(footer_line(&app.status, footer_text, layout[2].width)).style(
         Style::default()
             .fg(Color::DarkGray)
             .bg(THEME_BG)
@@ -24589,31 +25715,21 @@ fn draw_onboarding(frame: &mut Frame<'_>, app: &App) {
     if app.onboarding_cancel_install_confirm {
         draw_onboarding_cancel_install_modal(frame, app, frame.area());
     }
-    if should_draw_running_job_modal(app) {
-        draw_running_job_modal(frame, app, frame.area());
-    }
     if app.overlay_card.is_some() {
         draw_overlay_card(frame, app, frame.area());
     }
     if app.folder_browser.is_some() {
         draw_folder_browser_modal(frame, app, frame.area());
     }
-    if app.onboarding_success_modal {
-        draw_onboarding_success_modal(frame, app, frame.area());
-    }
 }
 
-fn draw_onboarding_success_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_onboarding_success_modal(frame: &mut Frame<'_>, _app: &App, area: Rect) {
     let modal = centered_rect(58, 36, area);
     draw_modal_clear(frame, modal, area);
     let block = surface_block(" Installed ", THEME_GOOD);
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
-    let folder = setup_install_root(&app.paths, &app.config);
-    let text = format!(
-        "ROCm installed successfully.\n\nFolder\n  {}\n\nPress any key to continue to ROCm CLI.",
-        display_runtime_folder_path(&folder)
-    );
+    let text = "ROCm installed successfully.\n\nPress any key to continue to ROCm CLI.";
     let details = Paragraph::new(text)
         .style(Style::default().fg(THEME_TEXT).bg(THEME_PANEL_3))
         .wrap(Wrap { trim: false });
@@ -25165,8 +26281,6 @@ fn chat_session_command_result_text(title: &str, ok: bool, summary: &str) -> Str
     if let Some(reason) = reason.as_deref() {
         let _ = writeln!(output, "{reason}");
     }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Choose ROCm result to see what happened.");
     output.trim_end().to_owned()
 }
 
@@ -25220,6 +26334,8 @@ fn chat_session_command_result_lines(
             || reason.is_some_and(|reason| trimmed == reason)
             || trimmed.eq_ignore_ascii_case("Use /logs to inspect the full output.")
             || trimmed.eq_ignore_ascii_case("Use /logs to browse saved ROCm CLI logs.")
+            || trimmed.starts_with("streamed_stdout:")
+            || trimmed.starts_with("streamed_stderr:")
         {
             continue;
         }
@@ -25257,18 +26373,37 @@ fn looks_like_log_path(text: &str) -> bool {
 }
 
 fn chat_command_failure_reason(summary: &str) -> Option<String> {
-    summary.lines().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        (lower.starts_with("error:")
-            || lower.contains(" failed")
-            || lower.contains("could not")
-            || lower.contains("not found"))
-        .then(|| trimmed.to_owned())
-    })
+    let candidates = summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("Live output")
+                && !line.eq_ignore_ascii_case("Recent output")
+                && !line.eq_ignore_ascii_case("Command result")
+                && !line.eq_ignore_ascii_case("Full log")
+                && !looks_like_log_path(line)
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with("error:")
+                || lower.contains("error:")
+                || lower.contains("could not")
+                || lower.contains("not found")
+                || lower.contains("no matching distribution")
+                || lower.contains("access is denied")
+                || lower.contains("permission denied")
+        })
+        .or_else(|| {
+            candidates.iter().find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains(" failed") && !lower.ends_with(" failed.")
+            })
+        })
+        .map(|line| (*line).to_owned())
 }
 
 fn chat_rendered_body(rendered: &str) -> String {
@@ -25368,6 +26503,14 @@ fn chat_rocm_cli_summary_text(body: &str) -> Option<String> {
 fn managed_service_is_chat_ready(record: &ManagedServiceRecord) -> bool {
     matches!(record.status.as_str(), "ready" | "running")
         && managed_service_endpoint_model_ready(record, TUI_SERVICE_READY_TIMEOUT).unwrap_or(false)
+}
+
+fn load_visible_managed_services(paths: &AppPaths) -> Vec<ManagedServiceRecord> {
+    load_managed_services(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(managed_service_is_live)
+        .collect()
 }
 
 fn tui_service_is_builtin_assistant(record: &ManagedServiceRecord) -> bool {
@@ -25680,77 +26823,200 @@ fn plain_command_completion_text(
     title: &str,
     ok: bool,
     rendered: &str,
-    streamed: StreamedOutputCounts,
+    _streamed: StreamedOutputCounts,
     recent_output: Option<&str>,
-    full_log_path: Option<&Path>,
-    full_log_error: Option<&str>,
+    _full_log_path: Option<&Path>,
+    _full_log_error: Option<&str>,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "{}",
-        if ok {
-            format!("{title} finished.")
-        } else {
-            format!("{title} failed.")
-        }
-    );
-    if streamed.total > 0 {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Live output");
-        if streamed.stdout > 0 {
-            let _ = writeln!(
-                output,
-                "  {} output line(s) were shown while it ran.",
-                streamed.stdout
-            );
-        }
-        if streamed.stderr > 0 {
-            let _ = writeln!(
-                output,
-                "  {} error line(s) were shown while it ran.",
-                streamed.stderr
-            );
-        }
-        if let Some(recent) = recent_output.filter(|recent| !recent.trim().is_empty()) {
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Recent output");
-            for line in recent.lines() {
-                let _ = writeln!(output, "  {line}");
-            }
-        }
-    } else {
-        let snippets = plain_command_completion_snippets(rendered);
-        if !snippets.is_empty() {
-            let _ = writeln!(output);
-            let _ = writeln!(output, "Details");
-            for line in snippets {
-                let _ = writeln!(output, "  {line}");
-            }
-        }
+    if ok {
+        let _ = writeln!(output, "{title} finished.");
+        return output.trim_end().to_owned();
     }
-    let _ = writeln!(output);
-    match full_log_path {
-        Some(_) => {
-            let _ = writeln!(output, "More details are available in Logs.");
-            let _ = writeln!(
-                output,
-                "Use View details here first; open /logs only when you need the full saved output."
-            );
-        }
-        None if full_log_error.is_some() => {
-            let _ = writeln!(output, "Full details");
-            let _ = writeln!(
-                output,
-                "  Could not save the full log: {}",
-                full_log_error.unwrap_or("unknown error")
-            );
-        }
-        None => {
-            let _ = writeln!(output, "Use /logs to browse saved ROCm CLI logs.");
+    let _ = writeln!(output, "{title} failed.");
+    if let Some(reason) = plain_command_failure_reason(rendered, recent_output) {
+        let _ = writeln!(output);
+        if reason.to_ascii_lowercase().starts_with("error:") {
+            let _ = writeln!(output, "{reason}");
+        } else {
+            let _ = writeln!(output, "Error: {reason}");
         }
     }
     output.trim_end().to_owned()
+}
+
+fn plain_command_failure_reason(rendered: &str, recent_output: Option<&str>) -> Option<String> {
+    recent_output
+        .filter(|recent| !recent.trim().is_empty())
+        .into_iter()
+        .chain(std::iter::once(rendered))
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !matches!(*line, "stdout:" | "stderr:")
+                && !line.starts_with("command:")
+                && !line.starts_with("status:")
+                && !line.starts_with("streamed_stdout:")
+                && !line.starts_with("streamed_stderr:")
+                && !line.eq_ignore_ascii_case("recent output")
+                && !line.eq_ignore_ascii_case("live output")
+        })
+        .map(display_stream_log_line)
+        .find(|line| !line.trim().is_empty())
+}
+
+fn terse_screen_command_success_text(
+    paths: &AppPaths,
+    title: &str,
+    rendered: &str,
+) -> Option<String> {
+    match title {
+        "ComfyUI" => terse_comfyui_success_text(paths, rendered),
+        "Engine" => terse_engine_success_text(rendered),
+        _ => Some(generic_screen_command_success_text(title, rendered)),
+    }
+}
+
+fn generic_screen_command_success_text(title: &str, rendered: &str) -> String {
+    let mut output = format!("{title} finished.");
+    let lines = command_rendered_user_lines(rendered);
+    if !lines.is_empty() {
+        output.push_str("\n\n");
+        output.push_str(&lines.into_iter().take(6).collect::<Vec<_>>().join("\n"));
+    }
+    output
+}
+
+fn command_rendered_user_lines(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !matches!(*line, "stdout:" | "stderr:")
+                && !line.starts_with("command:")
+                && !line.starts_with("status:")
+                && !line.starts_with("streamed_stdout:")
+                && !line.starts_with("streamed_stderr:")
+        })
+        .map(display_stream_log_line)
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
+fn terse_engine_success_text(rendered: &str) -> Option<String> {
+    let engine = keyed_output_value(rendered, "engine");
+    let env_path = keyed_output_value(rendered, "env_path");
+    let is_ready = rendered
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("engine ready"));
+    let is_install = rendered
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("engine install"));
+    if !is_ready && !is_install {
+        return None;
+    }
+
+    let mut output = match engine.as_deref() {
+        Some("pytorch") if is_ready => "PyTorch is ready from the ROCm folder.".to_owned(),
+        Some(engine) => format!("{engine} is ready."),
+        None => "Engine is ready.".to_owned(),
+    };
+    if let Some(env_path) = env_path {
+        output.push_str("\n\nFolder: ");
+        output.push_str(&env_path);
+    }
+    Some(output)
+}
+
+fn terse_comfyui_success_text(paths: &AppPaths, rendered: &str) -> Option<String> {
+    let status = keyed_output_value(rendered, "status");
+    let url = keyed_output_value(rendered, "URL").or_else(|| keyed_output_value(rendered, "url"));
+    if let Some(url) = url {
+        let mut output = String::from("ComfyUI is running.");
+        output.push_str("\n\nOpen this URL:\n  ");
+        output.push_str(&url);
+        append_comfyui_tui_paths(&mut output, paths, Some(rendered));
+        if let Some(status) = status
+            && !friendly_comfyui_status_is_noise(&status)
+        {
+            output.push_str("\nStatus: ");
+            output.push_str(&status);
+        }
+        return Some(output);
+    }
+    if rendered.lines().any(|line| line.trim() == "installed: yes") {
+        let mut output = "ComfyUI installed.\n\nNext: Start ComfyUI.".to_owned();
+        append_comfyui_tui_paths(&mut output, paths, Some(rendered));
+        return Some(output);
+    }
+    status.map(|value| format!("ComfyUI status: {value}."))
+}
+
+fn append_comfyui_tui_paths(output: &mut String, paths: &AppPaths, rendered: Option<&str>) {
+    if let Some(models) = comfyui_models_path(paths, rendered) {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Put models here:");
+        let _ = writeln!(output, "  {}", display_runtime_folder_path(&models));
+        let _ = writeln!(output);
+        let _ = writeln!(output, "To print this path later:");
+        let _ = writeln!(output, "  rocm comfyui models-path");
+    }
+}
+
+fn friendly_comfyui_status_is_noise(status: &str) -> bool {
+    let trimmed = status.trim();
+    trimmed.eq_ignore_ascii_case("running")
+        || trimmed.eq_ignore_ascii_case("ok")
+        || trimmed.eq_ignore_ascii_case("ok (0)")
+        || trimmed.starts_with("ok ")
+}
+
+fn comfyui_models_path(paths: &AppPaths, rendered: Option<&str>) -> Option<PathBuf> {
+    if let Ok(Some(path)) = crate::comfyui::models_folder(paths) {
+        return Some(path);
+    }
+
+    rendered
+        .and_then(|rendered| {
+            keyed_output_value(rendered, "models path")
+                .or_else(|| keyed_output_value(rendered, "models folder"))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            rendered
+                .and_then(|rendered| keyed_output_value(rendered, "folder"))
+                .filter(|value| !value.trim().is_empty())
+                .map(|folder| PathBuf::from(folder).join("source").join("models"))
+        })
+}
+
+fn comfyui_success_status(rendered: &str) -> Option<String> {
+    keyed_output_value(rendered, "URL")
+        .or_else(|| keyed_output_value(rendered, "url"))
+        .map(|url| format!("ComfyUI is running at {url}"))
+        .or_else(|| {
+            rendered
+                .lines()
+                .any(|line| line.trim() == "installed: yes")
+                .then(|| "ComfyUI installed.".to_owned())
+        })
+        .or_else(|| {
+            keyed_output_value(rendered, "status").map(|status| format!("ComfyUI: {status}"))
+        })
+}
+
+fn keyed_output_value(rendered: &str, key: &str) -> Option<String> {
+    rendered.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let (name, value) = trimmed.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn write_tui_command_full_log(
@@ -25785,23 +27051,6 @@ fn write_tui_command_full_log(
     body.push('\n');
     fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
-}
-
-fn plain_command_completion_snippets(rendered: &str) -> Vec<String> {
-    rendered
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            !matches!(*line, "stdout:" | "stderr:")
-                && !line.starts_with("command:")
-                && !line.starts_with("status:")
-                && !line.starts_with("streamed_stdout:")
-                && !line.starts_with("streamed_stderr:")
-        })
-        .take(6)
-        .map(str::to_owned)
-        .collect()
 }
 
 fn serve_plan_device_policy(device: Option<&str>) -> &str {
@@ -26443,9 +27692,10 @@ mod tests {
         render_serve_command_plan,
     };
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+        MouseEventKind,
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
     use rocm_core::{
         AppPaths, AutomationProposalRecord, HostGpuSummary, ManagedServiceRecord,
         PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
@@ -26454,7 +27704,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::{Read as _, Write as _};
+    use std::io::{Cursor, Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::{
@@ -26567,15 +27817,91 @@ mod tests {
     }
 
     #[test]
+    fn fallback_terminal_decodes_f1_sequences() {
+        let event = super::read_fallback_terminal_event(&mut Cursor::new(b"\x1bOP".as_slice()))
+            .expect("SS3 F1 sequence should decode");
+        assert!(matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::F(1),
+                ..
+            })
+        ));
+
+        let event = super::read_fallback_terminal_event(&mut Cursor::new(b"\x1b[11~".as_slice()))
+            .expect("CSI F1 sequence should decode");
+        assert!(matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::F(1),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_terminal_decodes_single_escape_without_second_key() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(0x1b).expect("escape byte should send");
+        let started = Instant::now();
+
+        let event =
+            super::read_fallback_terminal_event_from_receiver(&receiver, Duration::from_millis(1))
+                .expect("single escape should decode");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "single Escape should not wait for another key"
+        );
+        assert!(matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_terminal_decodes_mouse_wheel_sequences() {
+        let event =
+            super::read_fallback_terminal_event(&mut Cursor::new(b"\x1b[<64;10;5M".as_slice()))
+                .expect("scroll-up sequence should decode");
+        assert!(matches!(
+            event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 9,
+                row: 4,
+                ..
+            })
+        ));
+
+        let event =
+            super::read_fallback_terminal_event(&mut Cursor::new(b"\x1b[<65;10;5M".as_slice()))
+                .expect("scroll-down sequence should decode");
+        assert!(matches!(
+            event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 9,
+                row: 4,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn gpu_sidebar_reports_unavailable_after_amd_smi_error() {
         let mut telemetry = GpuTelemetry::default();
         telemetry.record_error("monitor: failed to launch amd-smi".to_owned());
 
         let rendered = telemetry.sidebar_text();
 
-        assert!(rendered.contains("status: unavailable"));
+        assert!(rendered.contains("status: live usage unavailable"));
         assert!(!rendered.contains("status: checking GPU"));
-        assert!(rendered.contains("problem: monitor: failed to launch amd-smi"));
+        assert!(rendered.contains("note: live GPU usage is not available in this terminal"));
+        assert!(!rendered.contains("failed to launch amd-smi"));
     }
 
     #[test]
@@ -26680,7 +28006,7 @@ mod tests {
     fn sidebar_shows_current_tui_mode() {
         let app = test_app();
 
-        assert!(app.sidebar_text().contains("mode: ask"));
+        assert!(!app.sidebar_text().contains("mode: ask"));
     }
 
     #[test]
@@ -26704,8 +28030,8 @@ mod tests {
         let rendered = app.sidebar_text();
 
         assert!(rendered.contains("ROCm CLI"));
-        assert!(rendered.contains("setup: ready"));
-        assert!(rendered.contains("Use /doctor for details."));
+        assert!(rendered.contains("Setup: ready"));
+        assert!(rendered.contains("Choose Run setup check for details."));
         assert!(!rendered.contains("config:"));
         assert!(!rendered.contains("data:"));
         assert!(!rendered.contains("cache:"));
@@ -26724,7 +28050,7 @@ mod tests {
 
         let rendered = app.sidebar_text();
 
-        assert!(rendered.contains("setup: not set up"));
+        assert!(rendered.contains("Setup: not set up"));
     }
 
     #[test]
@@ -26744,7 +28070,7 @@ mod tests {
         assert!(super::setup_venv_ready(&app.paths, &app.config));
         let rendered = app.sidebar_text();
 
-        assert!(rendered.contains("setup: not set up"));
+        assert!(rendered.contains("Setup: not set up"));
         Ok(())
     }
 
@@ -26754,7 +28080,7 @@ mod tests {
 
         assert!(app.handle_command("logs"));
         assert_eq!(app.mode, TuiMode::Logs);
-        assert!(app.sidebar_text().contains("mode: logs"));
+        assert!(!app.sidebar_text().contains("mode: logs"));
 
         assert!(app.handle_command("serve tiny.gguf --engine llama.cpp"));
         assert_eq!(app.mode, TuiMode::Serve);
@@ -27427,7 +28753,7 @@ mod tests {
         );
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         let rendered = render_test_terminal(&app, 120, 24);
-        assert!(rendered.contains("Detected AMD GPU target"));
+        assert!(rendered.contains("Target"));
         assert!(rendered.contains("gfx1201"));
     }
 
@@ -27451,7 +28777,7 @@ mod tests {
         assert!(rendered.contains(r"App metadata cache: C:\Users\jam\.rocm\cache"));
         assert!(rendered.contains(r"ROCm install downloads: D:\jam\temp\therock_venvs\pip-cache"));
         assert!(rendered.contains(r"Active ROCm install: D:\jam\temp\therock_venvs"));
-        assert!(!rendered.contains(r"Download cache: C:\Users\jam\.rocm\cache"));
+        assert!(!rendered.contains(r"Downloaded files: C:\Users\jam\.rocm\cache"));
         assert!(!rendered.contains("ROCm installs and logs"));
     }
 
@@ -27902,6 +29228,62 @@ mod tests {
     }
 
     #[test]
+    fn slash_opens_command_popup_from_home_and_runs_exact_command() {
+        let mut app = test_app();
+
+        handle_key(&mut app, key_event(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert_eq!(app.input, "/");
+        assert!(super::surface_command_prompt_active(&app));
+        let rendered = render_test_terminal(&app, 120, 30);
+        assert!(rendered.contains("Command"));
+        assert!(rendered.contains("/doctor"));
+        assert!(!rendered.contains("Prompt"));
+
+        for ch in "doctor".chars() {
+            handle_key(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input, "/doctor");
+
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.doctor_manager.is_some());
+        assert!(app.input.is_empty());
+        assert!(app.overlay_card.is_none());
+    }
+
+    #[test]
+    fn slash_popup_works_from_comfyui_but_not_setup() {
+        let mut app = test_app();
+        submit_prompt_command(&mut app, "/comfyui");
+        assert!(app.command_screen.is_some());
+
+        handle_key(&mut app, key_event(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.input, "/");
+        assert!(super::surface_command_prompt_active(&app));
+
+        for ch in "comfyui logs".chars() {
+            handle_key(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.command_screen.is_some());
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("ComfyUI Logs")
+        );
+
+        let mut setup_app = test_app();
+        setup_app.onboarding_active = true;
+        handle_key(
+            &mut setup_app,
+            key_event(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(setup_app.input.is_empty());
+        assert!(setup_app.overlay_card.is_none());
+        assert!(!super::surface_command_prompt_active(&setup_app));
+    }
+
+    #[test]
     fn comfyui_slash_surface_is_navigable_and_friendly() {
         let mut app = test_app();
 
@@ -27910,17 +29292,36 @@ mod tests {
         assert!(app.command_screen.is_some());
         assert!(app.transcript.is_empty());
         let actions = &app.command_screen.as_ref().unwrap().actions;
-        assert!(actions.contains(&super::CommandScreenAction::OpenCommand(
-            "comfyui log-files"
-        )));
+        assert_eq!(
+            actions,
+            &vec![
+                super::CommandScreenAction::OpenCommand("comfyui install"),
+                super::CommandScreenAction::Back,
+            ]
+        );
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("ComfyUI"));
         assert!(rendered.contains("> Install ComfyUI"));
-        assert!(rendered.contains("Start ComfyUI"));
-        assert!(rendered.contains("Open ComfyUI logs"));
+        assert!(!rendered.contains("Start ComfyUI"));
+        assert!(!rendered.contains("Show models path"));
+        assert!(!rendered.contains("Open ComfyUI logs"));
         assert!(rendered.contains("Not installed yet"));
         assert!(!rendered.contains("last install log"));
         assert!(!rendered.contains("[ComfyUI]"));
+    }
+
+    #[test]
+    fn comfyui_menu_hides_install_after_setup() -> anyhow::Result<()> {
+        let mut app = test_app();
+        write_comfyui_manifest_for_test(&app)?;
+
+        submit_prompt_command(&mut app, "/comfyui");
+
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(!rendered.contains("Install ComfyUI"));
+        assert!(rendered.contains("Start ComfyUI"));
+        assert!(rendered.contains("Show models path"));
+        Ok(())
     }
 
     #[test]
@@ -27976,6 +29377,56 @@ mod tests {
     }
 
     #[test]
+    fn comfyui_start_completion_keeps_url_visible() {
+        let mut app = test_app();
+        submit_prompt_command(&mut app, "/comfyui");
+
+        app.complete_running_job(
+            "ComfyUI".to_owned(),
+            super::RunningJobKind::Cli,
+            Ok(super::CommandOutput {
+                ok: true,
+                rendered: "ComfyUI\n  status: running\n  URL: http://127.0.0.1:8188\n  models folder: D:\\jam\\temp\\ComfyUI\\models\n".to_owned(),
+                chat_approval: None,
+            }),
+            super::StreamedOutputCounts {
+                total: 0,
+                stdout: 0,
+                stderr: 0,
+            },
+        );
+
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("ComfyUI is running."));
+        assert!(rendered.contains("Open this URL:"));
+        assert!(rendered.contains("http://127.0.0.1:8188"));
+        assert!(rendered.contains("Show models path"));
+        assert!(rendered.contains("D:\\jam\\temp\\ComfyUI\\models"));
+        assert!(rendered.contains("rocm comfyui models-path"));
+        assert!(rendered.contains("Put models here:"));
+        assert!(!rendered.contains("Status: ok"));
+        assert!(!rendered.contains("ComfyUI finished."));
+        assert!(!rendered.contains("Recent output"));
+        assert!(!rendered.contains("Live output"));
+        assert!(!rendered.contains("Output:"));
+    }
+
+    #[test]
+    fn comfyui_models_path_command_shows_path() -> anyhow::Result<()> {
+        let mut app = test_app();
+        write_comfyui_manifest_for_test(&app)?;
+
+        submit_prompt_command(&mut app, "/comfyui models-path");
+
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Show models path"));
+        assert!(rendered.contains("models"));
+        assert!(!rendered.contains("Recent output"));
+        assert!(!rendered.contains("Output:"));
+        Ok(())
+    }
+
+    #[test]
     fn comfyui_completion_lists_user_actions() {
         let mut app = test_app();
         app.set_input("/comfyui ".to_owned());
@@ -27990,6 +29441,7 @@ mod tests {
                 "status".to_owned(),
                 "install".to_owned(),
                 "start".to_owned(),
+                "models-path".to_owned(),
                 "logs".to_owned(),
                 "log-files".to_owned(),
             ]
@@ -28008,23 +29460,17 @@ mod tests {
         submit_prompt_command(&mut app, "/comfyui logs");
         app.clear_input();
 
-        assert!(app.command_screen.is_some());
+        assert!(app.command_screen.is_none());
+        assert!(app.overlay_card.is_some());
         assert!(app.transcript.is_empty());
-        let detail = &app.command_screen.as_ref().unwrap().detail;
+        let detail = &app.overlay_card.as_ref().unwrap().detail;
         assert!(!detail.contains("saved file:"));
         assert!(!detail.contains("install-100.log"));
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(
-            app.selected_install_sdk_choice(),
-            super::InstallSdkChoice::Folder
-        );
         let rendered = render_test_terminal(&app, 140, 30);
-        assert!(rendered.contains("ComfyUI logs"));
+        assert!(rendered.contains("ComfyUI Logs"));
         assert!(rendered.contains("Install log"));
         assert!(rendered.contains("downloaded ComfyUI"));
         assert!(rendered.contains("installed packages"));
-        assert!(rendered.contains("Open ComfyUI logs"));
-        assert!(rendered.contains("Show ComfyUI log files"));
         assert!(!rendered.contains("ComfyUI Log Files"));
         Ok(())
     }
@@ -28039,12 +29485,12 @@ mod tests {
 
         submit_prompt_command(&mut app, "/comfyui log-files");
 
-        assert!(app.command_screen.is_some());
+        assert!(app.command_screen.is_none());
+        assert!(app.overlay_card.is_some());
         assert!(app.transcript.is_empty());
-        let state = app.command_screen.as_ref().unwrap();
-        assert_eq!(state.selected, 3);
-        assert!(state.detail_modal.is_some());
-        let detail = &state.detail_modal.as_ref().unwrap().detail;
+        let state = app.overlay_card.as_ref().unwrap();
+        assert_eq!(state.title, "ComfyUI Log Files");
+        let detail = &state.detail;
         assert!(detail.contains("saved file:"));
         assert!(detail.contains(&install_log.display().to_string()));
         let rendered = render_test_terminal(&app, 140, 30);
@@ -28060,69 +29506,55 @@ mod tests {
         let logs = app.paths.data_dir.join("apps").join("comfyui").join("logs");
         fs::create_dir_all(&logs)?;
         let install_log = logs.join("install-100.log");
-        fs::write(&install_log, "downloaded ComfyUI\ninstalled packages\n")?;
+        let long_log = (0..80)
+            .map(|index| format!("line {index}: downloaded ComfyUI package"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&install_log, long_log)?;
 
-        submit_prompt_command(&mut app, "/comfyui logs");
-        app.clear_input();
-
+        submit_prompt_command(&mut app, "/comfyui");
         assert!(app.command_screen.is_some());
-        let detail = &app.command_screen.as_ref().unwrap().detail;
-        assert!(!detail.contains("saved file:"));
-        assert!(!detail.contains(&install_log.display().to_string()));
-        assert_eq!(app.command_screen.as_ref().unwrap().selected, 2);
+        assert!(app.overlay_card.is_none());
 
-        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.handle_command("comfyui logs"));
+        assert!(app.command_screen.is_some());
         assert_eq!(
-            app.command_screen.as_ref().unwrap().selected,
-            3,
-            "input={:?} status={:?} surfaces={:?}",
-            app.input,
-            app.status,
-            active_surface_selection(&app)
-        );
-
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(app.command_screen.is_some());
-        let selected_before = app.command_screen.as_ref().unwrap().selected;
-        let state = app.command_screen.as_ref().unwrap();
-        assert_eq!(state.selected, 3);
-        assert!(state.detail_modal.is_some());
-        let detail = &state.detail_modal.as_ref().unwrap().detail;
-        assert!(detail.contains("saved file:"));
-        assert!(detail.contains(&install_log.display().to_string()));
-        let rendered = render_test_terminal(&app, 140, 30);
-        assert!(rendered.contains("ComfyUI Log Files"));
-        assert_eq!(app.status, "ComfyUI log file locations shown.");
-
-        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
-        let state = app.command_screen.as_ref().unwrap();
-        assert_eq!(state.selected, selected_before);
-        assert!(
-            state
-                .detail_modal
+            app.command_screen
                 .as_ref()
-                .is_some_and(|modal| modal.scroll > 0)
+                .map(|state| state.title.as_str()),
+            Some("ComfyUI")
+        );
+        let state = app.overlay_card.as_ref().expect("logs should open as card");
+        assert_eq!(state.title, "ComfyUI Logs");
+        assert!(state.detail.contains("line 0: downloaded ComfyUI package"));
+        let rendered = render_test_terminal(&app, 140, 30);
+        assert!(rendered.contains("ComfyUI Logs"));
+
+        handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(
+            app.overlay_card
+                .as_ref()
+                .is_some_and(|state| state.detail_scroll > 0)
+        );
+        let after_page = app.overlay_card.as_ref().unwrap().detail_scroll;
+
+        super::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 60,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.overlay_card.as_ref().unwrap().detail_scroll > after_page,
+            "mouse wheel should scroll the log card"
         );
 
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
-        let state = app.command_screen.as_ref().unwrap();
-        assert_eq!(state.selected, selected_before);
-        assert!(state.detail_modal.is_some());
-        assert_eq!(app.status, "Detail card is open. Press Esc to close it.");
-
-        for key in [
-            key_event(KeyCode::Char('l'), KeyModifiers::CONTROL),
-            key_event(KeyCode::Char('?'), KeyModifiers::NONE),
-            key_event(KeyCode::Char('x'), KeyModifiers::NONE),
-        ] {
-            handle_key(&mut app, key);
-            let state = app.command_screen.as_ref().unwrap();
-            assert_eq!(state.selected, selected_before);
-            assert!(state.detail_modal.is_some());
-            assert!(app.overlay_card.is_none());
-            assert!(app.input.is_empty());
-        }
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay_card.is_none());
+        assert!(app.command_screen.is_some());
         Ok(())
     }
 
@@ -28133,24 +29565,25 @@ mod tests {
         fs::create_dir_all(&logs)?;
         fs::write(logs.join("install-100.log"), "downloaded ComfyUI\n")?;
 
-        submit_prompt_command(&mut app, "/comfyui log-files");
-
+        submit_prompt_command(&mut app, "/comfyui");
         assert!(app.command_screen.is_some());
-        assert!(app.command_screen.as_ref().unwrap().detail_modal.is_some());
+
+        assert!(app.handle_command("comfyui log-files"));
+
+        assert!(app.overlay_card.is_some());
 
         handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
 
+        assert!(app.overlay_card.is_none());
         let state = app
             .command_screen
             .as_ref()
             .expect("ComfyUI screen should remain open");
-        assert!(state.detail_modal.is_none());
         assert_eq!(state.title, "ComfyUI");
-        assert_eq!(state.selected, 3);
-        assert_eq!(app.status, "Detail card closed.");
+        assert_eq!(app.status, "Card closed.");
         let rendered = render_test_terminal(&app, 140, 30);
         assert!(!rendered.contains("ComfyUI Log Files"));
-        assert!(rendered.contains("Show ComfyUI log files"));
+        assert!(rendered.contains("ComfyUI"));
         Ok(())
     }
 
@@ -29354,7 +30787,7 @@ mod tests {
         let modal = super::render_modal_approval(&app, app.pending_approval.as_ref().unwrap());
         assert!(modal.contains("Folder:"));
         assert!(modal.contains("custom-runtime"));
-        assert!(modal.contains("Downloads stay inside:"));
+        assert!(modal.contains("Downloaded files:"));
         assert!(modal.contains("pip-cache"));
         assert!(app.transcript.is_empty());
         Ok(())
@@ -29513,7 +30946,7 @@ mod tests {
         assert!(rendered.contains("Overview"));
         assert!(!rendered.contains("> Refresh"));
         assert!(!rendered.contains("  Refresh"));
-        assert!(rendered.contains("R refresh"));
+        assert!(rendered.contains("F5 refresh"));
 
         let mut app = test_app();
         assert!(app.handle_command("config"));
@@ -29541,6 +30974,58 @@ mod tests {
         assert!(app.command_screen.is_none());
         assert!(app.overlay_card.is_none());
         assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn f1_opens_scrollable_help_topics() {
+        let mut app = test_app();
+
+        handle_key(&mut app, key_event(KeyCode::F(1), KeyModifiers::NONE));
+
+        let state = app.overlay_card.as_ref().expect("F1 help should open");
+        assert_eq!(state.title, "Help");
+        let labels = state
+            .actions
+            .iter()
+            .map(|action| super::overlay_card_action_label(state, *action))
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"Keyboard shortcuts"));
+        assert!(labels.contains(&"CLI commands"));
+        assert!(super::overlay_card_detail_text(state).contains("Start here"));
+
+        handle_key(&mut app, key_event(KeyCode::End, KeyModifiers::NONE));
+        let state = app.overlay_card.as_ref().expect("help should stay open");
+        assert!(super::overlay_card_detail_text(state).contains("Troubleshooting"));
+
+        handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(
+            app.overlay_card
+                .as_ref()
+                .is_some_and(|state| state.detail_scroll > 0)
+        );
+        let rendered = render_test_terminal(&app, 80, 18);
+        assert!(rendered.contains("Help"));
+        assert!(rendered.contains("Keyboard"));
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay_card.is_none());
+    }
+
+    #[test]
+    fn home_help_opens_interactive_help_browser() {
+        let mut app = test_app();
+        app.home_selection = super::home_dashboard_actions(&app)
+            .iter()
+            .position(|action| *action == super::HomeDashboardAction::Help)
+            .expect("home should include help");
+
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Help")
+        );
+        assert!(app.command_screen.is_none());
     }
 
     #[test]
@@ -29630,7 +31115,6 @@ mod tests {
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("GPU status"));
         assert!(rendered.contains("Settings"));
-        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.config_manager.is_some());
         assert!(app.transcript.is_empty());
@@ -29640,15 +31124,12 @@ mod tests {
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Background helper"));
         assert!(rendered.contains("Automations"));
-        assert!(rendered.contains("Local servers"));
-        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.automations_manager.is_some());
         assert!(app.transcript.is_empty());
 
         let mut app = test_app();
         assert!(app.handle_command("daemon"));
-        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.services_manager.is_some());
@@ -29889,10 +31370,13 @@ mod tests {
             assert_eq!(active_tui_surface_count(&app), 1, "{command}");
             assert!(app.transcript.is_empty(), "{command}");
             let rendered = render_test_terminal(&app, 140, 32);
-            assert!(rendered.contains("Live output"), "{command}\n{rendered}");
             assert!(
                 !rendered.contains("command: rocm") && !rendered.contains("status: ok"),
                 "{command} should hide raw command labels\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("Live output") && !rendered.contains("Recent output"),
+                "{command} should stay terse after completion\n{rendered}"
             );
         }
     }
@@ -30458,16 +31942,62 @@ mod tests {
             handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
             if command.name == "setup" {
-                assert!(app.folder_browser.is_some(), "{}", command.name);
-                assert!(
-                    !app.onboarding_path_editing,
-                    "{} should use the folder picker before manual typing",
-                    command.name
-                );
+                if app.folder_browser.is_some() {
+                    assert!(
+                        !app.onboarding_path_editing,
+                        "{} should use the folder picker before manual typing",
+                        command.name
+                    );
+                } else {
+                    assert_eq!(
+                        active_surface_selection(&app).unwrap().surface,
+                        "overlay",
+                        "{} should keep setup inside a focused confirmation card",
+                        command.name
+                    );
+                }
             } else {
                 assert!(
                     app.input.is_empty(),
                     "{} should clear accidental prompt text before screen action",
+                    command.name
+                );
+            }
+            assert!(app.transcript.is_empty(), "{}", command.name);
+        }
+    }
+
+    #[test]
+    fn advertised_slash_commands_escape_once_after_accidental_typing_returns_home() {
+        for command in super::SLASH_COMMANDS {
+            let mut app = test_app();
+
+            assert!(app.handle_command(command.name), "{}", command.name);
+
+            handle_key(&mut app, key_event(KeyCode::Char('z'), KeyModifiers::NONE));
+            handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+            if command.name == "setup" {
+                assert!(app.onboarding_active, "{}", command.name);
+                assert!(
+                    app.status.contains("Quit setup selected"),
+                    "setup should select the visible Quit setup row before ROCm is ready"
+                );
+            } else if command.name == "home" {
+                assert_eq!(active_tui_surface_count(&app), 1, "{}", command.name);
+                assert_eq!(
+                    active_surface_selection(&app).unwrap().surface,
+                    "overlay",
+                    "{} should focus the quit card",
+                    command.name
+                );
+            } else {
+                assert!(app.input.is_empty(), "{}", command.name);
+                assert_eq!(active_tui_surface_count(&app), 1, "{}", command.name);
+                assert_eq!(
+                    active_surface_selection(&app).unwrap().surface,
+                    "home",
+                    "{} should land on Home after one Esc",
                     command.name
                 );
             }
@@ -30494,19 +32024,19 @@ mod tests {
             if command.name == "setup" {
                 assert!(app.onboarding_active, "required setup should stay visible");
                 assert!(
-                    app.status.contains("Setup is required"),
-                    "setup should explain why Esc does not leave before ROCm is ready"
+                    app.status.contains("Quit setup selected"),
+                    "setup should select the visible Quit setup row before ROCm is ready"
                 );
             } else if command.name == "home" {
                 assert_eq!(
                     active_tui_surface_count(&app),
                     1,
-                    "home should stay visible with Esc because no prompt screen is behind it"
+                    "home Esc should open the quit card as the only focused surface"
                 );
                 assert_eq!(
                     active_surface_selection(&app).unwrap().surface,
-                    "home",
-                    "home should stay focused with Esc"
+                    "overlay",
+                    "home Esc should focus the quit card"
                 );
             } else {
                 assert_eq!(
@@ -31119,7 +32649,7 @@ mod tests {
     }
 
     #[test]
-    fn services_manager_enter_opens_failed_service_logs() -> anyhow::Result<()> {
+    fn services_manager_hides_failed_service_but_direct_logs_still_work() -> anyhow::Result<()> {
         let mut app = test_app();
         let mut record = ManagedServiceRecord::new(
             &app.paths,
@@ -31140,8 +32670,12 @@ mod tests {
         fs::write(&record.log_path, "service ready\n")?;
         assert!(app.handle_command("services"));
 
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        let state = app.services_manager.as_ref().expect("services screen");
+        assert!(state.items.is_empty());
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(!rendered.contains("svc-qwen"), "{rendered}");
 
+        app.open_service_logs_browser(record.service_id.clone());
         assert!(app.logs_view.is_some());
         assert!(app.services_manager.is_none());
         assert!(app.transcript.is_empty());
@@ -31296,7 +32830,7 @@ mod tests {
             None,
             None,
         );
-        record.status = "failed".to_owned();
+        record.status = "ready".to_owned();
         record.write()?;
         let mut log = String::new();
         for index in 1..=90 {
@@ -31304,20 +32838,40 @@ mod tests {
         }
         fs::write(&record.log_path, log)?;
         assert!(app.handle_command("services"));
-        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        let selected = app.logs_view.as_ref().map(|state| state.selected);
+        for _ in 0..super::services_manager_choice_count(app.services_manager.as_ref().unwrap()) {
+            if app.selected_services_manager_action()
+                == Some(super::ServicesManagerAction::OpenLogs)
+            {
+                break;
+            }
+            handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.selected_services_manager_action(),
+            Some(super::ServicesManagerAction::OpenLogs)
+        );
+        handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.services_manager.is_some());
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Service Logs")
+        );
+        let selected = app.services_manager.as_ref().map(|state| state.selected);
         handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.logs_view.as_ref().map(|state| state.selected), selected);
+        assert_eq!(
+            app.services_manager.as_ref().map(|state| state.selected),
+            selected
+        );
         assert!(
-            app.logs_view
+            app.overlay_card
                 .as_ref()
                 .is_some_and(|state| state.detail_scroll > 0)
         );
 
         handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(
-            app.logs_view.as_ref().map(|state| state.detail_scroll),
+            app.overlay_card.as_ref().map(|state| state.detail_scroll),
             Some(0)
         );
         Ok(())
@@ -31631,7 +33185,7 @@ mod tests {
 
         app.set_input("Is ROCm installed?".to_owned());
         let rendered = render_test_terminal(&app, 120, 32);
-        assert!(rendered.contains("Enter sends | PageUp/PageDown scroll message"));
+        assert!(rendered.contains("Enter sends | PageUp/PageDown scroll chat"));
         assert!(!rendered.contains("Up/Down choose"));
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input, "Is ROCm installed?");
@@ -31949,7 +33503,7 @@ mod tests {
                             .is_some_and(|content| {
                                 content.contains("ROCm CLI guidance")
                                     && content.contains("which GPU is on this machine")
-                                    && content.contains("Qwen3-0.6B-GGUF")
+                                    && content.contains("Qwen3-4B-Instruct-2507-GGUF")
                                     && content.contains("ComfyUI")
                                     && content.contains(prompt)
                             })
@@ -32256,7 +33810,7 @@ mod tests {
                     "choices": [{
                         "message": {
                             "role": "assistant",
-                            "content": "I can start the recommended low-VRAM local assistant after you approve it.",
+                            "content": "I can start the recommended local assistant after you approve it.",
                             "tool_calls": [{
                                 "id": "call-serve",
                                 "type": "function",
@@ -32269,7 +33823,7 @@ mod tests {
                     }]
                 }),
                 "Start local model server",
-                "rocm serve Qwen3-0.6B-GGUF --engine lemonade --device gpu_required --managed",
+                "rocm serve Qwen3-4B-Instruct-2507-GGUF --engine lemonade --device gpu_required --managed",
             ),
             (
                 "install this specific TheRock wheel from date 06052026 into D:\\jam\\temp\\therock_venvs",
@@ -32795,9 +34349,8 @@ Full log
         let detail = super::chat_session_command_result_detail("Install", false, summary);
 
         assert!(display.contains("Install failed."));
-        assert!(display.contains("Choose ROCm result to see what happened."));
+        assert!(display.contains("Error: No matching distribution found for torch"));
         assert!(!display.contains("Recent command output"));
-        assert!(!display.contains("Error: No matching distribution found for torch"));
         assert!(!display.contains("Output: resolving torch wheels"));
         assert!(!display.contains("Warning: pip is checking candidates"));
         assert!(!display.contains("C:\\Users\\jam\\.rocm\\logs\\tui\\123-install.log"));
@@ -33044,11 +34597,7 @@ Full log
                 .content
                 .contains("ROCm installed into D:\\jam\\temp\\therock_venvs")
         );
-        assert!(
-            tool_turn
-                .content
-                .contains("Choose ROCm result to see what happened.")
-        );
+        assert!(!tool_turn.content.contains("Choose ROCm result"));
         assert!(tool_turn.detail.as_deref().is_some_and(|detail| {
             detail.contains("ROCm installed into D:\\jam\\temp\\therock_venvs")
         }));
@@ -33123,11 +34672,7 @@ Full log
         assert!(tool_turn.content.contains("Services finished."));
         assert!(!tool_turn.content.contains("Local server stopped"));
         assert!(!tool_turn.content.contains("svc-qwen"));
-        assert!(
-            tool_turn
-                .content
-                .contains("Choose ROCm result to see what happened.")
-        );
+        assert!(!tool_turn.content.contains("Choose ROCm result"));
         assert!(tool_turn.detail.as_deref().is_some_and(|detail| {
             detail.contains("Local server stopped") && detail.contains("svc-qwen")
         }));
@@ -33171,7 +34716,11 @@ Full log
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(app.command_screen.is_none());
-        assert!(app.logs_view.is_some());
+        assert!(app.services_manager.is_some());
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Service Logs")
+        );
         assert!(app.transcript.is_empty());
         Ok(())
     }
@@ -33296,8 +34845,7 @@ Full log
             state
                 .message
                 .as_deref()
-                .is_some_and(|message| message.contains("Local assistant is starting")
-                    && message.contains("Open logs"))
+                .is_some_and(|message| message.contains("Starting at http://127.0.0.1:11436/v1."))
         );
         assert!(app.transcript.is_empty());
         Ok(())
@@ -33391,8 +34939,139 @@ Full log
         assert!(app.services_manager.is_some());
         assert!(app.transcript.is_empty());
         assert_eq!(app.status, "Service stopped.");
-        assert!(render_test_terminal(&app, 120, 28).contains("Service stopped."));
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(!rendered.contains("status: stopped"), "{rendered}");
         Ok(())
+    }
+
+    #[test]
+    fn stopping_service_modal_uses_stopping_placeholder_before_output() {
+        let mut app = test_app();
+        let (_sender, receiver) = mpsc::channel();
+        app.running_job = Some(super::RunningJob {
+            title: "Services".to_owned(),
+            kind: super::RunningJobKind::ServiceLifecycle {
+                action: super::ServiceLifecycleAction::Stop,
+                service_id: "svc-qwen".to_owned(),
+            },
+            receiver,
+            started_at: Instant::now(),
+            streamed_lines: 0,
+            streamed_stdout_lines: 0,
+            streamed_stderr_lines: 0,
+        });
+
+        let output = super::running_job_modal_output_text(&app, 10, 80);
+
+        assert!(output.contains("Stopping..."), "{output}");
+        assert!(!output.contains("Starting..."), "{output}");
+    }
+
+    #[test]
+    fn services_screen_hides_stopped_records() -> anyhow::Result<()> {
+        let app = test_app();
+        let mut ready = ManagedServiceRecord::new(
+            &app.paths,
+            "svc-ready",
+            "lemonade",
+            "qwen",
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        ready.status = "ready".to_owned();
+        ready.write()?;
+        let mut stopped = ManagedServiceRecord::new(
+            &app.paths,
+            "svc-stopped",
+            "lemonade",
+            "qwen",
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        stopped.status = "stopped".to_owned();
+        stopped.write()?;
+
+        let services = super::load_visible_managed_services(&app.paths);
+
+        assert!(
+            services
+                .iter()
+                .any(|record| record.service_id == "svc-ready")
+        );
+        assert!(
+            !services
+                .iter()
+                .any(|record| record.service_id == "svc-stopped")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_escape_with_attached_service_opens_stop_overlay() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut record = ManagedServiceRecord::new(
+            &app.paths,
+            "svc-qwen",
+            "lemonade",
+            "qwen",
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        app.open_local_rocm_tools_chat_session(Some(record));
+
+        super::handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        let overlay = app.overlay_card.as_ref().expect("stop overlay should open");
+        assert_eq!(overlay.title, "Stop Assistant");
+        assert_eq!(overlay.selected, 0);
+        assert_eq!(
+            overlay.actions,
+            vec![
+                super::OverlayCardAction::Close,
+                super::OverlayCardAction::StopChatAssistant
+            ]
+        );
+        assert!(app.command_screen_is_chat_session());
+
+        super::handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay_card.is_none());
+        assert!(app.command_screen_is_chat_session());
+        Ok(())
+    }
+
+    #[test]
+    fn home_menu_has_quit_and_escape_opens_quit_overlay() {
+        let mut app = test_app();
+        app.open_home_dashboard();
+
+        let actions = super::home_dashboard_actions(&app);
+        assert_eq!(actions.last(), Some(&super::HomeDashboardAction::Quit));
+
+        super::handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Quit")
+        );
     }
 
     #[test]
@@ -33455,7 +35134,8 @@ Full log
         assert!(app.services_manager.is_some());
         assert!(app.logs_view.is_none());
         assert!(app.transcript.is_empty());
-        assert!(render_test_terminal(&app, 120, 28).contains("Service stopped."));
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(!rendered.contains("status: stopped"), "{rendered}");
         Ok(())
     }
 
@@ -34119,7 +35799,7 @@ Full log
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Models"));
         assert!(rendered.contains("Qwen/Qwen2.5-1.5B-Instruct"));
-        assert!(rendered.contains("Enter: review a local serve plan"));
+        assert!(rendered.contains("Enter: open local model setup"));
     }
 
     #[test]
@@ -34154,12 +35834,14 @@ Full log
         assert!(rendered.contains("Let's get your AMD GPU ready for local AI"));
         assert!(rendered.contains("Nothing starts until you review it"));
         assert!(rendered.contains("Install folder:"));
-        assert!(rendered.contains("Downloads stay inside:"));
+        assert!(rendered.contains("Downloaded files:"));
         assert!(rendered.contains("Up/Down choose"));
         assert!(rendered.contains("Left/Right folder"));
         assert!(rendered.contains("> Install ROCm"));
+        assert!(rendered.contains("Quit setup"));
         assert!(!rendered.contains("Skip setup"));
         assert!(!rendered.contains("Esc back"));
+        assert!(rendered.contains("Esc quit"));
         assert!(!rendered.contains("Transcript"));
         assert!(!rendered.contains("Activity"));
         assert!(!rendered.contains("/setup next"));
@@ -34649,6 +36331,24 @@ Full log
     }
 
     #[test]
+    fn onboarding_approval_escape_closes_in_one_press() {
+        let mut app = test_app();
+        app.onboarding_active = true;
+        app.reset_onboarding_selection();
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_approval.is_some());
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.pending_approval.is_none());
+        assert!(app.onboarding_active);
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(!rendered.contains("Review:"), "{rendered}");
+        assert!(rendered.contains("Install ROCm"), "{rendered}");
+    }
+
+    #[test]
     fn onboarding_pending_approval_shows_plain_install_details() {
         let mut app = test_app();
         app.host_gpu_summary = HostGpuSummary {
@@ -34671,10 +36371,12 @@ Full log
         assert!(!modal.contains("What will happen"));
         assert!(modal.contains("ROCm CLI will install ROCm into this folder."));
         assert!(modal.contains(&install_root.display().to_string()));
-        assert!(modal.contains("It will install gfx120X-all for AMD Radeon RX 9070 XT (gfx1201)."));
+        assert!(
+            modal.contains("It will install the matching ROCm package for AMD Radeon RX 9070 XT.")
+        );
         assert!(modal.contains("It will add the local AI pieces ROCm CLI needs."));
-        assert!(modal.contains("Downloads stay inside:"));
-        assert!(modal.contains(&pip_cache.display().to_string()));
+        assert!(modal.contains("Downloaded files:"));
+        assert!(modal.contains(&super::display_runtime_folder_path(&pip_cache)));
         assert!(modal.contains("> Enter or Y: start setup"));
         assert!(modal.contains("  Esc or N: cancel"));
         assert!(!modal.contains("PageUp"));
@@ -34727,15 +36429,17 @@ Full log
         assert!(modal.contains("Install ROCm"));
         assert!(modal.contains("Install ROCm/TheRock into the folder the user selected."));
         assert!(!modal.contains("Assistant reason:"));
-        assert!(modal.contains("It will install gfx120X-all for AMD Radeon RX 9070 XT (gfx1201)."));
+        assert!(
+            modal.contains("It will install the matching ROCm package for AMD Radeon RX 9070 XT.")
+        );
         assert!(modal.contains("Detected GPU"));
         assert!(modal.contains("GPU: AMD Radeon RX 9070 XT"));
         assert!(modal.contains("Target: gfx1201"));
         assert!(modal.contains("ROCm package: gfx120X-all"));
         assert!(modal.contains(&format!("Folder: {folder}")));
         assert!(modal.contains(&format!(
-            "Downloads stay inside: {}",
-            Path::new(folder).join("pip-cache").display()
+            "Downloaded files: {}",
+            super::display_runtime_folder_path(&Path::new(folder).join("pip-cache"))
         )));
     }
 
@@ -34757,6 +36461,24 @@ Full log
                 "pip".to_owned(),
                 "--prefix".to_owned(),
                 folder.to_owned(),
+            ],
+            None,
+            None,
+        );
+
+        assert!(app.pending_approval.is_some());
+        assert!(app.running_job.is_none());
+        assert!(app.status.contains("Review"));
+
+        app.pending_approval = None;
+        app.request_screen_cli_approval_with_explanation(
+            "Start model",
+            "Serve",
+            vec![
+                "serve".to_owned(),
+                "qwen".to_owned(),
+                "--engine".to_owned(),
+                "lemonade".to_owned(),
             ],
             None,
             None,
@@ -34824,8 +36546,10 @@ Full log
         assert!(modal.contains("Install ROCm"));
         assert!(!modal.contains("Review setup"));
         assert!(modal.contains(&folder.display().to_string()));
-        assert!(modal.contains("Downloads stay inside:"));
-        assert!(modal.contains(&folder.join("pip-cache").display().to_string()));
+        assert!(modal.contains("Downloaded files:"));
+        assert!(modal.contains(&super::display_runtime_folder_path(
+            &folder.join("pip-cache")
+        )));
         assert!(!modal.contains("PageUp"));
         assert!(!rendered.contains("> Approve setup"));
         assert!(!rendered.contains("> Cancel"));
@@ -34866,9 +36590,14 @@ Full log
         assert_eq!(config.setup.therock_venv.as_deref(), Some(folder.as_path()));
         assert_eq!(app.status, "ROCm folder saved. Press Enter to install.");
         let rendered = render_test_terminal(&app, 160, 24);
-        assert!(rendered.contains(&format!("Selected: {}", folder.display())));
-        assert!(rendered.contains("Downloads stay inside:"));
-        assert!(rendered.contains(&folder.join("pip-cache").display().to_string()));
+        assert!(rendered.contains(&format!(
+            "Folder: {}",
+            super::display_runtime_folder_path(&folder)
+        )));
+        assert!(rendered.contains("Downloaded files:"));
+        assert!(rendered.contains(&super::display_runtime_folder_path(
+            &folder.join("pip-cache")
+        )));
         Ok(())
     }
 
@@ -35064,7 +36793,7 @@ Full log
             super::OnboardingMenuChoice::Primary
         );
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Folder
@@ -35072,13 +36801,21 @@ Full log
         let rendered = render_test_terminal(&app, 120, 24);
         assert!(rendered.contains("> Install folder:"));
 
-        super::handle_onboarding_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             app.selected_onboarding_choice(),
             super::OnboardingMenuChoice::Primary
         );
         let rendered = render_test_terminal(&app, 120, 24);
         assert!(rendered.contains("> Install ROCm"));
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected_onboarding_choice(),
+            super::OnboardingMenuChoice::Quit
+        );
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(rendered.contains("> Quit setup"));
     }
 
     #[test]
@@ -35092,7 +36829,7 @@ Full log
         assert!(app.onboarding_active);
         assert_eq!(
             app.status,
-            "Setup is required before using local ROCm. Press Ctrl-C to quit."
+            "Finish setup to continue, or choose Quit setup."
         );
     }
 
@@ -35106,9 +36843,10 @@ Full log
 
         assert!(app.onboarding_active);
         assert_eq!(
-            app.status,
-            "Setup is required before using local ROCm. Press Ctrl-C to quit."
+            app.selected_onboarding_choice(),
+            super::OnboardingMenuChoice::Quit
         );
+        assert_eq!(app.status, "Quit setup selected. Press Enter to confirm.");
     }
 
     #[test]
@@ -35332,16 +37070,102 @@ Full log
     }
 
     #[test]
-    fn running_install_scrollbar_reaches_visual_bottom() {
-        let top = super::running_job_scrollbar_symbols(100, 20, 0, 12);
-        assert_eq!(top.first(), Some(&'^'));
-        assert_eq!(top.last(), Some(&'v'));
-        assert_eq!(top[1], '#');
+    fn running_install_modal_page_keys_scroll_setup_live_output() {
+        let mut app = test_app();
+        let sender = attach_running_job(&mut app, "Install", super::RunningJobKind::Cli);
+        app.onboarding_active = true;
 
-        let bottom = super::running_job_scrollbar_symbols(100, 20, 80, 12);
-        assert_eq!(bottom.first(), Some(&'^'));
-        assert_eq!(bottom.last(), Some(&'v'));
-        assert_eq!(bottom[bottom.len() - 2], '#');
+        for index in 0..18 {
+            sender
+                .send(super::RunningJobEvent::Stream {
+                    stream: super::CommandOutputStream::Stdout,
+                    line: format!(
+                        "Downloading https://rocm.nightlies.amd.com/v2/gfx120X-all/package-{index}-with-a-very-long-wheel-name-that-wraps-on-small-terminals.whl"
+                    ),
+                })
+                .unwrap();
+        }
+        sender
+            .send(super::RunningJobEvent::Stream {
+                stream: super::CommandOutputStream::Stdout,
+                line: "FINAL LIVE OUTPUT SENTINEL".to_owned(),
+            })
+            .unwrap();
+        app.poll_running_job();
+
+        let latest = render_test_terminal(&app, 64, 12);
+        assert!(latest.contains("FINAL LIVE OUTPUT SENTINEL"), "{latest}");
+
+        super::handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(app.onboarding_install_log_scroll > 0);
+        assert_eq!(
+            app.running_job_log_scroll,
+            app.onboarding_install_log_scroll
+        );
+        let earlier = render_test_terminal(&app, 64, 12);
+        assert!(!earlier.contains("FINAL LIVE OUTPUT SENTINEL"), "{earlier}");
+
+        super::handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
+        let latest_again = render_test_terminal(&app, 64, 12);
+        assert!(
+            latest_again.contains("FINAL LIVE OUTPUT SENTINEL"),
+            "{latest_again}"
+        );
+    }
+
+    #[test]
+    fn running_install_modal_page_up_reaches_old_wrapped_output_in_small_window() {
+        let mut app = test_app();
+        let sender = attach_running_job(&mut app, "Install", super::RunningJobKind::Cli);
+        app.onboarding_active = true;
+
+        for index in 0..28 {
+            sender
+                .send(super::RunningJobEvent::Stream {
+                    stream: super::CommandOutputStream::Stdout,
+                    line: format!(
+                        "Downloading https://rocm.nightlies.amd.com/v2/gfx120X-all/package-{index:02}-with-a-long-wheel-name-that-wraps-several-times-on-small-terminals.whl"
+                    ),
+                })
+                .unwrap();
+        }
+        sender
+            .send(super::RunningJobEvent::Stream {
+                stream: super::CommandOutputStream::Stdout,
+                line: "FINAL LIVE OUTPUT SENTINEL".to_owned(),
+            })
+            .unwrap();
+        app.poll_running_job();
+
+        let latest = render_test_terminal(&app, 48, 12);
+        assert!(latest.contains("FINAL LIVE OUTPUT SENTINEL"), "{latest}");
+
+        for _ in 0..30 {
+            super::handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::NONE));
+        }
+
+        let earliest = render_test_terminal(&app, 48, 12);
+        assert!(
+            earliest.contains("package-00"),
+            "PageUp should reach the oldest wrapped output in a small window:\n{earliest}"
+        );
+        assert!(
+            !earliest.contains("FINAL LIVE OUTPUT SENTINEL"),
+            "{earliest}"
+        );
+    }
+
+    #[test]
+    fn scroll_metrics_reaches_visual_bottom() {
+        let top = super::scroll_metrics(100, 20, 0);
+        assert_eq!(top.offset, 0);
+        assert_eq!(top.max_offset(), 80);
+        assert!(top.should_draw());
+
+        let bottom = super::scroll_metrics(100, 20, 200);
+        assert_eq!(bottom.offset, 80);
+        assert_eq!(bottom.viewport_len, 20);
+        assert_eq!(bottom.content_len, 100);
     }
 
     #[test]
@@ -35498,7 +37322,8 @@ Full log
         assert!(app.onboarding_cancel_install_confirm);
         assert!(!cancel_requested.load(Ordering::SeqCst));
         let setup_body = super::render_onboarding_screen_text_with_log_limit(&app, 8);
-        assert!(setup_body.contains("installer is downloading packages"));
+        assert!(setup_body.contains("Setup is running."));
+        assert!(!setup_body.contains("installer is downloading packages"));
         let rendered = render_test_terminal(&app, 120, 32);
         assert!(rendered.contains("Stop ROCm Install?"));
         assert!(rendered.contains("Installing ROCm"));
@@ -37060,6 +38885,14 @@ Full log
         handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
 
         assert_eq!(
+            app.selected_engine_manager_action(),
+            Some(super::EngineManagerAction::InstallRocm)
+        );
+
+        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(
             app.selected_engine_manager_item()
                 .as_ref()
                 .map(|item| item.name.as_str()),
@@ -37081,7 +38914,7 @@ Full log
     }
 
     #[test]
-    fn engine_manager_enter_with_ready_rocm_requests_engine_install() -> anyhow::Result<()> {
+    fn engine_manager_enter_with_ready_rocm_uses_pytorch_runtime() -> anyhow::Result<()> {
         let mut app = test_app();
         write_test_runtime_with_key(
             &app.paths,
@@ -37093,14 +38926,17 @@ Full log
         app.config.save(&app.paths)?;
         assert!(app.handle_command("engine"));
 
+        let rendered = render_test_terminal(&app, 120, 24);
+        assert!(rendered.contains("Installed pytorch"), "{rendered}");
+
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(
             app.pending_approval.as_ref().map(|pending| &pending.action),
             Some(super::ApprovalAction::CliCommand { args, .. })
                 if args == &vec![
-                    "engines".to_owned(),
-                    "install".to_owned(),
+                    "config".to_owned(),
+                    "set-default-engine".to_owned(),
                     "pytorch".to_owned(),
                 ]
         ));
@@ -37120,25 +38956,39 @@ Full log
         app.config.active_runtime_key = Some("release-pip-gfx120x-all-7-14-0".to_owned());
         app.config.save(&app.paths)?;
         assert!(app.handle_command("engine"));
+        handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
 
-        handle_key(&mut app, key_event(KeyCode::End, KeyModifiers::NONE));
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        for _ in 0..super::engine_manager_choice_count(app.engine_manager.as_ref().unwrap()) {
+            if app.selected_engine_manager_action()
+                == Some(super::EngineManagerAction::InstallSelected)
+            {
+                break;
+            }
+            handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let target_name = app
+            .selected_engine_manager_target_item()
+            .expect("engine row should stay selected for action rows")
+            .name;
         let rendered = render_test_terminal(&app, 120, 32);
         assert!(rendered.contains("> Install selected engine"));
         assert!(rendered.contains("Press Enter to review installing it."));
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(matches!(
-            app.pending_approval.as_ref().map(|pending| &pending.action),
-            Some(super::ApprovalAction::CliCommand { args, .. })
-                if args == &vec![
-                    "engines".to_owned(),
-                    "install".to_owned(),
-                    "pytorch".to_owned(),
-                ]
-        ));
+        let pending_action = app.pending_approval.as_ref().map(|pending| &pending.action);
+        assert!(
+            matches!(
+                pending_action,
+                Some(super::ApprovalAction::CliCommand { args, .. })
+                    if args == &vec![
+                        "engines".to_owned(),
+                        "install".to_owned(),
+                        target_name.clone(),
+                    ]
+            ),
+            "{pending_action:?}"
+        );
         assert!(app.engine_manager.is_some());
         assert!(app.transcript.is_empty());
         Ok(())
@@ -37209,9 +39059,14 @@ Full log
         )?;
         assert!(app.handle_command("engine"));
 
-        handle_key(&mut app, key_event(KeyCode::End, KeyModifiers::NONE));
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
-        handle_key(&mut app, key_event(KeyCode::Up, KeyModifiers::NONE));
+        for _ in 0..super::engine_manager_choice_count(app.engine_manager.as_ref().unwrap()) {
+            if app.selected_engine_manager_action()
+                == Some(super::EngineManagerAction::ReinstallSelected)
+            {
+                break;
+            }
+            handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
+        }
         let rendered = render_test_terminal(&app, 120, 32);
         assert!(rendered.contains("> Reinstall selected engine"));
         assert!(rendered.contains("Press Enter to review reinstalling it."));
@@ -37625,12 +39480,78 @@ Full log
         assert!(rendered.contains("Message"), "{rendered}");
         assert!(rendered.contains("therock_venvs"), "{rendered}");
 
-        handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::NONE));
+        handle_key(&mut app, key_event(KeyCode::PageUp, KeyModifiers::CONTROL));
         assert!(
             app.chat_input_scroll < super::CHAT_SESSION_FOLLOW_SCROLL,
-            "PageUp should scroll the typed message, not the conversation sentinel"
+            "Ctrl+PageUp should scroll the typed message, not the conversation sentinel"
         );
-        assert_eq!(app.status, "Message scrolled up.");
+        assert!(!app.status.to_ascii_lowercase().contains("scrolled"));
+    }
+
+    #[test]
+    fn chat_session_page_down_scrolls_conversation_even_with_draft_message() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let answer = (0..90)
+            .map(|index| format!("assistant detail line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_chat_session_turn(super::ChatSessionRole::Assistant, answer);
+        app.set_input("draft text should not steal PageDown".to_owned());
+
+        if let Some(state) = app.command_screen.as_mut() {
+            state.detail_scroll = 0;
+        }
+        let _ = render_test_terminal(&app, 100, 18);
+
+        for _ in 0..20 {
+            handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        let rendered = render_test_terminal(&app, 100, 18);
+
+        assert!(
+            rendered.contains("assistant detail line 89"),
+            "PageDown should reach the bottom of the conversation even with a draft:\n{rendered}"
+        );
+        assert_eq!(
+            app.chat_input_scroll,
+            super::CHAT_SESSION_FOLLOW_SCROLL,
+            "plain PageDown must not scroll the draft composer"
+        );
+    }
+
+    #[test]
+    fn chat_session_mouse_wheel_scrolls_conversation_to_bottom_with_draft_message() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let answer = (0..90)
+            .map(|index| format!("wheel detail line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_chat_session_turn(super::ChatSessionRole::Assistant, answer);
+        app.set_input("draft text should not steal transcript wheel scroll".to_owned());
+        if let Some(state) = app.command_screen.as_mut() {
+            state.detail_scroll = 0;
+        }
+        let _ = render_test_terminal(&app, 100, 18);
+
+        for _ in 0..40 {
+            super::handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 2,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        }
+        let rendered = render_test_terminal(&app, 100, 18);
+
+        assert!(
+            rendered.contains("wheel detail line 89"),
+            "mouse wheel over the conversation should reach the bottom:\n{rendered}"
+        );
     }
 
     #[test]
@@ -37667,21 +39588,25 @@ Full log
         let small_scroll = super::bounded_chat_session_scroll(&detail, small, u16::MAX);
         let tall_scroll = super::bounded_chat_session_scroll(&detail, tall, u16::MAX);
 
-        let small_width = small.width.saturating_sub(3).max(1) as usize;
+        let small_width = small.width.saturating_sub(2).max(1) as usize;
         let small_height = small.height.saturating_sub(2).max(1) as usize;
         let small_visual_lines = super::paragraph_visual_line_count(&detail, small_width);
+        let small_scroll_height =
+            super::scrollable_text_viewport_len(small_visual_lines, small_height);
         assert_eq!(
             usize::from(small_scroll),
-            small_visual_lines.saturating_sub(small_height),
+            small_visual_lines.saturating_sub(small_scroll_height),
             "chat should bottom-align instead of overscrolling past the last line"
         );
 
-        let tall_width = tall.width.saturating_sub(3).max(1) as usize;
+        let tall_width = tall.width.saturating_sub(2).max(1) as usize;
         let tall_height = tall.height.saturating_sub(2).max(1) as usize;
         let tall_visual_lines = super::paragraph_visual_line_count(&detail, tall_width);
+        let tall_scroll_height =
+            super::scrollable_text_viewport_len(tall_visual_lines, tall_height);
         assert_eq!(
             usize::from(tall_scroll),
-            tall_visual_lines.saturating_sub(tall_height),
+            tall_visual_lines.saturating_sub(tall_scroll_height),
             "resizing should clamp to the actual chat bottom"
         );
     }
@@ -37710,6 +39635,95 @@ Full log
     }
 
     #[test]
+    fn setup_snapshot_is_quiet_and_path_specific() {
+        let mut app = test_app();
+        app.onboarding_active = true;
+        let selected = app.paths.data_dir.join("therock_venvs");
+        app.config.setup.therock_venv = Some(selected.clone());
+        app.reset_onboarding_selection();
+
+        let rendered = render_test_terminal(&app, 120, 32);
+        let selected_display = super::display_runtime_folder_path(&selected);
+        assert!(rendered.contains("Set Up ROCm"), "{rendered}");
+        assert!(rendered.contains(&selected_display), "{rendered}");
+        assert!(!rendered.contains("Install folder: selected"), "{rendered}");
+        assert!(
+            !rendered.contains("Install folder: recommended"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Command List"), "{rendered}");
+        assert!(!rendered.contains("request plan"), "{rendered}");
+        assert!(!rendered.contains("What will happen"), "{rendered}");
+    }
+
+    #[test]
+    fn engine_completion_snapshot_returns_to_quiet_engine_list() -> anyhow::Result<()> {
+        let mut app = test_app();
+        write_test_runtime_with_key(
+            &app.paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            20,
+        )?;
+        app.config.active_runtime_key = Some("release-pip-gfx120x-all-7-14-0".to_owned());
+        app.config.save(&app.paths)?;
+        assert!(app.handle_command("engine"));
+        let sender = attach_running_job(&mut app, "Engine", super::RunningJobKind::Cli);
+        app.set_active_screen_message(
+            "Output: Downloading package\nOutput: Installing package".to_owned(),
+        );
+
+        finish_running_job(
+            &mut app,
+            sender,
+            "command: rocm engines install pytorch\nstatus: ok\n\nstdout:\nengine ready",
+        );
+
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Engines"), "{rendered}");
+        assert!(!rendered.contains("Engine finished"), "{rendered}");
+        assert!(!rendered.contains("Recent output"), "{rendered}");
+        assert!(!rendered.contains("Output: Downloading"), "{rendered}");
+        assert!(!rendered.contains("command: rocm"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn folder_picker_snapshot_keeps_scrolled_window_stable() -> anyhow::Result<()> {
+        let (root, _paths) = test_paths("folder-picker-render-scroll");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        for index in 0..60 {
+            fs::create_dir_all(root.join(format!("child-{index:03}")))?;
+        }
+        let mut app = test_app();
+        app.open_folder_browser(
+            "Choose ROCm Folder",
+            "Pick where ROCm/TheRock should be installed.",
+            super::FolderBrowserContext::OnboardingInstallFolder,
+        );
+        {
+            let state = app.folder_browser.as_mut().expect("folder picker");
+            let (entries, message) = super::folder_browser_entries(&root);
+            state.current_dir = root.clone();
+            state.entries = entries;
+            state.message = message;
+            state.selected = 30;
+            state.scroll_offset = 25;
+        }
+
+        let rendered = render_test_terminal(&app, 90, 18);
+        assert!(rendered.contains("Choose ROCm Folder"), "{rendered}");
+        assert!(rendered.contains("child-024"), "{rendered}");
+        assert!(!rendered.contains("Use current folder"), "{rendered}");
+        assert!(!rendered.contains("drive  "), "{rendered}");
+        assert!(!rendered.contains("open  "), "{rendered}");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
     fn folder_picker_pins_create_folder_rows_before_busy_directory_listing() -> anyhow::Result<()> {
         let (root, _paths) = test_paths("folder-picker-busy");
         let _ = fs::remove_dir_all(&root);
@@ -37727,8 +39741,8 @@ Full log
         assert_eq!(labels[0], "Use current folder");
         assert_eq!(labels[1], "+ therock_venvs");
         assert_eq!(labels[2], "+ rocm_venvs");
-        assert!(labels.iter().any(|label| *label == "+ therock_venvs"));
-        assert!(labels.iter().any(|label| *label == "+ rocm_venvs"));
+        assert!(labels.contains(&"+ therock_venvs"));
+        assert!(labels.contains(&"+ rocm_venvs"));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
@@ -37753,6 +39767,26 @@ Full log
         assert!(!labels.iter().any(|label| label.starts_with("cache")));
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_install_root_ignores_saved_internal_launcher_folder() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let launcher_dir = app.paths.data_dir.join("launcher");
+        fs::create_dir_all(&launcher_dir)?;
+        app.config.setup.therock_venv = Some(launcher_dir.clone());
+
+        let root = super::setup_install_root(&app.paths, &app.config);
+
+        assert_eq!(root, app.paths.data_dir.join("envs").join("default"));
+        assert!(super::folder_browser_is_internal_rocm_dir(
+            &app.paths,
+            &launcher_dir
+        ));
+        assert!(!super::folder_browser_is_internal_rocm_dir(
+            &app.paths, &root
+        ));
         Ok(())
     }
 
@@ -38104,7 +40138,8 @@ Full log
             .as_ref()
             .and_then(|state| state.message.as_deref())
             .expect("screen should show live output");
-        assert!(message.contains("Output: downloading package"));
+        assert!(message.contains("downloading package"));
+        assert!(!message.contains("Output: downloading package"));
         let rendered = super::command_screen_detail_text(&app);
         assert!(!rendered.contains("Live output is shown in the foreground card"));
         assert!(!rendered.contains("Output: downloading package"));
@@ -38121,8 +40156,7 @@ Full log
     }
 
     #[test]
-    fn screen_command_completion_keeps_recent_output_and_hides_raw_log_path() -> anyhow::Result<()>
-    {
+    fn screen_command_completion_stays_terse_and_saves_full_log() -> anyhow::Result<()> {
         let mut app = test_app();
         app.open_command_screen(
             "Plan",
@@ -38169,12 +40203,13 @@ Full log
             .as_ref()
             .and_then(|state| state.message.as_deref())
             .expect("completion should stay on the plan screen");
-        assert!(message.contains("Live output"));
-        assert!(message.contains("Recent output"));
-        assert!(message.contains("Output: resolving torch wheels"));
-        assert!(message.contains("Warning: pip is checking candidates"));
-        assert!(message.contains("More details are available in Logs."));
-        assert!(message.contains("Use View details here first"));
+        assert!(message.contains("Install TheRock SDK finished."));
+        assert!(message.contains("resolved torch"));
+        assert!(!message.contains("Live output"));
+        assert!(!message.contains("Recent output"));
+        assert!(!message.contains("Output: resolving torch wheels"));
+        assert!(!message.contains("More details are available in Logs."));
+        assert!(!message.contains("Use View details here first"));
         assert!(
             !message.contains(
                 &app.paths
@@ -38193,7 +40228,8 @@ Full log
         assert_eq!(logs.len(), 1);
         let log = fs::read_to_string(&logs[0])?;
         assert!(log.contains("recent_live_output:"));
-        assert!(log.contains("Output: resolving torch wheels"));
+        assert!(log.contains("resolving torch wheels"));
+        assert!(!log.contains("Output: resolving torch wheels"));
         assert!(log.contains("command_output:"));
         assert!(log.contains("stdout:\nresolved torch"));
         Ok(())
@@ -38297,7 +40333,7 @@ Full log
             );
             let rendered = render_test_terminal(&app, 120, 28);
             assert!(!rendered.contains("Inspect local ROCm state"), "{input}");
-            assert!(!rendered.contains("Run"), "{input}");
+            assert!(!screen.detail.contains("Run"), "{input}");
         }
     }
 
@@ -38315,7 +40351,7 @@ Full log
         assert!(app.running_job.is_none());
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(!rendered.contains("Inspect local ROCm state"));
-        assert!(!rendered.contains("Run"));
+        assert!(!super::serve_wizard_detail_text(&app).contains("Run"));
         assert!(rendered.contains("I need a local model before I can chat"));
     }
 
@@ -38627,8 +40663,9 @@ Full log
             .join(runtime_key);
         app.config.setup.therock_venv = Some(install_root);
         app.config.save(&app.paths)?;
+        app.rebase_paths_to_saved_setup_folder();
         let registry_dir = app.paths.data_dir.join("runtimes").join("registry");
-        fs::remove_dir_all(&registry_dir)?;
+        let _ = fs::remove_dir_all(&registry_dir);
 
         assert!(super::setup_venv_ready(&app.paths, &app.config));
         assert!(!super::setup_runtime_ready_for_sidebar(
@@ -39073,7 +41110,7 @@ Full log
         assert!(app.serve_wizard.is_some());
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("This mode only shows the plan"));
-        assert!(rendered.contains("Change Mode to keep it running in ROCm CLI"));
+        assert!(rendered.contains("show command only"));
         Ok(())
     }
 
@@ -39268,22 +41305,23 @@ Full log
         assert!(app.serve_wizard.is_none());
         assert!(app.transcript.is_empty());
         let selected = app.selected_model_recipe().expect("qwen model selected");
-        assert_eq!(selected.canonical_model_id, "Qwen3-0.6B-GGUF");
+        assert_eq!(selected.canonical_model_id, "Qwen3-4B-Instruct-2507-GGUF");
         let rendered = render_test_terminal(&app, 120, 28);
-        assert!(rendered.contains("Qwen3-0.6B-GGUF"));
-        assert!(rendered.contains("Enter: review a local serve plan"));
+        assert!(rendered.contains("Qwen3-4B-Instruct-2507-GGUF"));
+        assert!(rendered.contains("Enter: open local model setup"));
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.command_screen.is_some());
+        assert!(app.command_screen.is_none());
+        assert!(app.serve_wizard.is_some());
         assert!(app.model_picker.is_none());
         assert!(app.transcript.is_empty());
-        assert!(
-            app.command_screen
-                .as_ref()
-                .expect("model should plan")
-                .detail
-                .contains("Qwen3-0.6B-GGUF")
+        let wizard = app.serve_wizard.as_ref().expect("serve wizard");
+        assert_eq!(
+            super::selected_serve_wizard_recipe(wizard)
+                .expect("selected serve recipe")
+                .canonical_model_id,
+            "Qwen3-4B-Instruct-2507-GGUF"
         );
     }
 
@@ -39314,26 +41352,21 @@ Full log
         assert!(app.transcript.is_empty());
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(rendered.contains("Models"));
-        assert!(rendered.contains("Enter: review a local serve plan"));
+        assert!(rendered.contains("Enter: open local model setup"));
         assert!(rendered.contains("16 GB GPU memory available"));
         assert!(!rendered.contains("tiny-gpt2"));
         assert!(!rendered.contains("CPU only"));
 
         handle_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.command_screen.is_some());
+        assert!(app.command_screen.is_none());
+        assert!(app.serve_wizard.is_some());
         assert!(app.model_picker.is_none());
         assert!(app.transcript.is_empty());
-        let plan = app
-            .command_screen
-            .as_ref()
-            .expect("model should open")
-            .detail
-            .clone();
-        assert!(plan.contains("Ready action"));
-        assert!(plan.contains("Run: review and start this action"));
-        assert!(!plan.contains("intent:"));
-        assert!(!plan.contains("next_tool_approval:"));
+        let detail = super::serve_wizard_detail_text(&app);
+        assert!(detail.contains("Loaded your serve request"));
+        assert!(!detail.contains("intent:"));
+        assert!(!detail.contains("next_tool_approval:"));
     }
 
     #[test]
@@ -39360,7 +41393,12 @@ Full log
 
         assert!(app.handle_command("logs svc-qwen"));
 
-        assert!(app.logs_view.is_some());
+        assert!(app.overlay_card.is_some());
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Service Logs")
+        );
+        assert!(app.logs_view.is_none());
         assert!(app.command_screen.is_none());
         assert!(app.transcript.is_empty());
         assert!(render_test_terminal(&app, 120, 24).contains("service ready"));
@@ -39378,7 +41416,10 @@ Full log
         )?;
         assert!(app.handle_command("logs"));
 
-        for _ in 0..3 {
+        for _ in 0..super::logs_view_actions().len() {
+            if app.selected_logs_view_action() == super::LogsViewAction::Search {
+                break;
+            }
             handle_key(&mut app, key_event(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(
@@ -39488,7 +41529,7 @@ Full log
         let details = super::install_manager_detail_text(&app);
         assert!(details.contains("Selected folder"), "{details}");
         assert!(details.contains(&folder_text), "{details}");
-        assert!(details.contains("Downloads stay inside"), "{details}");
+        assert!(details.contains("Downloaded files"), "{details}");
         assert!(
             details.contains(&folder.join("pip-cache").display().to_string()),
             "{details}"
@@ -41112,6 +43153,116 @@ Full log
     }
 
     #[test]
+    fn home_dashboard_quit_is_last_and_esc_opens_one_focused_card() {
+        let mut app = test_app();
+        app.open_home_dashboard();
+
+        let actions = super::home_dashboard_actions(&app);
+        assert_eq!(
+            actions.last().copied(),
+            Some(super::HomeDashboardAction::Quit)
+        );
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Quit")
+        );
+        assert!(app.should_draw_home_dashboard());
+        assert!(app.command_screen.is_none());
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Quit"));
+        assert!(rendered.contains("Stay in ROCm CLI"));
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.overlay_card.is_none());
+        assert!(app.should_draw_home_dashboard());
+    }
+
+    #[test]
+    fn running_models_hides_stopped_services_from_main_list() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.paths.ensure()?;
+        for (service_id, status) in [
+            ("svc-ready", "ready"),
+            ("svc-stopped", "stopped"),
+            ("svc-exited", "exited"),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &app.paths,
+                service_id,
+                "lemonade",
+                "qwen",
+                super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+                "127.0.0.1",
+                11435,
+                "managed",
+                123,
+                None,
+                None,
+                None,
+            );
+            record.status = status.to_owned();
+            record.write()?;
+        }
+
+        app.open_services_manager();
+
+        let state = app.services_manager.as_ref().expect("services screen");
+        let service_ids = state
+            .items
+            .iter()
+            .map(|record| record.service_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(service_ids, vec!["svc-ready"]);
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Ready"), "{rendered}");
+        assert!(rendered.contains("lemonade"), "{rendered}");
+        assert!(!rendered.contains("svc-stopped"), "{rendered}");
+        assert!(!rendered.contains("svc-exited"), "{rendered}");
+        assert!(!rendered.contains("past attempts"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_chat_esc_asks_before_leaving_and_closes_in_one_more_esc() {
+        let mut app = test_app();
+        let record = ManagedServiceRecord::new(
+            &app.paths,
+            "svc-qwen",
+            "lemonade",
+            "qwen",
+            super::VALIDATED_LOCAL_ASSISTANT_MODEL,
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        app.open_local_rocm_tools_chat_session(Some(record));
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.overlay_card.as_ref().map(|state| state.title.as_str()),
+            Some("Stop Assistant")
+        );
+        assert!(app.command_screen_is_chat_session());
+        let rendered = render_test_terminal(&app, 120, 28);
+        assert!(rendered.contains("Stop Assistant"), "{rendered}");
+        assert!(!rendered.contains("Command List"), "{rendered}");
+
+        handle_key(&mut app, key_event(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.overlay_card.is_none());
+        assert!(app.command_screen_is_chat_session());
+    }
+
+    #[test]
     fn ctrl_l_clears_transcript_and_ctrl_r_refreshes_status() {
         let mut app = test_app();
         app.push_block("Test", "line");
@@ -41190,7 +43341,9 @@ Full log
             config_manager: None,
             services_manager: None,
             command_screen: None,
+            command_screen_last_area: std::cell::Cell::new(None),
             saved_chat_session: None,
+            chat_stop_service_id: None,
             overlay_card: None,
             folder_browser: None,
             onboarding_active: false,
@@ -41205,7 +43358,41 @@ Full log
             onboarding_cancel_install_confirm: false,
             onboarding_cancel_install_selection: 0,
             onboarding_success_modal: false,
+            tui_owned_service_ids: std::collections::BTreeSet::new(),
+            tui_started_comfyui: false,
         }
+    }
+
+    fn write_comfyui_manifest_for_test(app: &App) -> anyhow::Result<()> {
+        let app_root = app.paths.data_dir.join("apps").join("comfyui");
+        let source_path = app_root.join("source");
+        let log_path = app_root.join("logs").join("install-1.log");
+        fs::create_dir_all(source_path.join("models"))?;
+        fs::create_dir_all(log_path.parent().expect("test log should have parent"))?;
+        fs::write(&log_path, "installed ComfyUI\n")?;
+        let manifest_dir = app_root.join("manifests");
+        fs::create_dir_all(&manifest_dir)?;
+        fs::write(
+            manifest_dir.join("current.json"),
+            serde_json::json!({
+                "app_id": "comfyui",
+                "runtime_id": "runtime",
+                "runtime_key": "release",
+                "runtime_version": "7.13.0a20260511",
+                "runtime_root": "D:\\jam\\temp\\therock_venvs",
+                "python_executable": "python",
+                "source_url": "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.tar.gz",
+                "source_path": source_path,
+                "requirements_path": "requirements.txt",
+                "pip_cache_dir": "D:\\jam\\temp\\therock_venvs\\pip-cache",
+                "log_path": log_path,
+                "torch_version": "2.10.0",
+                "torch_cuda_available": true,
+                "installed_at_unix_ms": 1
+            })
+            .to_string(),
+        )?;
+        Ok(())
     }
 
     fn submit_prompt_command(app: &mut App, command: &str) {
@@ -41725,18 +43912,20 @@ Full log
     }
 
     fn render_test_terminal(app: &App, width: u16, height: u16) -> String {
+        render_test_buffer(app, width, height)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    fn render_test_buffer(app: &App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
         terminal
             .draw(|frame| super::draw(frame, app))
             .expect("test terminal should draw");
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>()
+        terminal.backend().buffer().clone()
     }
 
     fn test_paths(name: &str) -> (std::path::PathBuf, AppPaths) {

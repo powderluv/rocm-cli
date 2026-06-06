@@ -30,6 +30,7 @@ from typing import Iterable
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / ".rocm-work" / "tests" / "rust-cosmopolitan"
+DEFAULT_RELEASE_ROOT = REPO_ROOT / ".rocm-work" / "single-exe-release"
 DEFAULT_RUSTUP_HOME = REPO_ROOT / ".rocm-work" / "tools" / "rustup"
 DEFAULT_CARGO_HOME = REPO_ROOT / ".rocm-work" / "tools" / "cargo"
 DEFAULT_COSMOCC_ROOT = REPO_ROOT / ".rocm-work" / "tools" / "cosmocc-wsl-elf"
@@ -1105,6 +1106,12 @@ def build_rocm(args: argparse.Namespace) -> Path:
         write_text(work_root / "rocm-apelink.stderr.log", link_result.stderr)
         raise RustCosmoError(format_command_failure(link_result))
     ape.chmod(0o755)
+    if args.release:
+        release_ape = DEFAULT_RELEASE_ROOT / "rocm.exe"
+        release_ape.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ape, release_ape)
+        release_ape.chmod(0o755)
+        print(f"rust-cosmopolitan spike: rocm release artifact: {release_ape}")
     print(f"rust-cosmopolitan spike: rocm ELF artifact: {elf}")
     print(f"rust-cosmopolitan spike: rocm APE artifact: {ape}")
     return ape

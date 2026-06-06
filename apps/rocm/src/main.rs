@@ -36,10 +36,12 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 const ROCM_CODEX_DEVELOPER_INSTRUCTIONS: &str = "You are operating inside ROCm AI Command Center. Prefer `rocm` and `rocmd` commands for ROCm, runtime, engine, service, and automation actions. Preserve the vendored Codex login flow: if no provider or API key is configured, keep ChatGPT sign-in as the default path.";
+static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm", about = "ROCm AI Command Center CLI", version)]
@@ -53,13 +55,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Check this computer's GPU, ROCm install, engines, and setup folders.
     Doctor,
+    /// Print the rocm-cli version.
     Version,
     #[command(hide = true)]
     Bootstrap {
         #[command(subcommand)]
         command: Option<bootstrap::BootstrapCommand>,
     },
+    /// Manage first-time setup state.
     Setup {
         #[command(subcommand)]
         command: Option<SetupCommand>,
@@ -87,9 +92,7 @@ enum Command {
         engine_recipe_json: Option<String>,
     },
     #[command(name = "__engine-stdio", hide = true)]
-    EngineStdio {
-        engine: String,
-    },
+    EngineStdio { engine: String },
     #[command(name = "status", hide = true)]
     InternalStatus,
     #[command(name = "bridge-snapshot", hide = true)]
@@ -116,11 +119,15 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
+    /// Chat with an assistant provider.
     Chat {
+        /// Assistant provider to use.
         #[arg(long)]
         provider: Option<Provider>,
+        /// Model name to request from the provider.
         #[arg(long)]
         model: Option<String>,
+        /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
         #[arg(long)]
         prompt: Option<String>,
         #[arg(
@@ -129,90 +136,131 @@ enum Command {
         )]
         tools: bool,
     },
+    /// Install ROCm, drivers, or related local AI components.
     Install {
         #[command(subcommand)]
         target: InstallTarget,
     },
+    /// Check for a newer ROCm package and optionally install it.
     Update {
+        /// Install the selected update instead of only checking.
         #[arg(long)]
         apply: bool,
+        /// Runtime key to update.
         #[arg(long, requires = "apply")]
         runtime: Option<String>,
+        /// Use the updated ROCm install as the default after installing it.
         #[arg(long, requires = "apply")]
         activate: bool,
+        /// Show what would happen without changing files.
         #[arg(long, requires = "apply")]
         dry_run: bool,
     },
+    /// List, choose, add, or remove ROCm installs.
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
     },
+    /// List, install, or open shells for local model engines.
     Engines {
         #[command(subcommand)]
         command: EnginesCommand,
     },
+    /// Show recommended local models and what this machine can run.
     #[command(alias = "models")]
-    Model,
+    Model {
+        /// Show detailed recipe diagnostics.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Start a local model server.
     Serve {
+        /// Model name, alias, or local model file path.
         model: String,
+        /// Engine to use, such as lemonade, pytorch, or llama.cpp.
         #[arg(long)]
         engine: Option<String>,
+        /// Device policy. Use gpu_required for ROCm GPU execution.
         #[arg(long)]
         device: Option<String>,
+        /// ROCm runtime key to use for this server.
         #[arg(long, conflicts_with = "env_id")]
         runtime_id: Option<String>,
+        /// Engine environment id to use for this server.
         #[arg(long, conflicts_with = "runtime_id")]
         env_id: Option<String>,
+        /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
+        /// TCP port to bind.
         #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
         port: u16,
+        /// Run in this terminal instead of as a managed background server.
         #[arg(long, conflicts_with = "managed")]
         foreground: bool,
+        /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Allow binding to a non-local address.
         #[arg(long)]
         allow_public_bind: bool,
     },
+    /// Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
     Comfyui {
         #[command(subcommand)]
         command: Option<ComfyuiCommand>,
     },
+    /// Show or control local model servers.
     Services {
         #[command(subcommand)]
         command: Option<ServicesCommand>,
     },
+    /// Manage optional background checks and review requests.
     Automations {
         #[command(subcommand)]
         command: Option<AutomationsCommand>,
     },
+    /// Show or change saved ROCm CLI settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Browse recent ROCm CLI logs.
     Logs {
+        /// Show logs for a managed service id.
         #[arg(long)]
         service: Option<String>,
+        /// Search recent logs for one or more words.
         #[arg(long, num_args = 1.., value_name = "QUERY")]
         search: Vec<String>,
+        /// Optional free-text search query.
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
     },
+    /// Start the background helper in the foreground.
     Daemon,
+    /// Remove ROCm CLI-managed files from this computer.
     Uninstall {
+        /// Do not ask for interactive confirmation.
         #[arg(long)]
         yes: bool,
+        /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
+        /// Keep installed rocm-cli binaries.
         #[arg(long)]
         keep_binaries: bool,
+        /// Keep saved settings.
         #[arg(long)]
         keep_config: bool,
+        /// Keep app data such as logs, services, and engines.
         #[arg(long)]
         keep_data: bool,
+        /// Keep caches.
         #[arg(long)]
         keep_cache: bool,
+        /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
     },
@@ -220,27 +268,39 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum InstallTarget {
+    /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
     Sdk {
+        /// Package channel to install.
         #[arg(long, default_value = "release")]
         channel: String,
+        /// Package format to install.
         #[arg(long, default_value = "pip")]
         format: InstallFormat,
+        /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
+        /// Exact TheRock package version to install.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
+        /// Pick the TheRock package built on this date.
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
+        /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
     },
+    /// Preview or install Linux AMD driver support.
     Driver {
+        /// Use the DKMS driver wrapper flow.
         #[arg(long)]
         dkms: bool,
+        /// Apply without asking.
         #[arg(long)]
         yes: bool,
+        /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Check and repair driver setup where supported.
         #[arg(long)]
         reconcile: bool,
     },
@@ -248,22 +308,33 @@ enum InstallTarget {
 
 #[derive(Subcommand, Debug)]
 enum EnginesCommand {
+    /// Show local model engines and whether they are ready.
     List,
+    /// Install the selected engine into ROCm CLI's managed engine folder.
     Install {
+        /// Engine name, such as lemonade, pytorch, or llama.cpp.
         engine: String,
+        /// ROCm runtime key to install against.
         #[arg(long)]
         runtime_id: Option<String>,
+        /// Python version to use for engine setup.
         #[arg(long)]
         python_version: Option<String>,
+        /// Reinstall even if the engine already exists.
         #[arg(long)]
         reinstall: bool,
     },
+    /// Open a shell with the selected engine environment activated.
     Shell {
+        /// Engine name.
         engine: String,
+        /// ROCm runtime key to use.
         #[arg(long, conflicts_with = "env_id")]
         runtime_id: Option<String>,
+        /// Engine environment id to use.
         #[arg(long, conflicts_with = "runtime_id")]
         env_id: Option<String>,
+        /// Shell executable to launch.
         #[arg(long)]
         shell: Option<String>,
     },
@@ -271,31 +342,47 @@ enum EnginesCommand {
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
+    /// Show ROCm installs known to ROCm CLI.
     List,
+    /// Use the selected ROCm install by default.
     Activate {
+        /// Runtime key or friendly runtime selector.
         runtime: String,
     },
+    /// Switch back to the previously selected ROCm install.
     Rollback,
+    /// Remove a ROCm install from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
+        /// Runtime key or friendly runtime selector.
         runtime: String,
     },
+    /// Add a ROCm install from a saved manifest file.
     Import {
+        /// Manifest file path.
         manifest: PathBuf,
+        /// Replace an existing record with the same key.
         #[arg(long)]
         replace: bool,
     },
+    /// Add an existing Python ROCm folder without modifying it.
     Adopt {
+        /// Python executable inside the existing ROCm environment.
         #[arg(long)]
         python: PathBuf,
+        /// Optional SDK root path.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Runtime id to assign.
         #[arg(long)]
         runtime_id: Option<String>,
+        /// Runtime key to assign.
         #[arg(long)]
         runtime_key: Option<String>,
+        /// Channel label to assign.
         #[arg(long)]
         channel: Option<String>,
+        /// Replace an existing record with the same key.
         #[arg(long)]
         replace: bool,
     },
@@ -303,43 +390,71 @@ enum RuntimesCommand {
 
 #[derive(Subcommand, Debug)]
 enum ComfyuiCommand {
+    /// Show whether ComfyUI is installed or running.
     Status,
+    /// Print the ComfyUI models folder path.
+    #[command(name = "models-path", alias = "models")]
+    ModelsPath,
+    /// Show recent ComfyUI logs.
     Logs {
+        /// Number of recent log lines to show.
         #[arg(long, default_value_t = 80)]
         lines: usize,
     },
+    /// Install ComfyUI into ROCm CLI's app folder.
     Install {
+        /// ROCm runtime key to use.
         #[arg(long)]
         runtime_id: Option<String>,
+        /// Reinstall even if ComfyUI already exists.
         #[arg(long)]
         reinstall: bool,
+        /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
     },
+    /// Start ComfyUI and print its local URL.
     Start {
+        /// Host address to bind.
         #[arg(long, default_value = comfyui::default_host())]
         host: String,
+        /// TCP port to bind.
         #[arg(long, default_value_t = comfyui::default_port())]
         port: u16,
+        /// Do not try to open a browser window.
         #[arg(long)]
         no_open_browser: bool,
     },
+    /// Stop a ROCm CLI-managed ComfyUI server.
     Stop,
 }
 
 #[derive(Subcommand, Debug)]
 enum ServicesCommand {
-    List,
+    /// Show currently running local model servers.
+    List {
+        /// Include failed, stopped, and old service records.
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Show logs for a local model server.
     Logs {
+        /// Service id from `rocm services list`.
         service_id: String,
     },
+    /// Stop a local model server.
     Stop {
+        /// Service id from `rocm services list`.
         service_id: String,
+        /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
     },
+    /// Restart a local model server.
     Restart {
+        /// Service id from `rocm services list --all`.
         service_id: String,
+        /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
     },
@@ -347,61 +462,94 @@ enum ServicesCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
+    /// Show background checks and pending review requests.
     List,
+    /// Enable a background check.
     Enable {
+        /// Background check id.
         watcher: String,
+        /// How the check should behave.
         #[arg(long)]
         mode: Option<WatcherModeArg>,
     },
+    /// Disable a background check.
     Disable {
+        /// Background check id.
         watcher: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
+    /// Show saved settings.
     Show,
+    /// Set the preferred ROCm install for one engine.
     SetEngine {
+        /// Engine name.
         engine: String,
+        /// ROCm runtime key to use.
         #[arg(long, conflicts_with = "env_id")]
         runtime_id: Option<String>,
+        /// Engine environment id to use.
         #[arg(long, conflicts_with = "runtime_id")]
         env_id: Option<String>,
+        /// Clear this engine's preferred ROCm install.
         #[arg(long)]
         clear: bool,
     },
+    /// Choose the default local model engine.
     SetDefaultEngine {
+        /// Engine name.
         engine: String,
     },
+    /// Clear the saved default engine.
     ClearDefaultEngine,
+    /// Choose the default ROCm install.
     SetDefaultRuntime {
+        /// Runtime key from `rocm runtimes list`.
         runtime_id: String,
     },
+    /// Clear the saved default ROCm install.
     ClearDefaultRuntime,
+    /// Choose local GPU telemetry mode.
     SetTelemetry {
+        /// Telemetry mode.
         mode: TelemetryModeArg,
     },
+    /// Choose the provider used for ambiguous natural-language plans.
     SetPlannerProvider {
+        /// Provider name.
         provider: Provider,
     },
+    /// Clear the planner provider.
     ClearPlannerProvider,
+    /// Enable an assistant provider.
     EnableProvider {
+        /// Provider name.
         provider: Provider,
     },
+    /// Disable an assistant provider.
     DisableProvider {
+        /// Provider name.
         provider: Provider,
     },
+    /// Save an API key for a provider.
     SetProviderKey {
+        /// Provider name.
         provider: Provider,
     },
+    /// Remove a saved provider API key.
     ClearProviderKey {
+        /// Provider name.
         provider: Provider,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum SetupCommand {
+    /// Show first-time setup status.
     Status,
+    /// Reset setup so the next TUI launch shows first-time setup again.
     Reset,
 }
 
@@ -1024,12 +1172,14 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Runtimes { command }) => runtimes(command),
         Some(Command::Engines { command }) => engines(command),
-        Some(Command::Model) => {
+        Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
-            print!(
-                "{}",
-                render_model_registry_text_with_context_and_host(Some(&paths), None, None,)
-            );
+            let rendered = if verbose {
+                render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None)
+            } else {
+                render_model_registry_text_with_context_and_host(Some(&paths), None, None)
+            };
+            print!("{rendered}");
             Ok(())
         }
         Some(Command::Serve {
@@ -1480,7 +1630,7 @@ fn render_codex_bridge_instructions(
     writeln!(&mut text).ok();
     writeln!(&mut text, "## Engines").ok();
     if snapshot.engines.is_empty() {
-        writeln!(&mut text, "- No engine inventory available.").ok();
+        writeln!(&mut text, "- No local model engines were found.").ok();
     } else {
         for engine in &snapshot.engines {
             let default_marker = if engine.default_for_platform {
@@ -3011,7 +3161,35 @@ fn engines(command: EnginesCommand) -> Result<()> {
             let mut config = RocmCliConfig::load(&paths)?;
             let runtime_id =
                 resolve_engine_install_runtime_id(&paths, &config, &engine, runtime_id)?;
-            let response = engine_request::<_, InstallResponse>(
+            if engine == "pytorch"
+                && !reinstall
+                && python_version.is_none()
+                && let Some(manifest) = active_pytorch_runtime(&paths, &runtime_id)?
+            {
+                let engine_config = config.engine_config_mut(&engine);
+                engine_config.last_installed_runtime_id = Some(runtime_id.clone());
+                if engine_config.preferred_runtime_id.is_none()
+                    && engine_config.preferred_env_id.is_none()
+                {
+                    engine_config.preferred_runtime_id = Some(runtime_id.clone());
+                }
+                config.save(&paths)?;
+                println!("engine ready");
+                println!("  engine: {engine}");
+                println!("  runtime_id: {runtime_id}");
+                println!("  env_path: {}", manifest.install_root.display());
+                record_cli_audit_event(
+                    &paths,
+                    "engine",
+                    "engine_install",
+                    "info",
+                    format!("ready engine={} runtime_id={}", engine, runtime_id),
+                    None,
+                );
+                return Ok(());
+            }
+            let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
+            let response = engine_request_with_env_root::<_, InstallResponse>(
                 Some(&paths),
                 &engine,
                 EngineMethod::Install,
@@ -3019,7 +3197,9 @@ fn engines(command: EnginesCommand) -> Result<()> {
                     runtime_id: runtime_id.clone(),
                     python_version: python_version.clone(),
                     reinstall,
+                    env_root: env_root.clone(),
                 },
+                env_root.as_deref(),
             )?;
             println!("engine install");
             println!("  engine: {engine}");
@@ -3027,45 +3207,6 @@ fn engines(command: EnginesCommand) -> Result<()> {
             println!("  reinstall: {reinstall}");
             println!("  env_id: {}", response.env_id);
             println!("  env_path: {}", response.env_path);
-            let external_runtime = response.managed_env == Some(false);
-            if external_runtime {
-                println!(
-                    "  runtime_executable: {}",
-                    response
-                        .runtime_executable
-                        .as_deref()
-                        .unwrap_or(response.python_executable.as_str())
-                );
-            } else {
-                println!(
-                    "  python_version: {}",
-                    python_version.as_deref().unwrap_or("default")
-                );
-                println!("  python_executable: {}", response.python_executable);
-            }
-            if let Some(runtime_kind) = response.runtime_kind.as_deref() {
-                println!("  runtime_kind: {runtime_kind}");
-            }
-            match response.runtime_executable.as_deref() {
-                Some(runtime_executable) if !external_runtime => {
-                    println!("  runtime_executable: {runtime_executable}");
-                }
-                _ => {}
-            }
-            if let Some(managed_env) = response.managed_env {
-                println!("  managed_env: {managed_env}");
-            }
-            println!("  lock_hash: {}", response.lock_hash);
-            println!(
-                "  packages: {}",
-                summarize_packages(&response.installed_packages)
-            );
-            println!(
-                "  capabilities: cpu={} rocm_gpu={} openai_compatible={}",
-                response.capabilities.cpu,
-                response.capabilities.rocm_gpu,
-                response.capabilities.openai_compatible
-            );
             for warning in response.warnings {
                 println!("  warning: {warning}");
             }
@@ -3081,12 +3222,9 @@ fn engines(command: EnginesCommand) -> Result<()> {
                     seeded_preference = true;
                 }
                 config.save(&paths)?;
-                println!("  config: recorded last installed env for {engine}");
-                if seeded_preference {
-                    println!("  config: seeded preferred env from first successful install");
-                }
+                let _ = seeded_preference;
             } else {
-                println!("  config: external runtime detected; no managed env preference recorded");
+                println!("  note: external runtime");
             }
             record_cli_audit_event(
                 &paths,
@@ -3139,6 +3277,113 @@ fn engine_manages_own_runtime(engine: &str) -> bool {
     engine == "lemonade"
 }
 
+fn env_root_for_runtime(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_id: &str,
+) -> Result<Option<PathBuf>> {
+    if engine_manages_own_runtime(engine) {
+        return Ok(None);
+    }
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, runtime_id)?;
+    Ok(Some(manifest.install_root.join("engines")))
+}
+
+fn env_root_for_engine_install(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    engine: &str,
+    runtime_id: &str,
+) -> Result<Option<PathBuf>> {
+    if engine_manages_own_runtime(engine) {
+        return env_root_for_self_managed_engine(paths, config);
+    }
+    env_root_for_runtime(paths, engine, runtime_id)
+}
+
+fn env_root_for_self_managed_engine(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<PathBuf>> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    for selector in [
+        config.active_runtime_key.as_deref(),
+        config.default_runtime_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(manifest) = runtime_manifest_for_selector(&manifests, selector) {
+            return Ok(Some(manifest.install_root.join("engines")));
+        }
+    }
+    let ready = manifests
+        .iter()
+        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
+        .collect::<Vec<_>>();
+    Ok(match ready.as_slice() {
+        [manifest] => Some(manifest.install_root.join("engines")),
+        _ => None,
+    })
+}
+
+fn runtime_manifest_for_selector<'a>(
+    manifests: &'a [therock::InstalledRuntimeManifest],
+    selector: &str,
+) -> Option<&'a therock::InstalledRuntimeManifest> {
+    manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .or_else(|| {
+            let mut matches = manifests
+                .iter()
+                .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector));
+            let first = matches.next()?;
+            if matches.next().is_none() {
+                Some(first)
+            } else {
+                None
+            }
+        })
+}
+
+fn env_root_for_service(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    if env_id.is_some() {
+        return Ok(None);
+    }
+    match runtime_id {
+        Some(runtime_id) => env_root_for_runtime(paths, engine, runtime_id),
+        None => Ok(None),
+    }
+}
+
+fn active_pytorch_runtime(
+    paths: &AppPaths,
+    runtime_id: &str,
+) -> Result<Option<therock::InstalledRuntimeManifest>> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, runtime_id)?;
+    if !pytorch_runtime_ready(manifest) {
+        return Ok(None);
+    }
+    Ok(Some(manifest.clone()))
+}
+
+fn pytorch_runtime_ready(manifest: &therock::InstalledRuntimeManifest) -> bool {
+    manifest.format == "pip"
+        && validate_runtime_manifest_for_activation(manifest).is_ok()
+        && manifest
+            .rocm_sdk
+            .as_ref()
+            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some())
+}
+
 fn managed_engine_runtime_id(engine: &str) -> &'static str {
     match engine {
         "lemonade" => "lemonade-embeddable-10.6.0",
@@ -3155,7 +3400,8 @@ fn ensure_self_managed_engine_ready(
         return Ok(());
     }
     let runtime_id = managed_engine_runtime_id(engine).to_owned();
-    let installed = engine_request::<_, DetectResponse>(
+    let env_root = env_root_for_self_managed_engine(paths, config)?;
+    let detect = engine_request::<_, DetectResponse>(
         Some(paths),
         engine,
         EngineMethod::Detect,
@@ -3164,13 +3410,15 @@ fn ensure_self_managed_engine_ready(
             device_filter: None,
         },
     )
-    .map(|detect| detect.installed)
-    .unwrap_or(false);
+    .ok();
+    let installed = detect.as_ref().is_some_and(|detect| {
+        detect.installed && detect_runtime_matches_env_root(detect, env_root.as_deref())
+    });
     let response = if installed {
         None
     } else {
         eprintln!("Preparing {engine} for GPU serving...");
-        Some(engine_request::<_, InstallResponse>(
+        Some(engine_request_with_env_root::<_, InstallResponse>(
             Some(paths),
             engine,
             EngineMethod::Install,
@@ -3178,7 +3426,9 @@ fn ensure_self_managed_engine_ready(
                 runtime_id: runtime_id.clone(),
                 python_version: None,
                 reinstall: false,
+                env_root: env_root.clone(),
             },
+            env_root.as_deref(),
         )?)
     };
 
@@ -3195,6 +3445,17 @@ fn ensure_self_managed_engine_ready(
     Ok(())
 }
 
+fn detect_runtime_matches_env_root(detect: &DetectResponse, env_root: Option<&Path>) -> bool {
+    let Some(env_root) = env_root else {
+        return true;
+    };
+    detect
+        .runtime_executable
+        .as_deref()
+        .map(PathBuf::from)
+        .is_some_and(|runtime_executable| path_is_same_or_inside(&runtime_executable, env_root))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ManagedEngineEnvManifest {
     env_id: String,
@@ -3206,6 +3467,7 @@ struct ManagedEngineEnvManifest {
 #[derive(Debug, Clone)]
 struct ResolvedEngineEnv {
     env_id: String,
+    managed_env_id: Option<String>,
     runtime_id: String,
     python_executable: String,
     env_path: PathBuf,
@@ -3293,6 +3555,7 @@ fn resolve_engine_env(
     if let Some(env_id) = selection.env_id.as_deref() {
         let manifest = load_engine_env_manifest(paths, engine, env_id)?;
         return Ok(ResolvedEngineEnv {
+            managed_env_id: Some(manifest.env_id.clone()),
             env_id: manifest.env_id,
             runtime_id: manifest.runtime_id,
             python_executable: manifest.python_executable,
@@ -3306,7 +3569,32 @@ fn resolve_engine_env(
     let runtime_id = selection.runtime_id.with_context(|| {
         "no active ROCm runtime is configured; run `rocm runtimes list` and `rocm runtimes activate <runtime_key>`, or pass --runtime-id"
     })?;
-    let response = engine_request::<_, InstallResponse>(
+    if engine == "pytorch"
+        && let Some(manifest) = active_pytorch_runtime(paths, &runtime_id)?
+    {
+        let python_executable = manifest.python_executable.clone().unwrap_or_else(|| {
+            managed_env_bin_dir(&manifest.install_root)
+                .join(if cfg!(windows) {
+                    "python.exe"
+                } else {
+                    "python"
+                })
+                .display()
+                .to_string()
+        });
+        return Ok(ResolvedEngineEnv {
+            env_id: manifest.runtime_key.clone(),
+            managed_env_id: None,
+            runtime_id,
+            python_executable,
+            env_path: manifest.install_root,
+            source: selection
+                .source
+                .unwrap_or_else(|| "active_therock_runtime".to_owned()),
+        });
+    }
+    let env_root = env_root_for_engine_install(paths, config, engine, &runtime_id)?;
+    let response = engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
         engine,
         EngineMethod::Install,
@@ -3314,9 +3602,12 @@ fn resolve_engine_env(
             runtime_id: runtime_id.clone(),
             python_version: None,
             reinstall: false,
+            env_root: env_root.clone(),
         },
+        env_root.as_deref(),
     )?;
     Ok(ResolvedEngineEnv {
+        managed_env_id: Some(response.env_id.clone()),
         env_id: response.env_id,
         runtime_id,
         python_executable: response.python_executable,
@@ -3600,7 +3891,7 @@ fn serve(
         )?;
         println!("  engine_env_id: {}", engine_env.env_id);
         managed_runtime_id = Some(engine_env.runtime_id);
-        managed_env_id = Some(engine_env.env_id);
+        managed_env_id = engine_env.managed_env_id;
     }
 
     if managed {
@@ -3717,7 +4008,7 @@ fn start_managed_service(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.engine_recipe_json = engine_recipe
-        .map(|recipe| serde_json::to_string(recipe))
+        .map(serde_json::to_string)
         .transpose()
         .context("failed to encode engine recipe hint")?;
     record.write()?;
@@ -3743,10 +4034,14 @@ fn start_managed_service(
         &record.engine_state_path,
         Some(&record.log_path),
     )?;
+    let engine_envs_root = env_root_for_service(&paths, engine, runtime_id, env_id)?;
     #[cfg(windows)]
-    let child_pid =
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &app_path_env_vars(&paths))
-            .context("failed to launch managed engine process")?;
+    let child_pid = {
+        let env_values = app_path_env_var_values(&paths, engine_envs_root.as_deref());
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
+            .context("failed to launch managed engine process")?
+    };
     #[cfg(not(windows))]
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
@@ -3754,6 +4049,9 @@ fn start_managed_service(
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, &paths);
+        if let Some(engine_envs_root) = engine_envs_root.as_deref() {
+            command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
+        }
         let mut child = command
             .spawn()
             .context("failed to launch managed engine process")?;
@@ -3881,9 +4179,9 @@ fn run_foreground_service(
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    match command.unwrap_or(ServicesCommand::List) {
-        ServicesCommand::List => {
-            print!("{}", render_services_text(&paths)?);
+    match command.unwrap_or(ServicesCommand::List { all: false }) {
+        ServicesCommand::List { all } => {
+            print!("{}", render_services_text(&paths, all)?);
             Ok(())
         }
         ServicesCommand::Logs { service_id } => {
@@ -3911,6 +4209,18 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
                 "comfyui_status",
                 "info",
                 "rendered ComfyUI status",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::ModelsPath => {
+            print!("{}", comfyui::render_models_path(&paths)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_models_path",
+                "info",
+                "rendered ComfyUI models path",
                 None,
             );
             Ok(())
@@ -4686,6 +4996,21 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
             .eq_ignore_ascii_case(right.to_string_lossy().as_ref())
     } else {
         left == right
+    }
+}
+
+fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
+    let path = normalize_path_for_compare(path);
+    let base = normalize_path_for_compare(base);
+    if cfg!(windows) {
+        let path_text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let base_text = base.to_string_lossy().replace('/', "\\").to_lowercase();
+        path_text == base_text
+            || path_text
+                .strip_prefix(&base_text)
+                .is_some_and(|rest| rest.starts_with('\\'))
+    } else {
+        path == base || path.starts_with(base)
     }
 }
 
@@ -5715,17 +6040,19 @@ pub(crate) fn render_chat_prompt_result_with_progress(
         let _ = writeln!(output, "ROCm CLI summary");
         let _ = writeln!(output, "{summary}");
     }
-    if should_request_local_tool_follow_up(provider, &tool_result, deterministic_summary.as_deref())
-    {
+    let follow_up_blocking_summary = deterministic_summary
+        .as_deref()
+        .filter(|_| deterministic_summary_can_stand_alone(&tool_result.follow_up_text));
+    if should_request_local_tool_follow_up(provider, &tool_result, follow_up_blocking_summary) {
         let follow_up_messages = vec![
             providers::ChatMessage {
                 role: "system".to_owned(),
-                content: "You are ROCm CLI's local assistant. ROCm tools have already been checked for this turn. Answer only from the supplied tool results. Do not request another tool call. Do not guess paths, GPU names, versions, or install state that are not shown in the tool results.".to_owned(),
+                content: "You are ROCm CLI's local assistant. ROCm tools have already been checked for this turn. Use the supplied tool results for local facts about this machine. If the tool results do not contain enough information to answer the whole question, say what is known from the results and then answer the rest normally from your own model knowledge. Do not request another tool call. Do not invent local paths, GPU names, versions, or install state that are not shown in the tool results. Keep the answer concise.".to_owned(),
             },
             providers::ChatMessage {
                 role: "user".to_owned(),
                 content: format!(
-                    "Original request:\n{}\n\nROCm tool results:\n{}\n\nAnswer the original request using only these ROCm tool results. Keep the answer concise.",
+                    "Original request:\n{}\n\nROCm tool results:\n{}\n\nAnswer the original request. Use the ROCm tool results for this machine's facts; if they are incomplete, answer the remaining part generally.",
                     user_prompt.trim(),
                     tool_result.follow_up_text.trim()
                 ),
@@ -5952,7 +6279,7 @@ fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToo
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({
                 "args": ["serve", "qwen", "--engine", "lemonade", "--device", "gpu_required", "--managed"],
-                "reason": "Start the recommended low-VRAM local assistant after the user approves it."
+                "reason": "Start the recommended local assistant after the user approves it."
             }),
         });
     }
@@ -6464,7 +6791,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer the recommended low-VRAM assistant model qwen when available, which maps to Qwen3-0.6B-GGUF with Lemonade and gpu_required. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. For local assistant serving after setup, prefer qwen when available, which maps to Qwen3-4B-Instruct-2507-GGUF with Lemonade and gpu_required. Use qwen-smoke only for a quick server smoke test. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -7379,6 +7706,10 @@ fn deterministic_chat_tool_summary(tool_text: &str) -> Option<String> {
         .or_else(|| deterministic_model_tool_summary(tool_text))
 }
 
+fn deterministic_summary_can_stand_alone(tool_text: &str) -> bool {
+    !tool_text.contains("model recipes")
+}
+
 #[derive(Debug, Default)]
 struct DeterministicModelRecipe {
     canonical_id: String,
@@ -7407,7 +7738,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
             recipe.canonical_id
         ));
         lines.push(format!(
-            "    Fit: {} GPU memory; designed for low-VRAM ROCm machines.",
+            "    Fit: needs about {} GPU memory.",
             recipe
                 .min_gpu_mem_gib
                 .map(|value| format!("{value} GiB"))
@@ -7421,10 +7752,10 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
 
     if let Some(recipe) = recipes
         .iter()
-        .find(|recipe| recipe.canonical_id == "Qwen/Qwen2.5-0.5B-Instruct")
+        .find(|recipe| recipe.canonical_id == "Qwen3-0.6B-GGUF")
     {
         lines.push(format!(
-            "  Tiny smoke test: qwen-tiny ({})",
+            "  Tiny smoke test: qwen-smoke ({})",
             recipe.canonical_id
         ));
         lines.push(
@@ -7505,7 +7836,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
 
     if !lines.is_empty() {
         lines.push(
-            "  Use /doctor to refresh actual GPU memory fit before starting anything large."
+            "  Run `rocm doctor` to refresh GPU memory details before starting anything large."
                 .to_owned(),
         );
     }
@@ -7955,7 +8286,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
-            Ok(render_model_registry_text_with_context_and_host(
+            Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
                 None,
                 None,
@@ -7984,12 +8315,19 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         {
             Ok(render_engine_inventory_text_with_paths(Some(paths)))
         }
-        [command] if command.eq_ignore_ascii_case("services") => render_services_text(paths),
+        [command] if command.eq_ignore_ascii_case("services") => render_services_text(paths, false),
         [command, subcommand]
             if command.eq_ignore_ascii_case("services")
                 && subcommand.eq_ignore_ascii_case("list") =>
         {
-            render_services_text(paths)
+            render_services_text(paths, false)
+        }
+        [command, subcommand, flag]
+            if command.eq_ignore_ascii_case("services")
+                && subcommand.eq_ignore_ascii_case("list")
+                && matches!(flag.as_str(), "-a" | "--all") =>
+        {
+            render_services_text(paths, true)
         }
         [command, subcommand, service_id]
             if command.eq_ignore_ascii_case("services")
@@ -8438,10 +8776,33 @@ pub(crate) fn render_doctor_text() -> Result<String> {
 }
 
 fn render_doctor_text_with_paths(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
-    let mut output = DoctorSummary::gather()?.render_text();
+    let summary = DoctorSummary::gather()?;
+    let mut output = render_doctor_plain_header(&summary);
+    output.push_str(&summary.render_text());
     append_doctor_runtime_state(&mut output, paths, config)?;
     append_doctor_engine_inventory(&mut output, paths, config);
     Ok(output)
+}
+
+fn render_doctor_plain_header(summary: &DoctorSummary) -> String {
+    let gpu = if summary.detected_gfx_target.is_some() {
+        "AMD GPU detected"
+    } else {
+        "AMD GPU not detected yet"
+    };
+    let runtime = match summary.managed_runtime_count {
+        0 => "No ROCm installs saved yet".to_owned(),
+        1 => "1 ROCm install saved".to_owned(),
+        count => format!("{count} ROCm installs saved"),
+    };
+    format!(
+        "ROCm setup check\n  {gpu}\n  {runtime}\n  Driver: {}\n\nDetails\n",
+        plain_status_label(&summary.driver.status)
+    )
+}
+
+fn plain_status_label(status: &str) -> String {
+    status.replace('_', " ")
 }
 
 pub(crate) fn render_engine_inventory_text() -> String {
@@ -8452,41 +8813,20 @@ pub(crate) fn render_engine_inventory_text() -> String {
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     let default_engine = default_engine_for_platform();
     let mut output = String::new();
-    let _ = writeln!(output, "engine inventory");
+    let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
         output,
-        "  engine_policy: first-party engines are built into rocm; external data-dir plugins are optional overrides"
+        "  Built-in engines are included with rocm-cli. External plugins are optional."
     );
-    let _ = writeln!(
-        output,
-        "  external_plugin_policy: optional overrides only; no fallback engine is selected automatically"
-    );
-    let _ = writeln!(
-        output,
-        "  plugin_naming: {}; llama.cpp uses {}",
-        rocm_engine_protocol::platform_engine_plugin_binary_name("<engine>"),
-        rocm_engine_protocol::platform_engine_plugin_binary_name("llama.cpp")
-    );
+    let _ = writeln!(output, "  ROCm GPU execution is required.");
     if let Some(paths) = paths {
-        let _ = writeln!(output, "  plugin_dirs:");
+        let _ = writeln!(output, "  Plugin folders:");
         for (index, path) in engine_plugin_dirs(paths).iter().enumerate() {
-            let note = if index == 0 {
-                "primary external plugin directory"
-            } else {
-                "compatibility scan for existing data engine binaries"
-            };
+            let note = if index == 0 { "primary" } else { "legacy" };
             let _ = writeln!(output, "    {}. {} ({note})", index + 1, path.display());
         }
-        let _ = writeln!(
-            output,
-            "  upgrade_policy: installers update only the binary install dir; data-dir plugins are preserved"
-        );
-        let _ = writeln!(
-            output,
-            "  uninstall_policy: `rocm uninstall` removes data-dir plugins unless `--keep-data` is used"
-        );
     } else {
-        let _ = writeln!(output, "  plugin_dirs: <unavailable>");
+        let _ = writeln!(output, "  Plugin folders: not checked");
     }
     for (name, note) in engine_inventory() {
         let marker = if *name == default_engine { "*" } else { " " };
@@ -8660,6 +9000,55 @@ fn append_doctor_engine_inventory(output: &mut String, paths: &AppPaths, config:
 
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
+    _paths: Option<&AppPaths>,
+    aggregate_gpu_vram_gib: Option<f64>,
+    _host_ram_gib: Option<f64>,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Local models");
+    let registry = match load_model_recipe_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            let _ = writeln!(output, "  Model list is unavailable: {error}");
+            return output;
+        }
+    };
+    for recipe in &registry.recipes {
+        let _ = writeln!(
+            output,
+            "  {}  {}  {}",
+            recipe_display_ref(recipe),
+            model_recipe_memory_label(recipe),
+            model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
+        );
+    }
+    let _ = writeln!(
+        output,
+        "\nUse `rocm serve <model>` to start one. Use `rocm model --verbose` for details."
+    );
+    output
+}
+
+fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
+    recipe
+        .min_gpu_mem_gb
+        .map(|value| format!("{value} GiB GPU"))
+        .unwrap_or_else(|| "no GPU minimum".to_owned())
+}
+
+fn model_recipe_gpu_fit_label(
+    recipe: &ModelRecipeRecord,
+    aggregate_gpu_vram_gib: Option<f64>,
+) -> &'static str {
+    match (recipe.min_gpu_mem_gb, aggregate_gpu_vram_gib) {
+        (Some(required), Some(available)) if available >= required as f64 => "fits this GPU",
+        (Some(_), Some(_)) => "needs a larger GPU",
+        (Some(_), None) => "GPU fit unknown",
+        (None, _) => "fits",
+    }
+}
+
+pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     paths: Option<&AppPaths>,
     aggregate_gpu_vram_gib: Option<f64>,
     host_ram_gib: Option<f64>,
@@ -9271,16 +9660,25 @@ fn format_gib(value: f64) -> String {
 }
 
 fn append_engine_detect_summary(output: &mut String, engine: &str, paths: Option<&AppPaths>) {
-    let engine_binary = match paths {
-        Some(paths) => resolve_engine_binary_path_with_paths(engine, paths),
-        None => resolve_engine_binary_path(engine),
+    let engine_binary = if builtin_engine_available(engine) {
+        Ok(PathBuf::new())
+    } else {
+        match paths {
+            Some(paths) => resolve_engine_binary_path_with_paths(engine, paths),
+            None => resolve_engine_binary_path(engine),
+        }
     };
-    let binary_status = match &engine_binary {
-        Ok(path) => format!("adapter: {}", path.display()),
-        Err(_) => "adapter: <not found>".to_owned(),
+    let binary_status = if builtin_engine_available(engine) {
+        "adapter: built-in".to_owned()
+    } else {
+        match &engine_binary {
+            Ok(_) => "adapter: available".to_owned(),
+            Err(_) => "adapter: not found".to_owned(),
+        }
     };
     let _ = writeln!(output, "    {binary_status}");
-    if engine_binary.is_err()
+    if !builtin_engine_available(engine)
+        && engine_binary.is_err()
         && let Some(reason) = missing_packaged_engine_reason(engine)
     {
         let _ = writeln!(output, "    note: {reason}");
@@ -9305,14 +9703,96 @@ fn append_engine_detect_summary(output: &mut String, engine: &str, paths: Option
         engine_runtime_status_label(engine, &detect)
     );
     if let Some(kind) = detect.runtime_kind.as_deref() {
-        let _ = writeln!(output, "    runtime_kind: {kind}");
+        let _ = writeln!(
+            output,
+            "    runtime kind: {}",
+            friendly_engine_runtime_kind(kind)
+        );
     }
-    if let Some(executable) = detect.runtime_executable.as_deref() {
-        let _ = writeln!(output, "    runtime_executable: {executable}");
+    if detect.runtime_executable.is_some() {
+        let _ = writeln!(output, "    runtime executable: available");
     }
-    if !detect.notes.is_empty() {
-        let _ = writeln!(output, "    note: {}", detect.notes.join("; "));
+    if let Some(note) = friendly_engine_detect_notes(engine, &detect.notes) {
+        let _ = writeln!(output, "    note: {note}");
     }
+}
+
+fn friendly_engine_runtime_kind(kind: &str) -> String {
+    kind.replace('_', " ")
+}
+
+fn friendly_engine_detect_notes(engine: &str, notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let combined = notes.join("; ");
+    let lower = combined.to_ascii_lowercase();
+    if engine.eq_ignore_ascii_case("pytorch") {
+        if lower.contains("torch probe failed") || lower.contains("torch probe import failed") {
+            return Some("PyTorch engine is not ready yet; reinstall the PyTorch engine from the TUI or run `rocm engines install pytorch`.".to_owned());
+        }
+        if lower.contains("no managed pytorch envs found") {
+            return Some("PyTorch engine is not installed yet.".to_owned());
+        }
+        if lower.contains("torch probe:")
+            || lower.contains("rocm_sdk:")
+            || lower.contains("torch._rocm_init")
+            || lower.contains("managed env detected")
+        {
+            return Some("PyTorch is ready on your AMD GPU.".to_owned());
+        }
+    }
+    if engine.eq_ignore_ascii_case("lemonade") {
+        if lower.contains("not installed") || lower.contains("not found") {
+            return Some("Lemonade is not installed yet.".to_owned());
+        }
+        if lower.contains("lemonade embeddable")
+            || lower.contains("llamacpp:rocm")
+            || lower.contains("configured")
+        {
+            return Some("Lemonade is ready on your AMD GPU.".to_owned());
+        }
+    }
+    if engine.eq_ignore_ascii_case("llama.cpp") {
+        if lower.contains("llama-server not found") {
+            return Some("llama.cpp server is not installed yet.".to_owned());
+        }
+        if lower.contains("hip runtime env available") || lower.contains("therock") {
+            return Some("llama.cpp can use the active ROCm install.".to_owned());
+        }
+    }
+    if lower.contains("unsupported_native_windows")
+        || lower.contains("native windows")
+        || lower.contains("linux/wsl")
+        || lower.contains("wsl/linux")
+    {
+        return Some(format!("{engine} is available from WSL/Linux on Windows."));
+    }
+    Some(friendly_engine_detect_note_fallback(&combined))
+}
+
+fn friendly_engine_detect_note_fallback(note: &str) -> String {
+    let lower = note.to_ascii_lowercase();
+    if lower.contains("torch probe failed") || lower.contains("torch probe import failed") {
+        return "PyTorch engine is not ready yet; reinstall the PyTorch engine from the TUI or run `rocm engines install pytorch`.".to_owned();
+    }
+    if lower.contains("no managed pytorch envs found") {
+        return "PyTorch engine is not installed yet.".to_owned();
+    }
+    if lower.contains("torch probe:")
+        || lower.contains("rocm_sdk:")
+        || lower.contains("torch._rocm_init")
+    {
+        return "PyTorch is ready on your AMD GPU.".to_owned();
+    }
+    if lower.contains("unsupported_native_windows")
+        || lower.contains("native windows")
+        || lower.contains("linux/wsl")
+        || lower.contains("wsl/linux")
+    {
+        return "This engine is available from WSL/Linux on Windows.".to_owned();
+    }
+    note.replace('_', " ")
 }
 
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
@@ -9702,19 +10182,23 @@ fn log_browser_source_label(source: &str, show_file_locations: bool) -> String {
     }
 }
 
-pub(crate) fn render_services_text(paths: &AppPaths) -> Result<String> {
-    let records = load_managed_services(paths)?;
+pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
+    let records = load_managed_services(paths)?
+        .into_iter()
+        .filter(|record| all || managed_service_is_live(record))
+        .collect::<Vec<_>>();
     let counts = managed_service_sidebar_counts(&records);
     let mut output = String::new();
     let _ = writeln!(output, "Local Servers");
     let _ = writeln!(output);
     let _ = writeln!(output, "Status: {}", local_server_sidebar_status(&counts));
-    if counts.past_attempts > 0 {
-        let _ = writeln!(output, "Past attempts: {}", counts.past_attempts);
-    }
     let _ = writeln!(output);
     if records.is_empty() {
-        let _ = writeln!(output, "No local server records yet.");
+        let _ = if all {
+            writeln!(output, "No local server records yet.")
+        } else {
+            writeln!(output, "No local servers are running.")
+        };
         let _ = writeln!(
             output,
             "Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve."
@@ -10035,10 +10519,19 @@ fn restart_internal_managed_service(
         &record.engine_state_path,
         Some(&record.log_path),
     )?;
+    let engine_envs_root = env_root_for_service(
+        paths,
+        &record.engine,
+        record.runtime_id.as_deref(),
+        record.env_id.as_deref(),
+    )?;
     #[cfg(windows)]
-    let child_pid =
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &app_path_env_vars(paths))
-            .context("failed to restart managed engine process")?;
+    let child_pid = {
+        let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
+            .context("failed to restart managed engine process")?
+    };
     #[cfg(not(windows))]
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
@@ -10046,6 +10539,9 @@ fn restart_internal_managed_service(
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, paths);
+        if let Some(engine_envs_root) = engine_envs_root.as_deref() {
+            command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
+        }
         let mut child = command
             .spawn()
             .context("failed to restart managed engine process")?;
@@ -10794,14 +11290,18 @@ pub(crate) fn render_sidebar_text(
     let _ = writeln!(output, "ROCm CLI");
     let _ = writeln!(
         output,
-        "setup: {}",
+        "Setup: {}",
         if setup_ready { "ready" } else { "not set up" }
     );
-    let _ = writeln!(output, "provider: {provider}");
-    let _ = writeln!(output, "engine: {default_engine}");
+    let _ = writeln!(output, "Assistant: {}", friendly_provider_label(provider));
     let _ = writeln!(
         output,
-        "permissions: {}",
+        "Model runner: {}",
+        friendly_engine_label(default_engine)
+    );
+    let _ = writeln!(
+        output,
+        "Changes: {}",
         if config.permissions.full_access_enabled() {
             "full access"
         } else {
@@ -10810,20 +11310,17 @@ pub(crate) fn render_sidebar_text(
     );
     let _ = writeln!(
         output,
-        "local servers: {}",
+        "Local servers: {}",
         local_server_sidebar_status(&server_counts)
     );
-    if server_counts.past_attempts > 0 {
-        let _ = writeln!(output, "past attempts: {}", server_counts.past_attempts);
-    }
     let enabled_watchers = builtin_watchers()
         .iter()
         .filter(|watcher| config.watcher_enabled(watcher))
         .count();
-    let _ = writeln!(output, "background checks: {}", enabled_watchers);
+    let _ = writeln!(output, "Background checks: {}", enabled_watchers);
     let _ = writeln!(
         output,
-        "background service: {}",
+        "Background helper: {}",
         if config.automation_daemon_enabled() {
             "needed"
         } else {
@@ -10831,8 +11328,29 @@ pub(crate) fn render_sidebar_text(
         }
     );
     let _ = writeln!(output);
-    let _ = writeln!(output, "Use /doctor for details.");
+    let _ = writeln!(output, "Choose Run setup check for details.");
     output
+}
+
+fn friendly_provider_label(provider: &str) -> &str {
+    match provider {
+        "local" => "local model",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        other => other,
+    }
+}
+
+fn friendly_engine_label(engine: &str) -> &str {
+    match engine {
+        "lemonade" => "Lemonade",
+        "pytorch" => "PyTorch",
+        "llama.cpp" => "llama.cpp",
+        "vllm" => "vLLM",
+        "sglang" => "SGLang",
+        "atom" => "ATOM",
+        other => other,
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -10854,6 +11372,13 @@ pub(crate) fn managed_service_sidebar_counts(
         }
     }
     counts
+}
+
+pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
+    matches!(
+        record.status.as_str(),
+        "ready" | "running" | "starting" | "recovering"
+    )
 }
 
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
@@ -10994,6 +11519,12 @@ pub(crate) fn tui_help_text() -> String {
     let _ = writeln!(output, "  /quit, /exit   exit the TUI");
     let _ = writeln!(output);
     let _ = writeln!(output, "keyboard");
+    let _ = writeln!(output, "  F1             open interactive help");
+    let _ = writeln!(output, "  F5             refresh the current screen");
+    let _ = writeln!(
+        output,
+        "  /              open the command popup on normal menu screens"
+    );
     let _ = writeln!(
         output,
         "  Tab            complete slash commands and arguments"
@@ -11003,7 +11534,14 @@ pub(crate) fn tui_help_text() -> String {
         "  Up/Down        choose items or recall input history"
     );
     let _ = writeln!(output, "  PgUp/PgDn      scroll the current view");
+    let _ = writeln!(output, "  Mouse wheel    scroll long text and log cards");
     let _ = writeln!(output, "  Home/End       jump to top or bottom");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "logs");
+    let _ = writeln!(
+        output,
+        "  Targeted logs such as /comfyui logs and service logs open in a scrollable card"
+    );
     let _ = writeln!(output);
     let _ = writeln!(output, "natural language");
     let _ = writeln!(output, "  serve qwen with lemonade");
@@ -11273,9 +11811,9 @@ fn build_freeform_plan_with_recipes(
                     "read-only inspection",
                 ),
                 PlannedToolCall::read_only(
-                    "Inspect engine inventory",
+                    "Show local model engines",
                     vec!["engines".to_owned(), "list".to_owned()],
-                    "read-only engine inventory",
+                    "read-only engine list",
                 ),
                 PlannedToolCall::approval_required(
                     "Launch local endpoint",
@@ -12438,13 +12976,29 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
+    engine_request_with_env_root(paths, engine, method, request, None)
+}
+
+fn engine_request_with_env_root<T, R>(
+    paths: Option<&AppPaths>,
+    engine: &str,
+    method: EngineMethod,
+    request: &T,
+    env_root: Option<&Path>,
+) -> Result<R>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
     let stream_progress = matches!(&method, EngineMethod::Install);
     let envelope = EngineRequestEnvelope {
         method,
         payload: serde_json::to_value(request)
             .context("failed to encode engine request payload")?,
     };
-    if let Some(envelope) = builtin_engine_request(engine, &envelope) {
+    if let Some(envelope) = with_scoped_builtin_engine_env(paths, env_root, || {
+        builtin_engine_request(engine, &envelope)
+    }) {
         return decode_engine_response(envelope);
     }
 
@@ -12457,6 +13011,9 @@ where
     command.arg("stdio");
     if let Some(paths) = paths {
         apply_app_path_env(&mut command, paths);
+    }
+    if let Some(env_root) = env_root {
+        command.env("ROCM_CLI_ENGINE_ENVS_ROOT", env_root);
     }
     if stream_progress {
         command.env("ROCM_ENGINE_PROGRESS_STDERR", "1");
@@ -12556,6 +13113,59 @@ where
         .data
         .context("engine response envelope did not contain data")?;
     serde_json::from_value(data).context("failed to decode engine response payload")
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn with_scoped_builtin_engine_env<R>(
+    paths: Option<&AppPaths>,
+    env_root: Option<&Path>,
+    f: impl FnOnce() -> R,
+) -> R {
+    if paths.is_none() && env_root.is_none() {
+        return f();
+    }
+    let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().expect("builtin engine env lock poisoned");
+    let mut vars = Vec::new();
+    if let Some(paths) = paths {
+        for (key, value) in app_path_env_vars(paths) {
+            vars.push(ScopedEnvVar::set_path(key, value));
+        }
+    }
+    if let Some(env_root) = env_root {
+        vars.push(ScopedEnvVar::set_path(
+            "ROCM_CLI_ENGINE_ENVS_ROOT",
+            env_root,
+        ));
+    }
+    let result = f();
+    drop(vars);
+    result
 }
 
 fn builtin_engine_request(
@@ -12745,29 +13355,6 @@ fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     }
 }
 
-fn summarize_packages(packages: &[String]) -> String {
-    let interesting = ["torch", "transformers", "accelerate", "fastapi"];
-    let selected = interesting
-        .iter()
-        .filter_map(|name| {
-            packages
-                .iter()
-                .find(|entry| entry.starts_with(&format!("{name}==")))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if selected.is_empty() {
-        format!("{} captured in lockfile", packages.len())
-    } else {
-        format!(
-            "{} captured in lockfile; {}",
-            packages.len(),
-            selected.join(", ")
-        )
-    }
-}
-
 #[derive(Debug, Clone)]
 struct EngineSelection {
     runtime_id: Option<String>,
@@ -12927,6 +13514,26 @@ fn app_path_env_vars(paths: &AppPaths) -> [(&'static str, &Path); 3] {
         ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
         ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
     ]
+}
+
+fn app_path_env_var_values(
+    paths: &AppPaths,
+    env_root: Option<&Path>,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut vars = app_path_env_vars(paths)
+        .into_iter()
+        .map(|(key, value)| (key, value.to_path_buf()))
+        .collect::<Vec<_>>();
+    if let Some(env_root) = env_root {
+        vars.push(("ROCM_CLI_ENGINE_ENVS_ROOT", env_root.to_path_buf()));
+    }
+    vars
+}
+
+fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'static str, &'a Path)> {
+    vars.iter()
+        .map(|(key, value)| (*key, value.as_path()))
+        .collect()
 }
 
 fn managed_service_launcher_path() -> Result<PathBuf> {
@@ -13398,6 +14005,18 @@ mod tests {
         assert_eq!(vars[0], ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()));
         assert_eq!(vars[1], ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()));
         assert_eq!(vars[2], ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()));
+    }
+
+    #[test]
+    fn app_path_env_var_values_include_engine_env_root_when_needed() {
+        let paths = test_app_paths();
+        let engine_root = PathBuf::from("D:/rocm-data/runtime/engines");
+        let vars = app_path_env_var_values(&paths, Some(&engine_root));
+
+        assert_eq!(
+            vars.last().map(|(key, value)| (*key, value.as_path())),
+            Some(("ROCM_CLI_ENGINE_ENVS_ROOT", engine_root.as_path()))
+        );
     }
 
     #[test]
@@ -14339,7 +14958,8 @@ mod tests {
             "comfyui",
             "First-time setup is the same thing as bootstrap",
             "vllm",
-            "Qwen3-0.6B-GGUF",
+            "Qwen3-4B-Instruct-2507-GGUF",
+            "qwen-smoke",
             "llama-server",
             "Do not invent shell commands",
         ] {
@@ -14428,10 +15048,14 @@ runtime_state:
             "\
 rocm_command:
 model recipes
-  Qwen3-0.6B-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=2 GiB engines=[lemonade]
+  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
       engine_support:
         lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-      warning: tiny Lemonade GGUF assistant path for low-VRAM ROCm machines
+      warning: recommended Lemonade GGUF assistant for ROCm machines
+  Qwen3-0.6B-GGUF aliases=[qwen-smoke, lemonade-tiny] task=chat dtype=gguf device=gpu_required min_gpu_mem=2 GiB engines=[lemonade]
+      engine_support:
+        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
+      warning: tiny Lemonade GGUF smoke-test model; not the default assistant
   Qwen/Qwen2.5-0.5B-Instruct aliases=[qwen-tiny] task=chat dtype=float16 device=gpu_required min_gpu_mem=4 GiB engines=[pytorch]
       engine_support:
         pytorch: available path=D:\\rocm\\rocm-engine-pytorch.exe
@@ -14447,14 +15071,15 @@ model recipes
         .expect("model output should summarize");
 
         assert!(summary.contains("Recommended local assistant: qwen"));
+        assert!(summary.contains("Qwen3-4B-Instruct-2507-GGUF"));
+        assert!(summary.contains("4 GiB"));
+        assert!(summary.contains("Tiny smoke test: qwen-smoke"));
         assert!(summary.contains("Qwen3-0.6B-GGUF"));
-        assert!(summary.contains("2 GiB"));
-        assert!(summary.contains("Tiny smoke test: qwen-tiny"));
         assert!(summary.contains("8 GiB-class option: llama"));
         assert!(summary.contains("pytorch, llama.cpp"));
         assert!(summary.contains("Qwen/Qwen3.5-4B asks for 12 GiB"));
         assert!(summary.contains("Native Windows note"));
-        assert!(summary.contains("Use /doctor"));
+        assert!(summary.contains("Run `rocm doctor`"));
     }
 
     #[test]
@@ -14464,7 +15089,7 @@ model recipes
             follow_up_text: "\
 rocm_command:
 model recipes
-  Qwen3-0.6B-GGUF aliases=[qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=2 GiB engines=[lemonade]
+  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
       engine_support:
         lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
 "
@@ -15459,7 +16084,7 @@ install therock";
         assert!(rendered.contains("Recommended path:"));
         assert!(rendered.contains("Advanced manual command"));
         assert!(rendered.contains(
-            "rocm serve Qwen3-0.6B-GGUF --engine lemonade --device gpu_required --managed"
+            "rocm serve Qwen3-4B-Instruct-2507-GGUF --engine lemonade --device gpu_required --managed"
         ));
         assert!(!rendered.contains("sshleifer/tiny-gpt2"));
         assert!(rendered.contains("rocm chat --tools --provider local --prompt"));
@@ -15737,7 +16362,7 @@ install therock";
     }
 
     #[test]
-    fn render_services_text_separates_ready_starting_and_past_attempts() -> Result<()> {
+    fn render_services_text_lists_live_services_by_default_and_all_on_request() -> Result<()> {
         let (root, paths) = test_paths("services-list");
         paths.ensure()?;
 
@@ -15764,16 +16389,18 @@ install therock";
             record.write()?;
         }
 
-        let rendered = render_services_text(&paths)?;
+        let rendered = render_services_text(&paths, false)?;
+        let all = render_services_text(&paths, true)?;
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("Local Servers"));
         assert!(rendered.contains("Status: 1 ready, 1 starting"));
-        assert!(rendered.contains("Past attempts: 1"));
+        assert!(!rendered.contains("Past attempts"));
         assert!(rendered.contains("- svc-ready"));
         assert!(rendered.contains("  stop: rocm services stop svc-ready --yes"));
-        assert!(rendered.contains("- svc-failed"));
-        assert!(rendered.contains("  restart: rocm services restart svc-failed --yes"));
+        assert!(!rendered.contains("- svc-failed"));
+        assert!(all.contains("- svc-failed"));
+        assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
         Ok(())
     }
@@ -15942,7 +16569,7 @@ install therock";
 
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
-            "Qwen3-0.6B-GGUF"
+            "Qwen3-4B-Instruct-2507-GGUF"
         );
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "pytorch"),
@@ -16623,6 +17250,76 @@ VERSION_ID="41"
             )?,
             "release-pip-gfx120x-all"
         );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn env_root_for_runtime_uses_runtime_install_root() -> Result<()> {
+        let (root, paths) = test_paths("engine-env-root-runtime");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            1,
+        )?;
+
+        let engine_root = env_root_for_runtime(&paths, "pytorch", &manifest.runtime_key)?;
+
+        assert_eq!(engine_root, Some(manifest.install_root.join("engines")));
+        assert_eq!(
+            env_root_for_runtime(&paths, "lemonade", &manifest.runtime_key)?,
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn env_root_for_engine_install_uses_active_runtime_root_for_lemonade() -> Result<()> {
+        let (root, paths) = test_paths("lemonade-engine-env-root-runtime");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            1,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        let engine_root =
+            env_root_for_engine_install(&paths, &config, "lemonade", "lemonade-embeddable")?;
+
+        assert_eq!(engine_root, Some(manifest.install_root.join("engines")));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_pytorch_env_uses_active_therock_runtime() -> Result<()> {
+        let (root, paths) = test_paths("pytorch-active-runtime-env");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            1,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        let resolved = resolve_engine_env(&paths, &config, "pytorch", None, None)?;
+
+        assert_eq!(resolved.runtime_id, manifest.runtime_key);
+        assert_eq!(resolved.env_path, manifest.install_root);
+        assert_eq!(resolved.managed_env_id, None);
+        assert!(!resolved.env_path.join("engines").exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -17419,11 +18116,38 @@ VERSION_ID="41"
         let rendered = render_engine_inventory_text_with_paths(Some(&paths));
         let _ = fs::remove_dir_all(root);
 
-        assert!(rendered.contains("external_plugin_policy:"));
-        assert!(rendered.contains("no fallback engine is selected automatically"));
+        assert!(rendered.contains("Local model engines"));
+        assert!(rendered.contains("Built-in engines are included with rocm-cli"));
+        assert!(rendered.contains("ROCm GPU execution is required"));
+        assert!(rendered.contains("Plugin folders:"));
         assert!(rendered.contains(&paths.primary_engine_plugin_dir().display().to_string()));
-        assert!(rendered.contains("upgrade_policy: installers update only the binary install dir"));
-        assert!(rendered.contains("uninstall_policy: `rocm uninstall` removes data-dir plugins unless `--keep-data` is used"));
+    }
+
+    #[test]
+    fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
+        let pytorch = friendly_engine_detect_notes(
+            "pytorch",
+            &[r"torch probe: cuda_available=true device_count=1; managed env detected at C:\Users\jam\.rocm\engines\pytorch\envs\release; rocm_sdk: version=7.13".to_owned()],
+        )
+        .expect("pytorch note");
+        assert_eq!(pytorch, "PyTorch is ready on your AMD GPU.");
+
+        let lemonade = friendly_engine_detect_notes(
+            "lemonade",
+            &["Lemonade embeddable 10.6.0 is installed at D:/jam/temp/runtime; Lemonade is configured for llamacpp:rocm; no CPU fallback is used".to_owned()],
+        )
+        .expect("lemonade note");
+        assert_eq!(lemonade, "Lemonade is ready on your AMD GPU.");
+
+        let llama = friendly_engine_detect_notes(
+            "llama.cpp",
+            &["llama-server not found; TheRock HIP runtime env available: root=D:\\jam\\temp\\therock".to_owned()],
+        )
+        .expect("llama.cpp note");
+        assert_eq!(llama, "llama.cpp server is not installed yet.");
+        assert!(!pytorch.contains("torch probe"));
+        assert!(!lemonade.contains("D:/"));
+        assert!(!llama.contains("D:\\"));
     }
 
     #[test]
@@ -17519,7 +18243,7 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn sidebar_counts_saved_failed_services_as_past_attempts() -> Result<()> {
+    fn sidebar_omits_saved_failed_service_history() -> Result<()> {
         let (root, paths) = test_paths("sidebar-service-counts");
         for index in 0..6 {
             let mut record = ManagedServiceRecord::new(
@@ -17543,8 +18267,8 @@ VERSION_ID="41"
         let rendered = render_sidebar_text(&paths, &RocmCliConfig::default(), "local", true);
         let _ = fs::remove_dir_all(root);
 
-        assert!(rendered.contains("local servers: none ready"));
-        assert!(rendered.contains("past attempts: 6"));
+        assert!(rendered.contains("Local servers: none ready"));
+        assert!(!rendered.contains("past attempts"));
         assert!(!rendered.contains("running servers: 6"));
         Ok(())
     }
@@ -17772,22 +18496,28 @@ VERSION_ID="41"
     fn render_model_registry_text_lists_builtin_recipes() {
         let rendered = render_model_registry_text_with_context_and_host(None, None, None);
 
+        assert!(rendered.contains("Local models"));
+        assert!(rendered.contains("qwen3.5"));
+        assert!(rendered.contains("GPU fit unknown"));
+        assert!(rendered.contains("Use `rocm serve <model>`"));
+        assert!(rendered.contains("rocm model --verbose"));
+        assert!(!rendered.contains("recommended_system_ram:"));
+        assert!(!rendered.contains("engine_support:"));
+        assert!(!rendered.contains("artifact_check:"));
+    }
+
+    #[test]
+    fn render_model_registry_verbose_text_keeps_diagnostics() {
+        let rendered = render_model_registry_verbose_text_with_context_and_host(None, None, None);
+
         assert!(rendered.contains("model recipes"));
-        assert!(rendered.contains("Qwen/Qwen3.5-4B"));
         assert!(rendered.contains("aliases=[qwen"));
         assert!(rendered.contains("recommended_system_ram: 16 GiB"));
         assert!(rendered.contains("system_ram_fit: unknown"));
-        assert!(rendered.contains("system_ram_reason: current host RAM telemetry is unavailable"));
-        assert!(rendered.contains("quantization: none; bfloat16 weights"));
-        assert!(rendered.contains("artifact_check: not_checked"));
-        assert!(rendered.contains("artifact_reason: Hugging Face model id"));
         assert!(rendered.contains("gpu_fit: unknown"));
-        assert!(rendered.contains("reason: current telemetry has no aggregate GPU VRAM reading"));
-        assert!(rendered.contains("action: run /doctor or refresh GPU telemetry"));
         assert!(rendered.contains("engine_support:"));
         assert!(rendered.contains("engine_action: use /engine install <engine>"));
         assert!(rendered.contains("source: built-in recipe registry"));
-        assert!(rendered.contains("external signed recipe index is not configured yet"));
     }
 
     #[test]
@@ -17855,7 +18585,8 @@ VERSION_ID="41"
 
     #[test]
     fn render_model_registry_text_reports_host_ram_fit() {
-        let rendered = render_model_registry_text_with_context_and_host(None, None, Some(32.0));
+        let rendered =
+            render_model_registry_verbose_text_with_context_and_host(None, None, Some(32.0));
 
         assert!(rendered.contains("system_ram_policy: advisory"));
         assert!(rendered.contains("system_ram_fit: supported"));
@@ -17867,7 +18598,8 @@ VERSION_ID="41"
 
     #[test]
     fn render_model_registry_text_reports_supported_and_unsupported_gpu_fit() {
-        let rendered = render_model_registry_text_with_context_and_host(None, Some(16.0), None);
+        let rendered =
+            render_model_registry_verbose_text_with_context_and_host(None, Some(16.0), None);
 
         assert!(rendered.contains("gpu_fit: supported"));
         assert!(rendered.contains("aggregate GPU VRAM 16 GiB meets recipe minimum 12 GiB"));
@@ -17885,7 +18617,7 @@ VERSION_ID="41"
 
     #[test]
     fn render_model_registry_text_marks_tiny_recipe_as_gpu_smoke_support() {
-        let rendered = render_model_registry_text_with_context_and_host(None, None, None);
+        let rendered = render_model_registry_verbose_text_with_context_and_host(None, None, None);
 
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
         assert!(rendered.contains("device=gpu_required"));
@@ -17923,7 +18655,7 @@ VERSION_ID="41"
 
     #[test]
     fn model_registry_engine_reasons_do_not_mention_cpu_fallbacks() {
-        let rendered = render_model_registry_text_with_context_and_host(None, None, None);
+        let rendered = render_model_registry_verbose_text_with_context_and_host(None, None, None);
 
         assert!(!rendered.contains("CPU fallback"));
         assert!(rendered.contains("engine_action: use /engine install <engine>"));

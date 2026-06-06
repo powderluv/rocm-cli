@@ -95,11 +95,13 @@ Validated clean rebuild and E2E checkpoint on 2026-06-06:
     Radeon RX 9070 XT, `detected_gfx_target: gfx1201`,
     `compatible_therock_family: gfx120X-all`, and AMD display driver
     `32.0.23033.1002`.
-- WSL smoke through the Cosmopolitan APE loader reports `os: linux`,
-  `wsl: true`, `driver_policy: wsl_rocdxg`, `driver_status:
-  wsl_rocdxg_ready`, and `detected_gfx_target: gfx1201`.
-- WSL smoke through `sh <same APE> doctor` reports the Linux path and fails if
-  the output reports `os: windows`.
+- WSL smoke through `sh <same APE> doctor` reports `os: linux`, `wsl: true`,
+  `driver_policy: wsl_rocdxg`, `driver_status: wsl_rocdxg_ready`, and
+  `detected_gfx_target: gfx1201`.
+- WSL Linux-path smoke currently uses `sh <same APE> doctor`. Direct WSL
+  execution after renaming the same file to `rocm` is still a caveat: if it
+  reports `os: windows`, WSLInterop intercepted the file before rocm-cli
+  started.
 - Windows and WSL TUI smoke pass with the same universal artifact.
 - Windows and WSL Lemonade local-assistant E2E pass with no CPU/Vulkan fallback.
 - Windows and WSL PyTorch local-assistant E2E pass with no CPU fallback.
@@ -108,9 +110,8 @@ Validated clean rebuild and E2E checkpoint on 2026-06-06:
 
 WSL caveat: WSLInterop registers an `MZ` binfmt handler that can intercept
 direct `./rocm` execution before rocm-cli starts, even when the file has no
-`.exe` extension. Use `sh ./rocm ...` or the bundled `ape-x86_64.elf ./rocm
-...` launch path on WSL to force the Linux runtime path without changing the
-single file.
+`.exe` extension. `sh ./rocm ...` proves the Linux payload works. Direct
+`./rocm` without WSLInterop interception remains the desired user experience.
 
 Current release shape: first-party engine adapters and the small `rocmd`
 service/tool helper surface are built into `rocm`. The universal APE no longer
@@ -150,11 +151,12 @@ Prove whether the existing Rust CLI can become a true APE:
 4. Done: build the real `rocm` binary as one APE.
 5. Done: smoke `version` and `doctor` on native Windows and WSL.
 6. Done: no-arg first-time setup TUI opens from the APE on Windows in a PTY.
-7. Done: same artifact runs the Linux/WSL runtime path through `sh <same file>`.
+7. Partial: same artifact runs the Linux/WSL runtime path through
+   `sh <same file>`; direct renamed `./rocm` remains a WSLInterop caveat.
 8. Done: Windows and WSL universal-binary E2E passes for TUI smoke, Lemonade
    assistant, PyTorch assistant, and ComfyUI start/stop.
-9. Remaining: graduate the spike script into the release pipeline and validate
-   native Linux outside WSL.
+9. Remaining: graduate the spike script into the release pipeline, validate
+   direct WSL execution, and validate native Linux outside WSL.
 
 Acceptance for this track is no longer "hello world". The current artifact runs
 useful rocm-cli doctor/setup code as one APE; the remaining blocker list is now
@@ -193,9 +195,10 @@ A true universal rocm-cli binary is accepted only when:
 8. The executable does not claim GPU readiness unless the AMD runtime needed by
    the selected workflow is actually available.
 
-Current status on 2026-06-06: criteria 1-8 pass on Windows and WSL for the
-local `gfx1201` host. Native Linux validation and production release-pipeline
-promotion remain open.
+Current status on 2026-06-06: Windows execution and `sh <same APE>` WSL
+execution pass for the local `gfx1201` host. Direct renamed `./rocm` execution
+inside WSL remains a caveat when WSLInterop intercepts it. Native Linux
+validation and production release-pipeline promotion remain open.
 
 ## Automation
 
@@ -232,3 +235,6 @@ The output is:
 ```text
 .rocm-work/tests/rust-cosmopolitan/rocm-rust-cosmo-release.exe
 ```
+
+For release packaging, copy that artifact to the user-facing name `rocm.exe`
+on Windows. The same bytes may be copied to `rocm` for WSL/Linux smoke tests.

@@ -7,4 +7,6 @@
 /.idea
 /.vscode
 *.log
+active-implementation-log.md
+current-user-asks.md
 __pycache__/

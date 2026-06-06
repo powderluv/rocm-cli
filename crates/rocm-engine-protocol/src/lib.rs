@@ -192,6 +192,8 @@ pub struct InstallRequest {
     pub python_version: Option<String>,
     #[serde(default)]
     pub reinstall: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

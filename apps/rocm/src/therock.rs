@@ -2242,7 +2242,7 @@ fn parse_final_http_status(headers: &str) -> Option<u16> {
             }
             line.split_whitespace().nth(1)?.parse::<u16>().ok()
         })
-        .last()
+        .next_back()
 }
 
 fn http_get_windows_powershell(
@@ -2558,12 +2558,22 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
 fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
-        run_command(
+        if run_command(
             &env_python,
             &["--version"],
             "verify existing managed TheRock runtime Python",
-        )?;
-        return Ok(());
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        progress_line("Existing Python environment is incomplete; recreating it.");
+        fs::remove_dir_all(install_root).with_context(|| {
+            format!(
+                "failed to remove incomplete Python environment at {}",
+                install_root.display()
+            )
+        })?;
     }
     let args = python_venv_args(install_root);
     run_command(
@@ -2584,12 +2594,11 @@ fn ensure_python_venv(python_launcher: &Path, install_root: &Path) -> Result<()>
 }
 
 fn python_venv_args(install_root: &Path) -> Vec<String> {
-    let mut args = vec!["-m".to_owned(), "venv".to_owned()];
-    if !runtime_is_windows() {
-        args.push("--copies".to_owned());
-    }
-    args.push(install_root.to_string_lossy().to_string());
-    args
+    vec![
+        "-m".to_owned(),
+        "venv".to_owned(),
+        install_root.to_string_lossy().to_string(),
+    ]
 }
 
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
@@ -3281,15 +3290,10 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
         });
     }
 
-    let candidates: &[&str] = if runtime_is_windows() {
-        &["python", "python3", "py"]
-    } else {
-        &["python3", "python"]
-    };
-    for candidate in candidates {
-        if python_launcher_is_compatible(Path::new(candidate)) {
+    for candidate in python_path_candidates() {
+        if python_launcher_is_compatible(&candidate) {
             return Ok(PythonLauncher {
-                executable: PathBuf::from(candidate),
+                executable: candidate,
                 source: "path",
             });
         }
@@ -3311,6 +3315,64 @@ fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
         );
     }
     ensure_managed_python(paths)
+}
+
+fn python_path_candidates() -> Vec<PathBuf> {
+    let program_names: &[&str] = if runtime_is_windows() {
+        &["python", "python3", "py"]
+    } else {
+        &["python3", "python"]
+    };
+    program_names
+        .iter()
+        .flat_map(|program| resolve_program_on_path(program))
+        .collect()
+}
+
+fn resolve_program_on_path(program: &str) -> Vec<PathBuf> {
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let candidates = program_path_candidates(program);
+    split_runtime_path(&path_value)
+        .into_iter()
+        .flat_map(|dir| candidates.iter().map(move |candidate| dir.join(candidate)))
+        .filter(|path| path.is_file())
+        .map(|path| normalize_runtime_path_for_host(&path))
+        .collect()
+}
+
+fn split_runtime_path(value: &std::ffi::OsStr) -> Vec<PathBuf> {
+    if !runtime_is_windows() {
+        return std::env::split_paths(value).collect();
+    }
+    value
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| normalize_runtime_path_for_host(Path::new(entry)))
+        .collect()
+}
+
+fn program_path_candidates(program: &str) -> Vec<String> {
+    let path = Path::new(program);
+    if !runtime_is_windows() || path.extension().is_some() {
+        return vec![program.to_owned()];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let mut names = vec![program.to_owned()];
+    for ext in pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+    {
+        names.push(format!("{program}{ext}"));
+        names.push(format!("{program}{}", ext.to_ascii_lowercase()));
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn python_launcher_is_compatible(program: &Path) -> bool {
@@ -3729,14 +3791,59 @@ mod tests {
     }
 
     #[test]
-    fn python_venv_args_use_copies_on_unix_mounts() {
+    fn python_venv_args_use_python_default_linking() {
         let args = python_venv_args(Path::new("/mnt/d/jam/rocm"));
-        if cfg!(windows) {
-            assert!(!args.iter().any(|arg| arg == "--copies"));
-        } else {
-            assert!(args.iter().any(|arg| arg == "--copies"));
-        }
+
+        assert!(!args.iter().any(|arg| arg == "--copies"));
         assert_eq!(args.last().map(String::as_str), Some("/mnt/d/jam/rocm"));
+    }
+
+    #[test]
+    fn ensure_python_venv_recreates_broken_unix_env() -> Result<()> {
+        if runtime_is_windows() {
+            return Ok(());
+        }
+
+        let (root, _paths) = test_paths("recreate-broken-python-env");
+        fs::create_dir_all(&root)?;
+        let launcher = root.join("python3");
+        fs::write(
+            &launcher,
+            r#"#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  mkdir -p "$3/bin"
+  cat > "$3/bin/python" <<'PY'
+#!/bin/sh
+echo Python 3.12.10
+PY
+  chmod +x "$3/bin/python"
+  exit 0
+fi
+echo Python 3.12.10
+"#,
+        )?;
+        let install_root = root.join("runtime");
+        let broken_python = venv_python_path(&install_root);
+        fs::create_dir_all(broken_python.parent().expect("venv bin parent"))?;
+        fs::write(&broken_python, "#!/bin/sh\nexit 127\n")?;
+        fs::write(install_root.join("stale-marker"), "old")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
+            fs::set_permissions(&broken_python, fs::Permissions::from_mode(0o755))?;
+        }
+
+        ensure_python_venv(&launcher, &install_root)?;
+
+        assert!(!install_root.join("stale-marker").exists());
+        assert!(command_succeeds(
+            &venv_python_path(&install_root),
+            &["--version"]
+        ));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -3858,7 +3965,21 @@ mod tests {
             }
         }
         assert_eq!(launcher.source, "path");
-        assert_eq!(launcher.executable, PathBuf::from("python"));
+        assert!(
+            launcher.executable.is_absolute(),
+            "PATH launcher should resolve to an absolute executable: {}",
+            launcher.executable.display()
+        );
+        let launcher_path = launcher
+            .executable
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let expected_path = path_python
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        assert_eq!(launcher_path, expected_path);
         assert!(path_python.exists());
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -3871,7 +3992,7 @@ mod tests {
             name.to_owned()
         });
         let script = if cfg!(windows) {
-            "@echo off\r\nif \"%1\"==\"-c\" (echo cp312) else (echo Python 3.12.10)\r\n".to_owned()
+            "@echo off\r\nif \"%1\"==\"-c\" (echo cp312 & exit /b 0)\r\nif not \"%2\"==\"\" (echo cp312>\"%2\" & exit /b 0)\r\necho Python 3.12.10\r\n".to_owned()
         } else {
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo cp312; else echo Python 3.12.10; fi\n"
                 .to_owned()

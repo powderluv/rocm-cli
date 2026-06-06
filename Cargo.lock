@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "rocm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -1730,6 +1730,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "unicode-width 0.2.0",
  "ureq",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
@@ -1737,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -1750,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-atom"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1762,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-lemonade"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1775,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-llama-cpp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1787,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1795,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-pytorch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1810,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-sglang"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1822,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-vllm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1834,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "rocmd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

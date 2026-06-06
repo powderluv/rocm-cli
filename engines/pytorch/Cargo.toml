@@ -6,9 +6,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lib]
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
 async-stream.workspace = true

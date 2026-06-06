@@ -48,6 +48,9 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - The default feel should be a friendly control room for laymen, not a dry log
   viewer. Use plain labels, color, motion/progress, and focused review cards to
   make the next action obvious.
+- Verbosity is a hard no. First-view command output should be minimal and
+  plain-English. The only intentionally verbose surface is the foreground
+  install/progress card while pip or another installer is actively running.
 - The Home dashboard should use real arrow-key action rows plus a plain-English
   detail pane. Do not render Home as a transcript-like block with a handmade
   prompt marker.
@@ -77,7 +80,9 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - Prefer arrow-key lists, Enter actions, Esc back, and clear footer hints over
   requiring users to type subcommands.
 - When a screen has item actions such as install, remove, choose, stop,
-  restart, refresh, send, edit, or back, expose those as selectable rows.
+  restart, send, edit, or back, expose those as selectable rows.
+  Use F5 for ordinary refresh instead of adding a Refresh row, except on
+  screens where checking for updates is the main task.
   Letter shortcuts may exist, but they must not be required or be the main
   instruction.
 - Short-lived cards such as Help, Clear, and Quit must not replace the current
@@ -92,6 +97,10 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - First-time setup folder selection must be arrow-friendly. Left/Right on the
   folder row should cycle easy folder choices; Enter may still open manual text
   entry for users who need a custom path.
+- Folder pickers must also be mouse-friendly. Clicking a folder should select
+  or open it directly, and the chosen path should be shown as a full path.
+- Do not show internal launcher/cache/tool folders as attractive install
+  choices. Keep the default install path simple and user-owned.
 - Commands that send prompts or start provider work, such as `/chat <prompt>`,
   should show a review/send screen first unless the user is already in an
   explicit send action.
@@ -114,6 +123,11 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
   can run after the active work finishes.
 - Usage/error text in the TUI should be a plain fix in the relevant screen.
   Reserve raw command syntax for explicit help or non-TUI command output.
+- The `?` shortcut is contextual. It must not open command help while setup,
+  install progress, approval cards, or chat input own the screen.
+- Service lists in the TUI should show living services only by default. Failed
+  or stopped history belongs behind explicit logs/details or a non-TUI
+  `--all` style command.
 
 ## Command Navigability Baseline
 

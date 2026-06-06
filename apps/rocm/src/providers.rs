@@ -10,7 +10,7 @@ use std::time::Duration;
 
 pub(crate) const ROCM_TOOL_SCHEMA_ID: &str = "rocm-tools-v0";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ALIAS: &str = "qwen";
-pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-0.6B-GGUF";
+pub(crate) const LEMONADE_ASSISTANT_MODEL_ID: &str = "Qwen3-4B-Instruct-2507-GGUF";
 pub(crate) const BUILTIN_ASSISTANT_MODEL_ID: &str = LEMONADE_ASSISTANT_MODEL_ID;
 const LOCAL_PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(2);
