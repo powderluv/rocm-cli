@@ -305,7 +305,7 @@ pub(crate) fn runtime_path_for_child_process(path: &Path) -> String {
 }
 
 pub fn runtime_path_for_windows_child(path: &Path) -> String {
-    normalize_runtime_path_text_for_storage(&path.display().to_string())
+    normalize_windows_storage_path_text(&path.display().to_string())
 }
 
 pub fn runtime_path_for_child(path: &Path) -> String {

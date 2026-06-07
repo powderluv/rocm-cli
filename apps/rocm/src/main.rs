@@ -668,7 +668,7 @@ fn setup(command: Option<SetupCommand>) -> Result<()> {
     let mut config = RocmCliConfig::load(&paths)?;
     match command.unwrap_or(SetupCommand::Status) {
         SetupCommand::Status => {
-            print!("{}", render_setup_status_text(&config));
+            print!("{}", render_setup_status_text(&paths, &config)?);
         }
         SetupCommand::Reset => {
             print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
@@ -677,13 +677,54 @@ fn setup(command: Option<SetupCommand>) -> Result<()> {
     Ok(())
 }
 
-fn render_setup_status_text(config: &RocmCliConfig) -> String {
-    let state = if config.onboarding_dismissed {
-        "setup has been completed or dismissed"
+fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let active_manifest = config
+        .active_runtime_key
+        .as_deref()
+        .and_then(|runtime_key| {
+            manifests
+                .iter()
+                .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(runtime_key))
+        });
+    let active_ready = active_manifest
+        .is_some_and(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok());
+    let state = if config.setup.completed && active_ready {
+        "completed"
+    } else if config.setup.completed {
+        "completed; active runtime needs attention"
+    } else if active_ready {
+        "runtime ready; setup not completed"
+    } else if config.onboarding_dismissed {
+        "setup dismissed"
     } else {
         "first-time setup will show"
     };
-    format!("ROCm setup\n  status: {state}\n")
+
+    let mut output = String::new();
+    let _ = writeln!(output, "ROCm setup");
+    let _ = writeln!(output, "  status: {state}");
+    if let Some(root) = config.setup.therock_venv.as_ref() {
+        let _ = writeln!(output, "  install folder: {}", root.display());
+    }
+    if let Some(runtime_key) = config.active_runtime_key.as_deref() {
+        let _ = writeln!(output, "  active_runtime_key: {runtime_key}");
+    }
+    match active_manifest {
+        Some(manifest) => {
+            let _ = writeln!(output, "  active_runtime_id: {}", manifest.runtime_id);
+            let status = if active_ready { "ready" } else { "not_ready" };
+            let _ = writeln!(output, "  active_runtime_status: {status}");
+        }
+        None if config.active_runtime_key.is_some() => {
+            let _ = writeln!(output, "  active_runtime_status: missing_manifest");
+        }
+        None => {
+            let _ = writeln!(output, "  active_runtime_status: <unset>");
+        }
+    }
+    let _ = writeln!(output, "  help: run `rocm help` to see how to use rocm-cli");
+    Ok(output)
 }
 
 fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Result<String> {
@@ -1981,7 +2022,15 @@ fn install(target: InstallTarget) -> Result<()> {
                 dry_run,
             ) {
                 Ok(output) => {
+                    let finalized = if dry_run {
+                        None
+                    } else {
+                        finalize_successful_sdk_install(&paths)?
+                    };
                     print!("{output}");
+                    if let Some(finalized) = finalized {
+                        print_sdk_install_success(&finalized);
+                    }
                     record_cli_audit_event(
                         &paths,
                         "runtime",
@@ -5002,6 +5051,72 @@ fn import_runtime_manifest(
 }
 
 #[derive(Debug, Clone)]
+struct SdkInstallFinalization {
+    runtime_key: String,
+    install_root: PathBuf,
+}
+
+fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
+    print!("{}", render_sdk_install_success(finalized));
+}
+
+fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
+    format!(
+        "ROCm SDK installed successfully.\n  install folder: {}\n  active runtime: {}\n  next step: run `rocm help` to see how to use rocm-cli.\n",
+        finalized.install_root.display(),
+        finalized.runtime_key
+    )
+}
+
+fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstallFinalization>> {
+    let Some(manifest) = newest_installed_runtime_manifest(paths)? else {
+        return Ok(None);
+    };
+    let mut config = RocmCliConfig::load(paths)?;
+    config.setup.completed = true;
+    config.setup.therock_venv = Some(manifest.install_root.clone());
+    config.save(paths)?;
+
+    let activation_paths = paths
+        .clone()
+        .with_managed_root(manifest.install_root.clone(), false);
+    if paths.config_dir != activation_paths.config_dir
+        || paths.data_dir != activation_paths.data_dir
+    {
+        recover_setup_runtime_registration(paths, &config)?;
+        let mut current_config = RocmCliConfig::load(paths)?;
+        current_config.setup.completed = true;
+        current_config.setup.therock_venv = Some(manifest.install_root.clone());
+        let _ = activate_runtime(paths, &mut current_config, &manifest.runtime_key)?;
+    }
+
+    recover_setup_runtime_registration(&activation_paths, &config)?;
+
+    let mut config = RocmCliConfig::load(&activation_paths)?;
+    config.setup.completed = true;
+    config.setup.therock_venv = Some(manifest.install_root.clone());
+    let activation = activate_runtime(&activation_paths, &mut config, &manifest.runtime_key)?;
+
+    Ok(Some(SdkInstallFinalization {
+        runtime_key: activation.runtime_key,
+        install_root: manifest.install_root,
+    }))
+}
+
+fn newest_installed_runtime_manifest(
+    paths: &AppPaths,
+) -> Result<Option<therock::InstalledRuntimeManifest>> {
+    let mut manifests = therock::load_runtime_manifests(paths)?;
+    manifests.sort_by(|left, right| {
+        right
+            .installed_at_unix_ms
+            .cmp(&left.installed_at_unix_ms)
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+    });
+    Ok(manifests.into_iter().next())
+}
+
+#[derive(Debug, Clone)]
 struct AdoptRuntimeRequest {
     python_executable: PathBuf,
     install_root: PathBuf,
@@ -5928,7 +6043,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     if rocm_tools {
         messages.push(providers::ChatMessage {
             role: "system".to_owned(),
-            content: ROCM_CHAT_TOOL_SYSTEM_PROMPT.to_owned(),
+            content: rocm_chat_tool_system_prompt(),
         });
     }
     messages.push(providers::ChatMessage {
@@ -6936,6 +7051,11 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, SGLang, Lemonade, PyTorch, llama.cpp, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Doctor carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use doctor or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"pip\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM, SGLang, PyTorch, and Lemonade are general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For llama.cpp, use the llama.cpp engine backed by upstream llama-server: request rocm_command args like [\"engines\",\"install\",\"llama.cpp\"] or [\"serve\",\"MODEL.gguf\",\"--engine\",\"llama.cpp\",\"--device\",\"gpu_required\",\"--managed\"]. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
+
+fn rocm_chat_tool_system_prompt() -> String {
+    format!("{ROCM_CHAT_TOOL_SYSTEM_PROMPT}\n\nROCm CLI assistant skill:\n{ROCM_CHAT_TOOL_SKILL}")
+}
 
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -8764,11 +8884,12 @@ fn run_chat_port_status_tool(
         .and_then(serde_json::Value::as_u64)
         .context("port_status requires port")? as u16;
     let reachable = loopback_tcp_port_is_reachable(&host, port);
+    let host_key = loopback_host_key(&host);
     let matching_services = load_managed_services(paths)?
         .into_iter()
         .filter(|record| {
             record.port == port
-                && record.host.eq_ignore_ascii_case(&host)
+                && loopback_host_key(&record.host) == host_key
                 && managed_service_is_live(record)
         })
         .collect::<Vec<_>>();
@@ -8793,11 +8914,12 @@ fn run_chat_port_status_tool(
         for service in &matching_services {
             let _ = writeln!(
                 text,
-                "  - service_id={} engine={} model={} status={} endpoint={}",
+                "  - service_id={} engine={} model={} status={} running_state={} endpoint={}",
                 service.service_id,
                 service.engine,
                 service.model_ref,
                 service.status,
+                managed_service_running_state(&service.status),
                 service.endpoint_url
             );
         }
@@ -10480,12 +10602,6 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     }
     let _ = writeln!(output, "services:");
     for record in records {
-        let running_state = match record.status.as_str() {
-            "ready" | "running" => "running",
-            "starting" | "recovering" => "starting",
-            "failed" | "stopped" => "not_running",
-            _ => "unknown",
-        };
         let _ = writeln!(
             output,
             "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
@@ -10494,7 +10610,7 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
             record.model_ref,
             record.canonical_model_id,
             record.status,
-            running_state,
+            managed_service_running_state(&record.status),
             record.endpoint_url
         );
     }
@@ -11648,6 +11764,15 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
         record.status.as_str(),
         "ready" | "running" | "starting" | "recovering"
     )
+}
+
+fn managed_service_running_state(status: &str) -> &'static str {
+    match status {
+        "ready" | "running" => "running",
+        "starting" | "recovering" => "starting",
+        "failed" | "stopped" => "not_running",
+        _ => "unknown",
+    }
 }
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
@@ -13836,6 +13961,7 @@ fn app_path_env_vars(paths: &AppPaths) -> [(&'static str, &Path); 3] {
     ]
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn app_path_env_var_values(
     paths: &AppPaths,
     env_root: Option<&Path>,
@@ -13850,6 +13976,7 @@ fn app_path_env_var_values(
     vars
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'static str, &'a Path)> {
     vars.iter()
         .map(|(key, value)| (*key, value.as_path()))
@@ -15269,6 +15396,7 @@ mod tests {
 
     #[test]
     fn local_assistant_prompt_instructions_cover_core_support_questions() {
+        let prompt = rocm_chat_tool_system_prompt();
         for expected in [
             "is TheRock installed",
             "which GPU is on this machine",
@@ -15291,9 +15419,11 @@ mod tests {
             "qwen-smoke",
             "llama-server",
             "Do not invent shell commands",
+            "ROCm CLI Assistant Skill",
+            "Treat `localhost` and `127.0.0.1` as the same loopback endpoint",
         ] {
             assert!(
-                ROCM_CHAT_TOOL_SYSTEM_PROMPT.contains(expected),
+                prompt.contains(expected),
                 "system prompt should mention {expected}"
             );
         }
@@ -16352,6 +16482,48 @@ install therock";
     }
 
     #[test]
+    fn port_status_matches_loopback_managed_services() -> Result<()> {
+        let (root, paths) = test_paths("port-status-loopback");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-comfyui",
+            "comfyui",
+            "ComfyUI",
+            "ComfyUI",
+            "127.0.0.1",
+            18188,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let call = providers::ChatToolCall {
+            id: Some("port-check".to_owned()),
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": "localhost", "port": 18188 }),
+        };
+        let result = run_chat_port_status_tool(&paths, &call)?;
+        let text = mcp_tool_result_text(&result);
+        let managed_service_count = result
+            .get("structuredContent")
+            .and_then(|content| content.get("managed_services"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(managed_service_count, 1);
+        assert!(text.contains("managed_services:"), "{text}");
+        assert!(text.contains("service_id=svc-comfyui"), "{text}");
+        assert!(text.contains("running_state=starting"), "{text}");
+        Ok(())
+    }
+
+    #[test]
     fn fallback_tool_call_routes_simple_config_changes() {
         let show = fallback_rocm_tool_call_for_prompt("Show current ROCm CLI config").unwrap();
         assert_eq!(
@@ -17071,6 +17243,67 @@ install therock";
         assert!(!saved.setup.completed);
         assert!(saved.setup.therock_venv.is_some());
         assert!(saved.provider_enabled("openai"));
+        Ok(())
+    }
+
+    #[test]
+    fn setup_status_reports_completed_active_runtime() -> Result<()> {
+        let (root, paths) = test_paths("setup-status-completed-runtime");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-status",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            1,
+        )?;
+        let config = RocmCliConfig {
+            default_runtime_id: Some(manifest.runtime_id.clone()),
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            setup: rocm_core::SetupConfig {
+                completed: true,
+                therock_venv: Some(manifest.install_root.clone()),
+                cli_install_dir: None,
+            },
+            ..Default::default()
+        };
+
+        let rendered = render_setup_status_text(&paths, &config)?;
+
+        assert!(rendered.contains("status: completed"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "install folder: {}",
+                manifest.install_root.display()
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("active_runtime_key: release-pip-gfx120x-all-status"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("active_runtime_id: therock-release:gfx120X-all"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("active_runtime_status: ready"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rocm help"), "{rendered}");
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_status_reports_first_time_when_not_completed() -> Result<()> {
+        let (_root, paths) = test_paths("setup-status-first-time");
+        let config = RocmCliConfig::default();
+
+        let rendered = render_setup_status_text(&paths, &config)?;
+
+        assert!(rendered.contains("status: first-time setup will show"));
+        assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
 
@@ -17839,6 +18072,61 @@ VERSION_ID="41"
         let rendered = render_runtimes_text(&rebased_paths, &config)?;
         assert!(rendered.contains("release-pip-gfx120x-all-local-manifest"));
         assert!(rendered.contains("status=ready"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_install_finalization_activates_runtime_and_setup_root() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-finalized",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            42,
+        )?;
+
+        let finalized = finalize_successful_sdk_install(&paths)?
+            .context("sdk install finalization should select the installed runtime")?;
+        let rebased_paths = paths
+            .clone()
+            .with_managed_root(manifest.install_root.clone(), false);
+        let config = RocmCliConfig::load(&rebased_paths)?;
+
+        assert_eq!(finalized.runtime_key, manifest.runtime_key);
+        assert_eq!(
+            config.default_runtime_id.as_deref(),
+            Some(manifest.runtime_id.as_str())
+        );
+        assert!(config.setup.completed);
+        assert_eq!(
+            config.setup.therock_venv.as_deref(),
+            Some(manifest.install_root.as_path())
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(manifest.runtime_key.as_str())
+        );
+        assert_eq!(
+            config.default_runtime_id.as_deref(),
+            Some(manifest.runtime_id.as_str())
+        );
+        assert!(runtime_manifest_path(&rebased_paths, &manifest.runtime_key).is_file());
+        assert!(active_runtime_marker_path(&rebased_paths).is_file());
+
+        let success = render_sdk_install_success(&finalized);
+        assert!(success.contains("ROCm SDK installed successfully."));
+        assert!(success.contains("next step: run `rocm help`"));
+        assert!(success.contains(&manifest.install_root.display().to_string()));
+        assert!(!success.contains("config:"));
+        assert!(!success.contains("marker:"));
+
+        let mut doctor = String::new();
+        append_doctor_runtime_state(&mut doctor, &rebased_paths, &config)?;
+        assert!(doctor.contains("active_runtime_status: ready"));
+        assert!(doctor.contains("setup_runtime_root:"));
 
         let _ = fs::remove_dir_all(root);
         Ok(())

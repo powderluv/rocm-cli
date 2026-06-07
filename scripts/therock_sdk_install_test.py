@@ -477,6 +477,8 @@ def main() -> int:
     assert_contains(install_output, "python_executable:", "sdk install")
     assert_contains(install_output, "rocm_sdk_root:", "sdk install")
     assert_contains(install_output, "rocm_sdk_bin:", "sdk install")
+    assert_contains(install_output, "ROCm SDK installed successfully.", "sdk install")
+    assert_contains(install_output, "next step: run `rocm help`", "sdk install")
 
     manifest_path, manifest = discover_manifest(Path(env["ROCM_CLI_DATA_DIR"]))
     install_root = Path(str(manifest.get("install_root") or ""))

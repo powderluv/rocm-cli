@@ -284,7 +284,7 @@ def rocm_cli_state_paths() -> tuple[Path, Path]:
         data_base = (
             Path(data_dir)
             if data_dir
-            else default_rocm_cli_data_dir()
+            else default_rocm_cli_data_dir(config_base)
         )
         return (
             config_base / "config.json",
@@ -292,7 +292,7 @@ def rocm_cli_state_paths() -> tuple[Path, Path]:
         )
     return (
         default_rocm_cli_config_dir() / "config.json",
-        default_rocm_cli_data_dir() / "runtimes" / "registry",
+        default_rocm_cli_data_dir(default_rocm_cli_config_dir()) / "runtimes" / "registry",
     )
 
 
@@ -300,7 +300,17 @@ def default_rocm_cli_config_dir() -> Path:
     return Path.home() / ".rocm"
 
 
-def default_rocm_cli_data_dir() -> Path:
+def default_rocm_cli_data_dir(config_base: Path) -> Path:
+    config_path = config_base / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return Path.home() / ".rocm"
+    setup = config.get("setup")
+    if isinstance(setup, dict):
+        therock_venv = setup.get("therock_venv")
+        if isinstance(therock_venv, str) and therock_venv.strip():
+            return Path(therock_venv).expanduser()
     return Path.home() / ".rocm"
 
 

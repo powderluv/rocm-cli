@@ -6,7 +6,7 @@ use rocm_core::{
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
-    runtime_path_for_child, runtime_path_list_split, runtime_python_executable_in_env,
+    runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
     unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
@@ -2500,7 +2500,7 @@ fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
 }
 
 fn windows_child_path(path: &Path) -> String {
-    runtime_path_for_child(path)
+    runtime_path_for_windows_child(path)
 }
 
 fn curl_child_path(path: &Path) -> String {

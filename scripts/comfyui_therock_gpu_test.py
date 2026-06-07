@@ -62,6 +62,7 @@ def main() -> int:
     env = os.environ.copy()
     temp_state_root: Path | None = None
     started_pid: int | None = None
+    started_service = False
     try:
         if args.temp_state:
             temp_state_root = Path(tempfile.mkdtemp(prefix="rocm-cli-comfyui-state-"))
@@ -113,6 +114,7 @@ def main() -> int:
         print_step("Starting ComfyUI in GPU-required mode.")
         start_output = run_text(start_command, env=env, timeout=args.timeout)
         print(start_output, end="" if start_output.endswith("\n") else "\n")
+        started_service = True
         assert_start_output(start_output, args.host, args.port)
         started_pid = parse_pid(start_output)
 
@@ -157,9 +159,21 @@ def main() -> int:
         )
         )
     finally:
-        if started_pid and not args.keep_running:
-            print_step(f"Stopping ComfyUI process {started_pid}.")
-            stop_pid(started_pid)
+        if started_service and not args.keep_running:
+            print_step("Stopping ComfyUI through ROCm CLI.")
+            try:
+                stop_output = run_text(
+                    build_rocm_command(args, rocm, "comfyui", "stop"),
+                    env=env,
+                    timeout=args.timeout,
+                )
+                print(stop_output, end="" if stop_output.endswith("\n") else "\n")
+            except Exception as error:
+                if started_pid:
+                    print_step(f"ROCm CLI stop failed; stopping process {started_pid}.")
+                    stop_pid(started_pid)
+                else:
+                    print_step(f"ROCm CLI stop failed: {error}")
         if temp_state_root is not None and not args.keep_state:
             print_step(f"Removing temporary ROCm CLI state under {temp_state_root}.")
             shutil.rmtree(temp_state_root, ignore_errors=True)
@@ -855,7 +869,11 @@ def download_generated_image(
 
 
 def assert_install_output(output: str) -> None:
-    require_contains(output, "AMD GPU check: ready", "install output")
+    require_any_contains(
+        output,
+        ["AMD GPU check: ready", "AMD GPU: ready"],
+        "install output",
+    )
     require_contains(output, "next step: rocm comfyui start", "install output")
     reject_cpu_fallback(output, "install output")
 
@@ -864,10 +882,12 @@ def assert_start_output(output: str, host: str, port: int) -> None:
     if "status: running" not in output:
         require_contains(output, "status: starting", "start output")
     require_contains(output, "AMD GPU check: ready", "start output")
-    require_contains(output, f"url: http://{host}:{port}", "start output")
+    require_any_contains(
+        output,
+        [f"url: http://{host}:{port}", f"URL: http://{host}:{port}"],
+        "start output",
+    )
     require_contains(output, "browser: not opened", "start output")
-    if parse_pid(output) is None:
-        raise RuntimeError(f"start output did not include a process id:\n{output}")
     reject_cpu_fallback(output, "start output")
 
 
@@ -889,6 +909,12 @@ def assert_logs_output(output: str) -> None:
 def require_contains(output: str, needle: str, label: str) -> None:
     if needle not in output:
         raise RuntimeError(f"{label} did not contain `{needle}`:\n{output}")
+
+
+def require_any_contains(output: str, needles: list[str], label: str) -> None:
+    if not any(needle in output for needle in needles):
+        joined = "`, `".join(needles)
+        raise RuntimeError(f"{label} did not contain one of `{joined}`:\n{output}")
 
 
 def reject_cpu_fallback(output: str, label: str) -> None:
@@ -943,9 +969,20 @@ def run_self_test() -> int:
         "ComfyUI\n  installed: yes\n  AMD GPU check: ready (1 device)\n"
         "  next step: rocm comfyui start\n"
     )
+    assert_install_output(
+        "ComfyUI\n  installed: yes\n  AMD GPU: ready (1 device)\n"
+        "  next step: rocm comfyui start\n"
+    )
     assert_start_output(
         "ComfyUI\n  status: starting\n  AMD GPU check: ready (1 device)\n"
         "  url: http://127.0.0.1:18188\n  browser: not opened (--no-open-browser)\n"
+        "  pid: 12345\n",
+        "127.0.0.1",
+        18188,
+    )
+    assert_start_output(
+        "ComfyUI\n  status: starting\n  AMD GPU check: ready (1 device)\n"
+        "  URL: http://127.0.0.1:18188\n  browser: not opened (--no-open-browser)\n"
         "  pid: 12345\n",
         "127.0.0.1",
         18188,
