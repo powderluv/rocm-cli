@@ -11750,6 +11750,13 @@ fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -
         return false;
     }
 
+    let endpoint_ready = matches!(record.status.as_str(), "ready" | "running")
+        && managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
+            .unwrap_or(false);
+    if endpoint_ready {
+        return false;
+    }
+
     let tracked_pids = [record.engine_pid, Some(record.supervisor_pid)]
         .into_iter()
         .flatten()
@@ -11765,10 +11772,7 @@ fn refresh_managed_service_runtime_liveness(record: &mut ManagedServiceRecord) -
         return false;
     }
 
-    if matches!(record.status.as_str(), "ready" | "running")
-        && !managed_service_endpoint_model_ready(record, SERVICE_LIVENESS_CHECK_TIMEOUT)
-            .unwrap_or(false)
-    {
+    if matches!(record.status.as_str(), "ready" | "running") {
         let new_status = if has_live_pid { "starting" } else { "stopped" };
         if record.status != new_status {
             record.status = new_status.to_owned();
@@ -16881,7 +16885,7 @@ install therock";
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             Some("therock-release".to_owned()),
             None,
             Some("gpu_preferred".to_owned()),
@@ -16899,7 +16903,7 @@ install therock";
         assert!(rendered.contains("Service Log"));
         assert!(rendered.contains("Service: svc_qwen35_primary"));
         assert!(rendered.contains("Engine: pytorch"));
-        assert!(rendered.contains("Status: ready"));
+        assert!(rendered.contains("Status: starting"));
         assert!(rendered.contains("File locations: shown"));
         assert!(rendered.contains(&format!(
             "  Details file: {}",

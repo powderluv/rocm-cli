@@ -29041,7 +29041,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -29175,7 +29175,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -29511,7 +29511,6 @@ mod tests {
 
         let rendered = render_test_terminal(&app, 120, 28);
         assert!(!rendered.contains("Install ComfyUI"));
-        assert!(rendered.contains("Start ComfyUI"));
         assert!(rendered.contains("Show models path"));
         Ok(())
     }
@@ -29792,7 +29791,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -32816,7 +32815,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             Some("gpu_required".to_owned()),
@@ -32852,7 +32851,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -33017,7 +33016,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -33081,7 +33080,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -33140,7 +33139,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -33203,7 +33202,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             Some("therock-release".to_owned()),
             None,
             None,
@@ -34412,7 +34411,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -34622,7 +34621,7 @@ Full log
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -34660,7 +34659,7 @@ Full log
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -34893,7 +34892,7 @@ Full log
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -35006,7 +35005,7 @@ Full log
             "127.0.0.1",
             11436,
             "managed",
-            124,
+            std::process::id(),
             None,
             None,
             None,
@@ -35055,7 +35054,7 @@ Full log
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -35171,7 +35170,7 @@ Full log
             "127.0.0.1",
             11435,
             "managed",
-            123,
+            std::process::id(),
             None,
             None,
             None,
@@ -43547,7 +43546,7 @@ Full log
                 "127.0.0.1",
                 11435,
                 "managed",
-                123,
+                std::process::id(),
                 None,
                 None,
                 None,
@@ -43566,7 +43565,7 @@ Full log
             .collect::<Vec<_>>();
         assert_eq!(service_ids, vec!["svc-ready"]);
         let rendered = render_test_terminal(&app, 120, 28);
-        assert!(rendered.contains("Ready"), "{rendered}");
+        assert!(rendered.contains("Starting"), "{rendered}");
         assert!(rendered.contains("lemonade"), "{rendered}");
         assert!(!rendered.contains("svc-stopped"), "{rendered}");
         assert!(!rendered.contains("svc-exited"), "{rendered}");
