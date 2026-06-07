@@ -38,7 +38,7 @@ use rocm_core::{
     WatcherMode, append_audit_event, builtin_watcher, builtin_watchers, current_executable_path,
     daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary,
     find_automation_proposal, format_host_for_url, format_host_port, format_http_base_url,
-    load_model_recipe_registry, load_recent_automation_proposals,
+    load_model_recipe_registry, load_recent_automation_proposals, managed_pip_cache_dir,
     managed_service_endpoint_model_ready, replace_automation_proposal, runtime_is_windows,
     runtime_python_bin_dir_name, runtime_python_executable_name, sanitize_component,
     unix_time_millis, update_automation_proposal_status,
@@ -14012,7 +14012,7 @@ fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
 }
 
 fn setup_pip_cache_dir(paths: &AppPaths, config: &RocmCliConfig) -> PathBuf {
-    setup_install_root(paths, config).join("pip-cache")
+    managed_pip_cache_dir(&setup_install_root(paths, config))
 }
 
 fn venv_python_path(venv_path: &std::path::Path) -> PathBuf {
@@ -23594,7 +23594,7 @@ fn install_sdk_detail_text(app: &App) -> String {
     let _ = writeln!(
         output,
         "  {}",
-        display_runtime_folder_path(&std::path::Path::new(folder).join("pip-cache"))
+        display_runtime_folder_path(&managed_pip_cache_dir(std::path::Path::new(folder)))
     );
     let _ = writeln!(output);
     let _ = writeln!(output, "Selected row");
@@ -25099,7 +25099,7 @@ fn plain_cli_approval_lines_with_gpu(
                 if cli_arg_value(args, "--format").unwrap_or("pip") == "pip" {
                     lines.push(format!(
                         "Downloaded files: {}",
-                        display_runtime_folder_path(&Path::new(folder).join("pip-cache"))
+                        display_runtime_folder_path(&managed_pip_cache_dir(Path::new(folder)))
                     ));
                 }
             }

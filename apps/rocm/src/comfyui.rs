@@ -2,7 +2,7 @@ use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path, format_http_base_url,
+    AppPaths, RocmCliConfig, download_file_to_path, format_http_base_url, managed_pip_cache_dir,
     runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
     runtime_path_for_windows_child, unix_time_millis,
 };
@@ -373,7 +373,7 @@ pub(crate) fn install(
     let runtime = select_runtime(paths, config, options.runtime_id.as_deref())?;
     let app_root = runtime_app_root(&runtime.manifest);
     let source_path = source_path_from_app_root(&app_root);
-    let pip_cache = app_root.join("pip-cache");
+    let pip_cache = managed_pip_cache_dir(&app_root);
     let log_path = install_log_path_from_app_root(&app_root);
     let requirements_path = source_path.join("requirements.txt");
     let models_folder = models_folder_for_source(&source_path);

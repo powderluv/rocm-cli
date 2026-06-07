@@ -2,10 +2,11 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_therock_family,
-    detect_managed_therock_family, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_python_bin_dir_name, runtime_python_executable_name, unix_time_millis,
+    detect_managed_therock_family, managed_pip_cache_dir, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_python_bin_dir_name,
+    runtime_python_executable_name, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -2966,11 +2967,11 @@ fn pip_cache_dir_with_override(
     install_root: &Path,
     _env_override: Option<PathBuf>,
 ) -> PathBuf {
-    install_root.join("pip-cache")
+    managed_pip_cache_dir(install_root)
 }
 
 fn managed_tools_root(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("tools")
+    managed_tools_dir(&paths.data_dir)
 }
 
 fn managed_python_manifest_path(paths: &AppPaths) -> PathBuf {

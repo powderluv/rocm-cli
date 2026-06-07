@@ -17,9 +17,9 @@ use rocm_core::{
     engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
     generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_service_endpoint_model_ready, model_artifact_cache_status, process_is_running,
-    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
-    sibling_binary_path, write_all_tcp_stream,
+    managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
+    process_is_running, read_tcp_stream_to_string, resolve_builtin_model_recipe,
+    resolve_model_recipe, sibling_binary_path, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -9222,7 +9222,7 @@ fn append_doctor_runtime_state(
         let pip_cache_dir = manifest
             .pip_cache_dir
             .clone()
-            .unwrap_or_else(|| manifest.install_root.join("pip-cache"));
+            .unwrap_or_else(|| managed_pip_cache_dir(&manifest.install_root));
         let _ = writeln!(
             output,
             "  active_runtime_pip_cache_dir: {}",
@@ -9246,7 +9246,7 @@ fn append_doctor_runtime_state(
         let _ = writeln!(
             output,
             "  setup_runtime_pip_cache_dir: {}",
-            setup_root.join("pip-cache").display()
+            managed_pip_cache_dir(setup_root).display()
         );
     }
     let keys = if manifests.is_empty() {

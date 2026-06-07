@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -31,6 +30,22 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
     WaitForSingleObject,
 };
+
+pub mod runtime;
+#[cfg(test)]
+use runtime::home_rocm_dir;
+pub use runtime::{
+    RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
+    default_data_dir, managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir,
+    managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, runtime_exe_suffix,
+    runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    runtime_path_for_windows_child, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_python_bin_dir_name,
+    runtime_python_executable_name,
+};
+use runtime::{env_path_override, runtime_path_for_child_process};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
@@ -129,22 +144,6 @@ fn download_file_with_curl(url: &str, destination: &Path, timeout: Duration) -> 
         "curl download failed for {url} with status {status}: {}",
         stderr.trim()
     )
-}
-
-fn runtime_path_for_child_process(path: &Path) -> String {
-    if runtime_is_windows() {
-        runtime_path_for_windows_child(path)
-    } else {
-        path.display().to_string()
-    }
-}
-
-pub fn runtime_path_for_windows_child(path: &Path) -> String {
-    normalize_runtime_path_text_for_storage(&path.display().to_string())
-}
-
-pub fn runtime_is_cosmopolitan_windows() -> bool {
-    runtime_is_windows() && std::path::MAIN_SEPARATOR == '/'
 }
 
 pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
@@ -736,36 +735,19 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn discover() -> Result<Self> {
-        let project_dirs = ProjectDirs::from("com", "powderluv", "rocm-cli");
-        let home_rocm = home_rocm_dir();
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
         let mut paths = Self {
             config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
-                .or_else(|| home_rocm.clone())
-                .or_else(|| {
-                    project_dirs
-                        .as_ref()
-                        .map(|dirs| dirs.config_dir().to_path_buf())
-                })
+                .or_else(default_config_dir)
                 .context("unable to determine config directory for rocm-cli")?,
             data_dir: data_dir_override
                 .clone()
-                .or_else(|| home_rocm.clone())
-                .or_else(|| {
-                    project_dirs
-                        .as_ref()
-                        .map(|dirs| dirs.data_dir().to_path_buf())
-                })
+                .or_else(default_data_dir)
                 .context("unable to determine data directory for rocm-cli")?,
             cache_dir: cache_dir_override
                 .clone()
-                .or_else(|| home_rocm.clone().map(|dir| dir.join("cache")))
-                .or_else(|| {
-                    project_dirs
-                        .as_ref()
-                        .map(|dirs| dirs.cache_dir().to_path_buf())
-                })
+                .or_else(default_cache_dir)
                 .context("unable to determine cache directory for rocm-cli")?,
         }
         .normalize_for_host();
@@ -787,7 +769,7 @@ impl AppPaths {
     pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
         self.data_dir = normalize_runtime_path_for_host(&root.into());
         if !keep_cache_dir {
-            self.cache_dir = self.data_dir.join("cache");
+            self.cache_dir = managed_runtime_cache_dir(&self.data_dir);
         }
         self.normalize_for_host()
     }
@@ -911,32 +893,6 @@ pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
     ]
 }
 
-fn env_path_override(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-fn home_rocm_dir() -> Option<PathBuf> {
-    if runtime_is_windows() {
-        if let Some(profile) = std::env::var_os("USERPROFILE")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-        {
-            return Some(profile.join(".rocm"));
-        }
-        if let (Some(drive), Some(path)) = (
-            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
-            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
-        ) {
-            let mut home = PathBuf::from(drive);
-            home.push(path);
-            return Some(home.join(".rocm"));
-        }
-    }
-    BaseDirs::new().map(|dirs| dirs.home_dir().join(".rocm"))
-}
-
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -946,121 +902,6 @@ fn env_flag(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RuntimePlatform {
-    Windows,
-    Linux,
-    Other(&'static str),
-}
-
-impl RuntimePlatform {
-    pub fn current() -> Self {
-        #[cfg(target_vendor = "cosmo")]
-        {
-            if cosmo_hostos_has(COSMO_HOST_WINDOWS) {
-                return Self::Windows;
-            }
-            if cosmo_hostos_has(COSMO_HOST_LINUX) {
-                return Self::Linux;
-            }
-        }
-
-        if cfg!(windows) {
-            Self::Windows
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
-        } else {
-            Self::Other(std::env::consts::OS)
-        }
-    }
-
-    pub fn os_name(self) -> &'static str {
-        match self {
-            Self::Windows => "windows",
-            Self::Linux => "linux",
-            Self::Other(os) => os,
-        }
-    }
-
-    pub fn is_windows(self) -> bool {
-        matches!(self, Self::Windows)
-    }
-
-    pub fn is_linux(self) -> bool {
-        matches!(self, Self::Linux)
-    }
-}
-
-pub fn runtime_is_windows() -> bool {
-    RuntimePlatform::current().is_windows()
-}
-
-pub fn runtime_is_linux() -> bool {
-    RuntimePlatform::current().is_linux()
-}
-
-pub fn runtime_os_name() -> &'static str {
-    RuntimePlatform::current().os_name()
-}
-
-pub fn runtime_exe_suffix() -> &'static str {
-    if runtime_is_windows() { ".exe" } else { "" }
-}
-
-pub fn runtime_python_bin_dir_name() -> &'static str {
-    if runtime_is_windows() {
-        "Scripts"
-    } else {
-        "bin"
-    }
-}
-
-pub fn runtime_python_executable_name() -> &'static str {
-    if runtime_is_windows() {
-        "python.exe"
-    } else {
-        "python"
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum RuntimePathSeparator {
-    Native,
-    Slash,
-    Backslash,
-}
-
-impl RuntimePathSeparator {
-    fn separator(self) -> char {
-        match self {
-            Self::Native if std::path::MAIN_SEPARATOR == '\\' => '\\',
-            Self::Native => '/',
-            Self::Slash => '/',
-            Self::Backslash => '\\',
-        }
-    }
-}
-
-#[cfg(target_vendor = "cosmo")]
-const COSMO_HOST_LINUX: i32 = 1;
-
-#[cfg(target_vendor = "cosmo")]
-const COSMO_HOST_WINDOWS: i32 = 4;
-
-#[cfg(target_vendor = "cosmo")]
-unsafe extern "C" {
-    static __hostos: i32;
-}
-
-#[cfg(target_vendor = "cosmo")]
-fn cosmo_hostos_has(mask: i32) -> bool {
-    // Cosmopolitan exposes the active host through libc/dce.h. Calling it
-    // directly keeps the Rust APE tied to Cosmopolitan's runtime instead of a
-    // repo-local C compatibility shim.
-    unsafe { (__hostos & mask) != 0 }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5377,260 +5218,6 @@ pub fn daemon_binary_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-pub fn current_executable_path() -> Result<PathBuf> {
-    if cfg!(target_vendor = "cosmo")
-        && let Ok(path) = current_executable_path_from_argv0()
-    {
-        return Ok(path);
-    }
-    match std::env::current_exe() {
-        Ok(path) if current_exe_is_cosmopolitan_loader(&path) => {
-            current_executable_path_from_argv0().or(Ok(path))
-        }
-        Ok(path) => Ok(path),
-        Err(current_exe_error) => current_executable_path_from_argv0()
-            .with_context(|| format!("failed to discover current executable: {current_exe_error}")),
-    }
-}
-
-fn current_exe_is_cosmopolitan_loader(path: &Path) -> bool {
-    if !cfg!(target_vendor = "cosmo") {
-        return false;
-    }
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| matches!(name, "ape" | "ape-x86_64.elf" | "ape-aarch64.elf"))
-        .unwrap_or(false)
-}
-
-fn current_executable_path_from_argv0() -> Result<PathBuf> {
-    let argv0 = std::env::args_os()
-        .next()
-        .context("current process argv[0] is unavailable")?;
-    let current_dir = std::env::current_dir().ok();
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    current_executable_path_from_argv0_value(
-        argv0.as_os_str(),
-        current_dir.as_deref(),
-        Some(path_var.as_os_str()),
-        cfg!(target_vendor = "cosmo"),
-    )
-}
-
-fn current_executable_path_from_argv0_value(
-    argv0: &OsStr,
-    current_dir: Option<&Path>,
-    path_var: Option<&OsStr>,
-    prefer_current_dir_file: bool,
-) -> Result<PathBuf> {
-    let argv0_text = argv0.to_string_lossy().trim().to_owned();
-    if argv0_text.is_empty() {
-        bail!("current process argv[0] is empty");
-    }
-    if runtime_path_text_is_absolute(&argv0_text) {
-        return Ok(PathBuf::from(normalize_runtime_path_text(&argv0_text)));
-    }
-
-    let looks_path_like = argv0_text.contains('/')
-        || argv0_text.contains('\\')
-        || argv0_text.starts_with('.')
-        || argv0_text.starts_with('~');
-    if looks_path_like && let Some(current_dir) = current_dir {
-        return Ok(normalize_runtime_join_path(current_dir, &argv0_text));
-    }
-
-    if prefer_current_dir_file
-        && let Some(current_dir) = current_dir
-        && let Some(candidate) = runtime_executable_search_candidates(current_dir, &argv0_text)
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-    {
-        return Ok(candidate);
-    }
-
-    let path_var = path_var.map(OsString::from).unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        for candidate in runtime_executable_search_candidates(&dir, &argv0_text) {
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    if let Some(current_dir) = current_dir {
-        return Ok(normalize_runtime_join_path(current_dir, &argv0_text));
-    }
-
-    bail!("unable to resolve current executable from argv[0]: {argv0_text}");
-}
-
-fn runtime_executable_search_candidates(dir: &Path, argv0: &str) -> Vec<PathBuf> {
-    let normalized = normalize_runtime_path_text(argv0);
-    let mut candidates = vec![normalize_runtime_join_path(dir, &normalized)];
-    if runtime_is_windows()
-        && Path::new(argv0).extension().is_none()
-        && !normalized.to_ascii_lowercase().ends_with(".exe")
-    {
-        candidates.push(normalize_runtime_join_path(
-            dir,
-            &format!("{normalized}.exe"),
-        ));
-    }
-    candidates
-}
-
-fn normalize_runtime_join_path(base: &Path, child: &str) -> PathBuf {
-    let child = normalize_runtime_path_text(child);
-    if runtime_path_text_is_absolute(&child) {
-        return PathBuf::from(child);
-    }
-    if runtime_is_windows() && std::path::MAIN_SEPARATOR == '/' {
-        let base = normalize_runtime_path_text(&base.display().to_string());
-        return PathBuf::from(format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            child.trim_start_matches('/')
-        ));
-    }
-    base.join(child)
-}
-
-fn normalize_runtime_path_text(value: &str) -> String {
-    normalize_runtime_path_text_for_platform(value, RuntimePlatform::current())
-}
-
-pub fn normalize_runtime_path_for_host(path: &Path) -> PathBuf {
-    PathBuf::from(normalize_runtime_path_text(&path.display().to_string()))
-}
-
-pub fn normalize_runtime_path_text_for_host(value: &str) -> String {
-    normalize_runtime_path_text(value)
-}
-
-pub fn normalize_runtime_path_for_storage(path: &Path) -> PathBuf {
-    PathBuf::from(normalize_runtime_path_text_for_storage(
-        &path.display().to_string(),
-    ))
-}
-
-pub fn normalize_runtime_path_text_for_storage(value: &str) -> String {
-    if runtime_is_windows() {
-        normalize_windows_storage_path_text(value)
-    } else {
-        value.to_owned()
-    }
-}
-
-fn normalize_windows_runtime_path_text(value: &str) -> String {
-    normalize_windows_runtime_path_text_with_separator(value, RuntimePathSeparator::Native)
-}
-
-fn normalize_runtime_path_text_for_platform(value: &str, platform: RuntimePlatform) -> String {
-    if platform.is_windows() {
-        normalize_windows_runtime_path_text(value)
-    } else {
-        value.to_owned()
-    }
-}
-
-fn normalize_windows_runtime_path_text_with_separator(
-    value: &str,
-    separator: RuntimePathSeparator,
-) -> String {
-    let value = value.trim();
-    let forward = value.replace('\\', "/");
-    let forward_bytes = forward.as_bytes();
-    if forward_bytes.len() >= 2
-        && forward_bytes[0] == b'/'
-        && forward_bytes[1].is_ascii_alphabetic()
-        && (forward_bytes.len() == 2 || forward_bytes[2] == b'/')
-    {
-        let drive = (forward_bytes[1] as char).to_ascii_uppercase();
-        let rest = if forward_bytes.len() > 3 {
-            forward[3..].trim_start_matches('/')
-        } else {
-            ""
-        };
-        return format_windows_drive_path(drive, rest, separator);
-    }
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        let drive = (bytes[0] as char).to_ascii_uppercase();
-        let rest = value[2..].replace('\\', "/");
-        let rest = rest.trim_start_matches('/');
-        return format_windows_drive_path(drive, rest, separator);
-    }
-    if let Some(rest) = forward.strip_prefix("//") {
-        return format_windows_unc_path(rest, separator);
-    }
-    match separator.separator() {
-        '/' => value.replace('\\', "/"),
-        '\\' => value.replace('/', "\\"),
-        _ => value.to_owned(),
-    }
-}
-
-fn normalize_windows_storage_path_text(value: &str) -> String {
-    normalize_windows_runtime_path_text_with_separator(value, RuntimePathSeparator::Backslash)
-}
-
-fn format_windows_drive_path(drive: char, rest: &str, separator: RuntimePathSeparator) -> String {
-    let separator = separator.separator();
-    if rest.is_empty() {
-        return format!("{drive}:{separator}");
-    }
-    let rest = match separator {
-        '\\' => rest.replace('/', "\\"),
-        _ => rest.to_owned(),
-    };
-    format!("{drive}:{separator}{rest}")
-}
-
-fn format_windows_unc_path(rest: &str, separator: RuntimePathSeparator) -> String {
-    match separator.separator() {
-        '\\' => format!(r"\\{}", rest.replace('/', "\\")),
-        _ => format!("//{rest}"),
-    }
-}
-
-fn runtime_path_text_is_absolute(value: &str) -> bool {
-    runtime_path_text_is_absolute_for_platform(value, RuntimePlatform::current())
-}
-
-pub fn runtime_path_text_is_absolute_for_host(value: &str) -> bool {
-    runtime_path_text_is_absolute(value)
-}
-
-pub fn runtime_path_text_is_absolute_for_platform(value: &str, platform: RuntimePlatform) -> bool {
-    if platform.is_windows() {
-        windows_runtime_path_text_is_absolute(value)
-    } else {
-        value.trim().starts_with('/')
-    }
-}
-
-fn windows_runtime_path_text_is_absolute(value: &str) -> bool {
-    let normalized = normalize_windows_runtime_path_text(value);
-    let bytes = normalized.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
-    {
-        return true;
-    }
-    let unc = normalized.replace('\\', "/");
-    if !unc.starts_with("//") {
-        return false;
-    }
-    let mut parts = unc.split('/').filter(|part| !part.is_empty());
-    parts.next().is_some() && parts.next().is_some()
-}
-
-pub fn platform_binary_name(binary_name: &str) -> String {
-    format!("{binary_name}{}", runtime_exe_suffix())
-}
-
 pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
     let model_slug = sanitize_component(model_ref)
         .trim_matches('-')
@@ -5706,16 +5293,6 @@ mod tests {
         let request = server.join().expect("server thread should not panic")?;
         assert!(request.starts_with("GET /v1/models HTTP/1.1"));
         Ok(())
-    }
-
-    #[test]
-    fn platform_binary_name_adds_windows_suffix_only_on_windows() {
-        let name = platform_binary_name("rocm");
-        if cfg!(windows) {
-            assert_eq!(name, "rocm.exe");
-        } else {
-            assert_eq!(name, "rocm");
-        }
     }
 
     #[test]
@@ -7020,54 +6597,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_windows_paths_accept_mixed_drive_separators() {
-        if !runtime_is_windows() {
-            return;
-        }
-
-        let path = normalize_windows_runtime_path_text(r"D:\/jam/temp/therock_venvs");
-
-        assert!(windows_runtime_path_text_is_absolute(&path));
-        if std::path::MAIN_SEPARATOR == '\\' {
-            assert_eq!(path, r"D:\jam\temp\therock_venvs");
-        } else {
-            assert_eq!(path, "D:/jam/temp/therock_venvs");
-        }
-    }
-
-    #[test]
-    fn runtime_windows_paths_accept_universal_drive_prefixes() {
-        if !runtime_is_windows() {
-            return;
-        }
-
-        let path = normalize_windows_runtime_path_text("/D/jam/temp/therock_venvs");
-
-        assert!(windows_runtime_path_text_is_absolute(&path));
-        if std::path::MAIN_SEPARATOR == '\\' {
-            assert_eq!(path, r"D:\jam\temp\therock_venvs");
-        } else {
-            assert_eq!(path, "D:/jam/temp/therock_venvs");
-        }
-    }
-
-    #[test]
-    fn runtime_windows_storage_paths_use_native_drive_syntax() {
-        if !runtime_is_windows() {
-            return;
-        }
-
-        assert_eq!(
-            normalize_runtime_path_text_for_storage("/D/jam/temp/therock_venvs"),
-            r"D:\jam\temp\therock_venvs"
-        );
-        assert_eq!(
-            normalize_runtime_path_text_for_storage("D:/jam/temp/therock_venvs"),
-            r"D:\jam\temp\therock_venvs"
-        );
-    }
-
-    #[test]
     fn cosmopolitan_windows_runtime_path_join_preserves_drive_colons() {
         if !runtime_is_windows() {
             return;
@@ -7084,144 +6613,6 @@ mod tests {
         assert!(joined.contains(r"D:\ROCm\bin"));
         assert!(!joined.contains(r"C;\Tools"));
         assert!(!joined.contains(r"D;\ROCm"));
-    }
-
-    #[test]
-    fn runtime_windows_paths_normalize_relative_backslashes_for_unix_separator_runtime() {
-        if !runtime_is_windows() || std::path::MAIN_SEPARATOR != '/' {
-            return;
-        }
-
-        assert_eq!(
-            normalize_windows_runtime_path_text(r".\rocm.exe"),
-            "./rocm.exe"
-        );
-    }
-
-    #[test]
-    fn runtime_path_normalization_accepts_windows_drive_forms() {
-        let cases = [
-            (r"D:\jam\temp\therock_venvs", "D:/jam/temp/therock_venvs"),
-            ("D:/jam/temp/therock_venvs", "D:/jam/temp/therock_venvs"),
-            (r"D:\/jam/temp/therock_venvs", "D:/jam/temp/therock_venvs"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(
-                normalize_windows_runtime_path_text_with_separator(
-                    input,
-                    RuntimePathSeparator::Slash
-                ),
-                expected
-            );
-            assert!(runtime_path_text_is_absolute_for_platform(
-                input,
-                RuntimePlatform::Windows
-            ));
-        }
-    }
-
-    #[test]
-    fn runtime_path_normalization_accepts_windows_unc_forms() {
-        assert_eq!(
-            normalize_windows_runtime_path_text_with_separator(
-                r"\\server\share\rocm",
-                RuntimePathSeparator::Slash
-            ),
-            "//server/share/rocm"
-        );
-        assert_eq!(
-            normalize_windows_runtime_path_text_with_separator(
-                "//server/share/rocm",
-                RuntimePathSeparator::Backslash
-            ),
-            r"\\server\share\rocm"
-        );
-        assert!(runtime_path_text_is_absolute_for_platform(
-            r"\\server\share\rocm",
-            RuntimePlatform::Windows
-        ));
-    }
-
-    #[test]
-    fn runtime_path_normalization_keeps_wsl_paths_linux_native() {
-        let wsl_path = "/mnt/d/jam/temp/therock_venvs";
-        assert_eq!(
-            normalize_runtime_path_text_for_platform(wsl_path, RuntimePlatform::Linux),
-            wsl_path
-        );
-        assert!(runtime_path_text_is_absolute_for_platform(
-            wsl_path,
-            RuntimePlatform::Linux
-        ));
-    }
-
-    #[test]
-    fn runtime_path_normalization_does_not_treat_windows_drive_as_linux_absolute() {
-        let windows_path = r"D:\jam\temp\therock_venvs";
-        assert_eq!(
-            normalize_runtime_path_text_for_platform(windows_path, RuntimePlatform::Linux),
-            windows_path
-        );
-        assert!(!runtime_path_text_is_absolute_for_platform(
-            windows_path,
-            RuntimePlatform::Linux
-        ));
-    }
-
-    #[test]
-    fn cosmopolitan_argv0_resolution_prefers_launched_file_before_path() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-current-exe-resolution-{}",
-            unix_time_millis()
-        ));
-        let current_dir = root.join("cwd");
-        let path_dir = root.join("bin");
-        fs::create_dir_all(&current_dir)?;
-        fs::create_dir_all(&path_dir)?;
-        let local_binary = current_dir.join("install");
-        let path_binary = path_dir.join("install");
-        fs::write(&local_binary, b"local")?;
-        fs::write(&path_binary, b"path")?;
-        let path_var = std::env::join_paths([path_dir.as_os_str()])?;
-
-        let resolved = current_executable_path_from_argv0_value(
-            std::ffi::OsStr::new("install"),
-            Some(&current_dir),
-            Some(path_var.as_os_str()),
-            true,
-        )?;
-
-        assert_eq!(resolved, local_binary);
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn argv0_resolution_uses_path_when_not_cosmopolitan_preferred() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-current-exe-path-resolution-{}",
-            unix_time_millis()
-        ));
-        let current_dir = root.join("cwd");
-        let path_dir = root.join("bin");
-        fs::create_dir_all(&current_dir)?;
-        fs::create_dir_all(&path_dir)?;
-        let local_binary = current_dir.join("install");
-        let path_binary = path_dir.join("install");
-        fs::write(&local_binary, b"local")?;
-        fs::write(&path_binary, b"path")?;
-        let path_var = std::env::join_paths([path_dir.as_os_str()])?;
-
-        let resolved = current_executable_path_from_argv0_value(
-            std::ffi::OsStr::new("install"),
-            Some(&current_dir),
-            Some(path_var.as_os_str()),
-            false,
-        )?;
-
-        assert_eq!(resolved, path_binary);
-        fs::remove_dir_all(root).ok();
-        Ok(())
     }
 
     #[test]
