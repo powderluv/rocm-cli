@@ -25,8 +25,6 @@ const DEFAULT_PIP_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PIP_RETRIES: u32 = 8;
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
-static PYTHON_VENV_PROBE_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -3412,14 +3410,8 @@ fn python_launcher_install_ready(program: &Path) -> Result<()> {
 }
 
 fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
-    let unique = PYTHON_VENV_PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let probe_dir = std::env::temp_dir().join(format!(
-        "rocm-cli-python-venv-probe-{}-{}-{}",
-        std::process::id(),
-        unix_time_millis(),
-        unique
-    ));
-    let _ = fs::remove_dir_all(&probe_dir);
+    let probe_root = python_venv_probe_temp_root()?;
+    let probe_dir = probe_root.join("env");
     let args = python_venv_args(&probe_dir);
     let venv_result = run_command(
         program,
@@ -3430,7 +3422,7 @@ fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
         "probe Python virtual environment support",
     );
     if let Err(error) = venv_result {
-        let _ = fs::remove_dir_all(&probe_dir);
+        let _ = fs::remove_dir_all(&probe_root);
         return Err(error);
     }
     let env_python = venv_python_path(&probe_dir);
@@ -3439,8 +3431,16 @@ fn verify_python_can_create_pip_venv(program: &Path) -> Result<()> {
         &["-m", "pip", "--version"],
         "probe Python pip support in virtual environment",
     );
-    let _ = fs::remove_dir_all(&probe_dir);
+    let _ = fs::remove_dir_all(&probe_root);
     pip_result.map(|_| ())
+}
+
+fn python_venv_probe_temp_root() -> Result<PathBuf> {
+    if runtime_is_windows() {
+        windows_temp_dir("rocm-cli-python-venv-probe")
+    } else {
+        linux_temp_dir("rocm-cli-python-venv-probe")
+    }
 }
 
 #[cfg(test)]
@@ -3641,7 +3641,6 @@ fn slugify(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -4045,6 +4044,55 @@ echo Python 3.12.10
             .to_ascii_lowercase();
         assert_eq!(launcher_path, expected_path);
         assert!(path_python.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn python_venv_probe_temp_root_uses_windows_temp_env() -> Result<()> {
+        if !runtime_is_windows() {
+            return Ok(());
+        }
+        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let (root, _paths) = test_paths("python-probe-temp-root");
+        let temp_root = root.join("Temp");
+        fs::create_dir_all(&temp_root)?;
+        let old_temp = std::env::var_os("TEMP");
+        let old_tmp = std::env::var_os("TMP");
+        let old_localappdata = std::env::var_os("LOCALAPPDATA");
+        unsafe {
+            std::env::set_var("TEMP", &temp_root);
+            std::env::remove_var("TMP");
+            std::env::remove_var("LOCALAPPDATA");
+        }
+        let probe_root = python_venv_probe_temp_root();
+        unsafe {
+            match old_temp {
+                Some(value) => std::env::set_var("TEMP", value),
+                None => std::env::remove_var("TEMP"),
+            }
+            match old_tmp {
+                Some(value) => std::env::set_var("TMP", value),
+                None => std::env::remove_var("TMP"),
+            }
+            match old_localappdata {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        let probe_root = probe_root?;
+        assert!(
+            probe_root.starts_with(&temp_root),
+            "probe root should stay under TEMP: {} not under {}",
+            probe_root.display(),
+            temp_root.display()
+        );
+        assert!(
+            !probe_root.to_string_lossy().starts_with("/tmp/"),
+            "Windows probe root must not use Unix /tmp: {}",
+            probe_root.display()
+        );
+        fs::remove_dir_all(&probe_root).ok();
         fs::remove_dir_all(root).ok();
         Ok(())
     }
