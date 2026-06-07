@@ -21,9 +21,9 @@ use crossterm::{
     },
 };
 use ratatui::{
-    Frame, Terminal,
+    Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -83,6 +83,8 @@ const CHAT_SESSION_MAX_TURNS: usize = 20;
 const CHAT_SESSION_FOLLOW_SCROLL: u16 = 10_000;
 const ACTIVE_SCREEN_RECENT_OUTPUT_LINES: usize = 120;
 const RUNNING_JOB_OUTPUT_LINES: usize = 1000;
+const FALLBACK_TERMINAL_COLUMNS: u16 = 120;
+const FALLBACK_TERMINAL_ROWS: u16 = 36;
 const VALIDATED_LOCAL_ASSISTANT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
 const THEME_BG: Color = Color::Rgb(13, 15, 18);
 const THEME_PANEL: Color = Color::Rgb(19, 20, 22);
@@ -260,7 +262,7 @@ fn run_app(app: &mut App) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to initialize terminal backend")?;
+    let mut terminal = create_terminal(backend).context("failed to initialize terminal backend")?;
 
     let result = run_loop(&mut terminal, app);
 
@@ -274,6 +276,55 @@ fn run_app(app: &mut App) -> Result<()> {
     terminal.show_cursor().context("failed to restore cursor")?;
 
     result
+}
+
+fn create_terminal(
+    backend: CrosstermBackend<Stdout>,
+) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    if let Some(area) = fallback_terminal_viewport() {
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+    } else {
+        Terminal::new(backend)
+    }
+}
+
+fn fallback_terminal_viewport() -> Option<Rect> {
+    match size() {
+        Ok((width, height)) if width > 1 && height > 1 => None,
+        _ => {
+            let size = fallback_terminal_size_from_env().unwrap_or(Size {
+                width: FALLBACK_TERMINAL_COLUMNS,
+                height: FALLBACK_TERMINAL_ROWS,
+            });
+            Some(Rect::new(0, 0, size.width, size.height))
+        }
+    }
+}
+
+fn fallback_terminal_size_from_env() -> Option<Size> {
+    fallback_terminal_size_from_values(
+        std::env::var("COLUMNS").ok().as_deref(),
+        std::env::var("LINES").ok().as_deref(),
+    )
+}
+
+fn fallback_terminal_size_from_values(columns: Option<&str>, lines: Option<&str>) -> Option<Size> {
+    let width = parse_terminal_dimension(columns?)?;
+    let height = parse_terminal_dimension(lines?)?;
+    if width > 1 && height > 1 {
+        Some(Size { width, height })
+    } else {
+        None
+    }
+}
+
+fn parse_terminal_dimension(value: &str) -> Option<u16> {
+    value.trim().parse::<u16>().ok().filter(|value| *value > 1)
 }
 
 struct App {
@@ -28104,6 +28155,18 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fallback_terminal_size_uses_columns_and_lines_values() {
+        let size = super::fallback_terminal_size_from_values(Some("119"), Some("37"))
+            .expect("valid terminal env size");
+        assert_eq!(size.width, 119);
+        assert_eq!(size.height, 37);
+
+        assert!(super::fallback_terminal_size_from_values(Some("1"), Some("37")).is_none());
+        assert!(super::fallback_terminal_size_from_values(Some("119"), Some("0")).is_none());
+        assert!(super::fallback_terminal_size_from_values(Some("wide"), Some("37")).is_none());
     }
 
     #[test]
