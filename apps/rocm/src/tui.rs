@@ -9279,19 +9279,23 @@ impl App {
     }
 
     fn set_input(&mut self, value: String) {
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         self.input = value;
         self.input_cursor = self.input_len_chars();
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn clear_input(&mut self) {
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         self.input.clear();
         self.input_cursor = 0;
         self.chat_input_scroll = 0;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn input_len_chars(&self) -> usize {
@@ -9321,18 +9325,21 @@ impl App {
     }
 
     fn insert_input_char(&mut self, ch: char) {
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         let index = self.input_cursor_byte_index();
         self.input.insert(index, ch);
         self.input_cursor = self.input_cursor.saturating_add(1);
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn backspace_input(&mut self) {
         if self.input_cursor == 0 {
             return;
         }
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         let end = self.input_cursor_byte_index();
         let start = self.input_byte_index_for_char(self.input_cursor - 1);
         self.input.replace_range(start..end, "");
@@ -9340,18 +9347,21 @@ impl App {
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn delete_input_char(&mut self) {
         if self.input_cursor >= self.input_len_chars() {
             return;
         }
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         let start = self.input_cursor_byte_index();
         let end = self.input_byte_index_for_char(self.input_cursor + 1);
         self.input.replace_range(start..end, "");
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn move_input_left(&mut self) {
@@ -9379,6 +9389,7 @@ impl App {
         if self.input_cursor == 0 {
             return;
         }
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         let chars = self.input.chars().collect::<Vec<_>>();
         let mut start = self.input_cursor;
         while start > 0 && chars[start - 1].is_whitespace() {
@@ -9394,12 +9405,14 @@ impl App {
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
         self.history_index = None;
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn previous_history(&mut self) {
         if self.history.is_empty() {
             return;
         }
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         let next_index = match self.history_index {
             Some(index) if index > 0 => index - 1,
             Some(index) => index,
@@ -9410,12 +9423,14 @@ impl App {
         self.move_input_end();
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn next_history(&mut self) {
         let Some(index) = self.history_index else {
             return;
         };
+        let should_follow_chat = self.command_screen_chat_should_follow_latest();
         if index + 1 >= self.history.len() {
             self.history_index = None;
             self.clear_input();
@@ -9427,6 +9442,7 @@ impl App {
         self.move_input_end();
         self.chat_input_scroll = CHAT_SESSION_FOLLOW_SCROLL;
         self.reset_completion_selection();
+        self.set_chat_session_follow_if_needed(should_follow_chat);
     }
 
     fn cycle_completion(&mut self, direction: CompletionDirection) -> bool {
@@ -39762,6 +39778,48 @@ Full log
         assert!(
             scroll < super::CHAT_SESSION_FOLLOW_SCROLL,
             "PageUp should move from the actual bottom, not remain near the follow sentinel"
+        );
+    }
+
+    #[test]
+    fn chat_session_typing_new_prompt_keeps_latest_visible() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let answer = (0..140)
+            .map(|index| format!("typing follow line {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_chat_session_turn(super::ChatSessionRole::Assistant, answer);
+        if let Some(state) = app.command_screen.as_mut() {
+            state.detail_scroll = 0;
+        }
+        let _ = render_test_terminal(&app, 92, 20);
+
+        for _ in 0..80 {
+            handle_key(&mut app, key_event(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert!(
+            app.command_screen
+                .as_ref()
+                .is_some_and(|state| state.detail_scroll < super::CHAT_SESSION_FOLLOW_SCROLL),
+            "test should use the real bottom offset, not the follow sentinel"
+        );
+
+        let prompt =
+            "please keep the newest assistant answer visible while I type this longer follow up "
+                .repeat(8);
+        for ch in prompt.chars() {
+            handle_key(&mut app, key_event(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        let rendered = render_test_terminal(&app, 92, 20);
+        assert!(
+            rendered.contains("typing follow line 139"),
+            "typing a new prompt should keep the latest answer visible, not jump upward:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("typing follow line 000"),
+            "typing a new prompt should not jump back to the top:\n{rendered}"
         );
     }
 
