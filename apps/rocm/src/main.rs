@@ -19220,12 +19220,15 @@ VERSION_ID="41"
         let (root, paths) = test_paths("model-vllm-support");
         let plugin_dir = paths.primary_engine_plugin_dir();
         fs::create_dir_all(&plugin_dir)?;
-        fs::write(
-            plugin_dir.join(rocm_engine_protocol::platform_engine_plugin_binary_name(
-                "vllm",
-            )),
-            "vllm",
-        )?;
+        let plugin_path = plugin_dir.join(
+            rocm_engine_protocol::platform_engine_plugin_binary_name("vllm"),
+        );
+        fs::write(&plugin_path, "vllm")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755))?;
+        }
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
         let mut output = String::new();
 
@@ -19233,12 +19236,15 @@ VERSION_ID="41"
         let _ = fs::remove_dir_all(root);
 
         if cfg!(windows) {
-            assert!(output.contains("vllm: adapter_available"));
-            assert!(output.contains("runtime_status=unsupported_native_windows"));
-            assert!(output.contains("gpu_execution_required=true"));
-            assert!(!output.contains("CPU fallback"));
+            assert!(output.contains("vllm: adapter_available"), "{output}");
+            assert!(
+                output.contains("runtime_status=unsupported_native_windows"),
+                "{output}"
+            );
+            assert!(output.contains("gpu_execution_required=true"), "{output}");
+            assert!(!output.contains("CPU fallback"), "{output}");
         } else {
-            assert!(output.contains("vllm: available path="));
+            assert!(output.contains("vllm: built_in"), "{output}");
         }
         Ok(())
     }

@@ -26422,6 +26422,12 @@ fn chat_session_cancelled_command_text(title: &str) -> String {
 }
 
 fn chat_session_command_result_text(title: &str, ok: bool, summary: &str) -> String {
+    if ok
+        && title == "ComfyUI"
+        && let Some(display) = chat_session_comfyui_success_text(summary)
+    {
+        return display;
+    }
     let mut output = String::new();
     if ok {
         let _ = writeln!(output, "{title} finished.");
@@ -26437,7 +26443,13 @@ fn chat_session_command_result_text(title: &str, ok: bool, summary: &str) -> Str
 
 fn chat_session_command_result_detail(title: &str, ok: bool, summary: &str) -> String {
     let mut output = String::new();
-    if ok {
+    if ok && title == "ComfyUI" {
+        if let Some(display) = chat_session_comfyui_success_text(summary) {
+            let _ = writeln!(output, "{display}");
+        } else {
+            let _ = writeln!(output, "{title} finished.");
+        }
+    } else if ok {
         let _ = writeln!(output, "{title} finished.");
     } else {
         let _ = writeln!(output, "{title} failed.");
@@ -26456,6 +26468,34 @@ fn chat_session_command_result_detail(title: &str, ok: bool, summary: &str) -> S
         }
     }
     output.trim_end().to_owned()
+}
+
+fn chat_session_comfyui_success_text(summary: &str) -> Option<String> {
+    let url = keyed_output_value(summary, "URL").or_else(|| keyed_output_value(summary, "url"));
+    let models = keyed_output_value(summary, "models path")
+        .or_else(|| keyed_output_value(summary, "models folder"));
+    if let Some(url) = url {
+        let mut output = "ComfyUI is running.".to_owned();
+        output.push_str("\n\nOpen this URL:\n  ");
+        output.push_str(&url);
+        if let Some(models) = models {
+            output.push_str("\n\nPut models here:\n  ");
+            output.push_str(&models);
+        }
+        return Some(output);
+    }
+
+    if comfyui_rendered_is_installed(summary) {
+        let mut output = "ComfyUI installed.".to_owned();
+        output.push_str("\n\nStart ComfyUI:\n  /comfyui start");
+        if let Some(models) = models {
+            output.push_str("\n\nPut models here:\n  ");
+            output.push_str(&models);
+        }
+        return Some(output);
+    }
+
+    None
 }
 
 fn chat_session_command_result_lines(
@@ -27097,8 +27137,8 @@ fn terse_comfyui_success_text(paths: &AppPaths, rendered: &str) -> Option<String
         }
         return Some(output);
     }
-    if rendered.lines().any(|line| line.trim() == "installed: yes") {
-        let mut output = "ComfyUI installed.\n\nNext: Start ComfyUI.".to_owned();
+    if comfyui_rendered_is_installed(rendered) {
+        let mut output = "ComfyUI installed.\n\nStart ComfyUI:\n  /comfyui start".to_owned();
         append_comfyui_tui_paths(&mut output, paths, Some(rendered));
         return Some(output);
     }
@@ -27111,7 +27151,7 @@ fn append_comfyui_tui_paths(output: &mut String, paths: &AppPaths, rendered: Opt
         let _ = writeln!(output, "Put models here:");
         let _ = writeln!(output, "  {}", display_runtime_folder_path(&models));
         let _ = writeln!(output);
-        let _ = writeln!(output, "To print this path later:");
+        let _ = writeln!(output, "Show models path:");
         let _ = writeln!(output, "  rocm comfyui models-path");
     }
 }
@@ -27149,14 +27189,24 @@ fn comfyui_success_status(rendered: &str) -> Option<String> {
         .or_else(|| keyed_output_value(rendered, "url"))
         .map(|url| format!("ComfyUI is running at {url}"))
         .or_else(|| {
-            rendered
-                .lines()
-                .any(|line| line.trim() == "installed: yes")
-                .then(|| "ComfyUI installed.".to_owned())
+            comfyui_rendered_is_installed(rendered).then(|| "ComfyUI installed.".to_owned())
         })
         .or_else(|| {
             keyed_output_value(rendered, "status").map(|status| format!("ComfyUI: {status}"))
         })
+}
+
+fn comfyui_rendered_is_installed(rendered: &str) -> bool {
+    rendered.lines().any(|line| line.trim() == "installed: yes")
+        || keyed_output_values(rendered, "status")
+            .iter()
+            .any(|status| status.eq_ignore_ascii_case("installed"))
+        || keyed_output_values(rendered, "next step")
+            .iter()
+            .any(|step| {
+                step.eq_ignore_ascii_case("rocm comfyui start")
+                    || step.eq_ignore_ascii_case("/comfyui start")
+            })
 }
 
 fn keyed_output_value(rendered: &str, key: &str) -> Option<String> {
@@ -27168,6 +27218,20 @@ fn keyed_output_value(rendered: &str, key: &str) -> Option<String> {
             .then(|| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     })
+}
+
+fn keyed_output_values(rendered: &str, key: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let (name, value) = trimmed.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(key)
+                .then(|| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .collect()
 }
 
 fn write_tui_command_full_log(
@@ -33402,7 +33466,7 @@ mod tests {
             .unwrap_or("<missing>");
         assert!(
             assistant_content.contains("Here is what I found on this computer.")
-                && (assistant_content.contains("AMD Radeon RX 9070 XT")
+                && (assistant_content.contains("GPU:")
                     || assistant_content.contains("WSL DXCore and ROCDXG plumbing detected"))
                 && assistant_content.contains("ROCm/TheRock:"),
             "{assistant_content}"
@@ -33421,7 +33485,7 @@ mod tests {
         assert!(rendered.contains("Assistant"));
         assert!(rendered.contains("Here is what I found on this computer."));
         assert!(
-            rendered.contains("AMD Radeon RX 9070 XT")
+            rendered.contains("GPU:")
                 || rendered.contains("WSL DXCore and ROCDXG plumbing detected")
         );
         assert!(!rendered.contains("Live progress"));
@@ -35799,6 +35863,89 @@ Full log
         let chat_detail = super::command_screen_detail_text(&app);
         assert!(chat_detail.contains("ComfyUI is not installed yet"));
         assert!(!rendered.contains("/comfyui start"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_comfyui_install_result_prompts_to_start() {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let sender = attach_running_job(&mut app, "ComfyUI", super::RunningJobKind::Cli);
+        sender
+            .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
+                ok: true,
+                rendered: "ComfyUI\n  status: installed\n  models path: C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models\n  next step: rocm comfyui start\n".to_owned(),
+                chat_approval: None,
+            })))
+            .unwrap();
+
+        app.poll_running_job();
+
+        let session = app
+            .command_screen
+            .as_ref()
+            .and_then(|state| state.chat_session.as_ref())
+            .expect("chat session should stay open");
+        let tool_turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.role == super::ChatSessionRole::Tool)
+            .expect("ComfyUI result should be shown in chat");
+        assert!(tool_turn.content.contains("ComfyUI installed."));
+        assert!(tool_turn.content.contains("Start ComfyUI:"));
+        assert!(tool_turn.content.contains("/comfyui start"));
+        assert!(
+            tool_turn
+                .content
+                .contains("C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models")
+        );
+        assert!(!tool_turn.content.contains("ComfyUI finished."));
+    }
+
+    #[test]
+    fn assistant_comfyui_start_result_shows_url_models_and_quit_prompt() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.open_local_rocm_tools_chat_session(None);
+        let port = 18188;
+        let url = format!("http://127.0.0.1:{port}");
+        write_comfyui_running_state_for_test(&app, port)?;
+        let sender = attach_running_job(&mut app, "ComfyUI", super::RunningJobKind::Cli);
+        sender
+            .send(super::RunningJobEvent::Finished(Ok(super::CommandOutput {
+                ok: true,
+                rendered: format!(
+                    "ComfyUI\n  status: running\n  URL: {url}\n  models path: C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models\n"
+                ),
+                chat_approval: None,
+            })))
+            .unwrap();
+
+        app.poll_running_job();
+
+        let session = app
+            .command_screen
+            .as_ref()
+            .and_then(|state| state.chat_session.as_ref())
+            .expect("chat session should stay open");
+        let tool_turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.role == super::ChatSessionRole::Tool)
+            .expect("ComfyUI start result should be shown in chat");
+        assert!(tool_turn.content.contains("ComfyUI is running."));
+        assert!(tool_turn.content.contains(&url));
+        assert!(
+            tool_turn
+                .content
+                .contains("C:\\Users\\jam\\.rocm\\apps\\comfyui\\source\\models")
+        );
+        assert!(!tool_turn.content.contains("ComfyUI finished."));
+
+        app.request_quit_overlay_or_wait();
+
+        let overlay = app.overlay_card.as_ref().expect("quit overlay should open");
+        assert_eq!(overlay.title, "Quit");
+        assert!(overlay.detail.contains(&format!("ComfyUI at {url}")));
         Ok(())
     }
 
@@ -43752,6 +43899,31 @@ Full log
                 "torch_version": "2.10.0",
                 "torch_cuda_available": true,
                 "installed_at_unix_ms": 1
+            })
+            .to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn write_comfyui_running_state_for_test(app: &App, port: u16) -> anyhow::Result<()> {
+        let app_root = app.paths.data_dir.join("apps").join("comfyui");
+        let state_dir = app_root.join("state");
+        let source_path = app_root.join("source");
+        let log_path = app_root.join("logs").join("start-1.log");
+        fs::create_dir_all(&state_dir)?;
+        fs::create_dir_all(log_path.parent().expect("test log should have parent"))?;
+        fs::write(
+            state_dir.join("running.json"),
+            serde_json::json!({
+                "app_id": "comfyui",
+                "url": format!("http://127.0.0.1:{port}"),
+                "host": "127.0.0.1",
+                "port": port,
+                "pid": std::process::id(),
+                "source_path": source_path,
+                "python_executable": "python",
+                "log_path": log_path,
+                "started_at_unix_ms": 1
             })
             .to_string(),
         )?;
