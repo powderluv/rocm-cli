@@ -21,11 +21,7 @@ pub fn platform_engine_plugin_binary_name(engine_id: &str) -> String {
         "{ENGINE_PLUGIN_BINARY_PREFIX}{}",
         engine_id_to_plugin_binary_component(engine_id)
     );
-    if cfg!(windows) {
-        format!("{binary_name}.exe")
-    } else {
-        binary_name
-    }
+    rocm_core::platform_binary_name(&binary_name)
 }
 
 fn engine_id_to_plugin_binary_component(engine_id: &str) -> &str {

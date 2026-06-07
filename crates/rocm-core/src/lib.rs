@@ -36,14 +36,20 @@ pub mod runtime;
 use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
-    default_data_dir, managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir,
-    managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
-    normalize_runtime_path_text_for_storage, platform_binary_name, runtime_exe_suffix,
-    runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    runtime_path_for_windows_child, runtime_path_text_is_absolute_for_host,
-    runtime_path_text_is_absolute_for_platform, runtime_python_bin_dir_name,
-    runtime_python_executable_name,
+    default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
+    managed_runtime_cache_dir, managed_tools_dir, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
+    platform_binary_name, prepend_runtime_path, runtime_directory_label,
+    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
+    runtime_install_root_is_protected, runtime_is_cosmopolitan_windows, runtime_is_linux,
+    runtime_is_windows, runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
+    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_rocm_library_filename, runtime_tcp_timeouts_are_supported, shell_command_for_host,
 };
 use runtime::{env_path_override, runtime_path_for_child_process};
 
@@ -116,11 +122,7 @@ fn download_file_with_curl(url: &str, destination: &Path, timeout: Duration) -> 
     }
     let stderr_path = destination.with_extension("curl-stderr.txt");
     let max_time = timeout.as_secs().max(1).to_string();
-    let curl_command = if runtime_is_windows() {
-        "curl.exe"
-    } else {
-        "curl"
-    };
+    let curl_command = platform_binary_name("curl");
     let status = Command::new(curl_command)
         .args(["-fL", "--retry", "3", "--connect-timeout", "30"])
         .args(["--max-time", &max_time])
@@ -284,7 +286,7 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
     let stream =
         TcpStream::connect(addr).with_context(|| format!("failed to connect to {host}:{port}"))?;
-    if !(runtime_is_windows() && std::path::MAIN_SEPARATOR == '/') {
+    if runtime_tcp_timeouts_are_supported() {
         stream.set_read_timeout(Some(timeout)).ok();
         stream.set_write_timeout(Some(timeout)).ok();
     }

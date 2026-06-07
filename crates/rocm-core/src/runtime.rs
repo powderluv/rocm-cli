@@ -103,6 +103,10 @@ pub fn runtime_is_cosmopolitan_windows() -> bool {
     RuntimeHost::current().uses_unix_path_separator_on_windows()
 }
 
+pub fn runtime_tcp_timeouts_are_supported() -> bool {
+    !runtime_is_cosmopolitan_windows()
+}
+
 pub fn runtime_exe_suffix() -> &'static str {
     if runtime_is_windows() { ".exe" } else { "" }
 }
@@ -123,19 +127,77 @@ pub fn runtime_python_executable_name() -> &'static str {
     }
 }
 
-pub(crate) fn env_path_override(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+pub fn runtime_python_env_bin_dir(env_root: &Path) -> PathBuf {
+    normalize_runtime_path_for_host(env_root).join(runtime_python_bin_dir_name())
 }
 
-pub(crate) fn home_rocm_dir() -> Option<PathBuf> {
+pub fn runtime_python_executable_in_env(env_root: &Path) -> PathBuf {
+    runtime_python_env_bin_dir(env_root).join(runtime_python_executable_name())
+}
+
+pub fn runtime_python_activation_script(env_root: &Path) -> PathBuf {
+    let script = if runtime_is_windows() {
+        "activate.bat"
+    } else {
+        "activate"
+    };
+    runtime_python_env_bin_dir(env_root).join(script)
+}
+
+pub fn runtime_python_activation_hint(env_root: &Path) -> String {
+    let script = runtime_python_activation_script(env_root);
+    if runtime_is_windows() {
+        script.display().to_string()
+    } else {
+        format!("source {}", script.display())
+    }
+}
+
+pub fn runtime_rocm_library_filename(shortname: &str) -> String {
+    if runtime_is_windows() {
+        match shortname {
+            "amdhip64" => "amdhip64.dll".to_owned(),
+            other if other.ends_with(".dll") => other.to_owned(),
+            other => format!("{other}.dll"),
+        }
+    } else {
+        match shortname {
+            other if other.starts_with("lib") && other.ends_with(".so") => other.to_owned(),
+            other if other.ends_with(".so") => other.to_owned(),
+            other => format!("lib{other}.so"),
+        }
+    }
+}
+
+pub fn default_interactive_shell_program() -> Option<String> {
+    if runtime_is_windows() {
+        std::env::var("COMSPEC")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some("cmd".to_owned()))
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some("sh".to_owned()))
+    }
+}
+
+pub fn shell_command_for_host(command: &str) -> (String, Vec<String>) {
+    if runtime_is_windows() {
+        ("cmd".to_owned(), vec!["/C".to_owned(), command.to_owned()])
+    } else {
+        ("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()])
+    }
+}
+
+pub fn runtime_home_dir() -> Option<PathBuf> {
     if runtime_is_windows() {
         if let Some(profile) = std::env::var_os("USERPROFILE")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
         {
-            return Some(profile.join(".rocm"));
+            return Some(profile);
         }
         if let (Some(drive), Some(path)) = (
             std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
@@ -143,10 +205,20 @@ pub(crate) fn home_rocm_dir() -> Option<PathBuf> {
         ) {
             let mut home = PathBuf::from(drive);
             home.push(path);
-            return Some(home.join(".rocm"));
+            return Some(home);
         }
     }
-    BaseDirs::new().map(|dirs| dirs.home_dir().join(".rocm"))
+    BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+
+pub(crate) fn env_path_override(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+pub(crate) fn home_rocm_dir() -> Option<PathBuf> {
+    runtime_home_dir().map(|dir| dir.join(".rocm"))
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
@@ -183,6 +255,47 @@ pub fn managed_tools_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("tools")
 }
 
+pub fn runtime_path_list_split(value: &OsStr) -> Vec<PathBuf> {
+    if !runtime_is_windows() {
+        return std::env::split_paths(value).collect();
+    }
+    value
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| normalize_runtime_path_for_host(Path::new(entry)))
+        .collect()
+}
+
+pub fn runtime_path_list_join<I, P>(entries: I) -> Result<OsString>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let entries = entries
+        .into_iter()
+        .map(|entry| normalize_runtime_path_for_host(entry.as_ref()))
+        .collect::<Vec<_>>();
+    if runtime_is_windows() {
+        let joined = entries
+            .iter()
+            .map(|entry| runtime_path_for_windows_child(entry))
+            .collect::<Vec<_>>()
+            .join(";");
+        return Ok(OsString::from(joined));
+    }
+    std::env::join_paths(entries).context("failed to join PATH entries")
+}
+
+pub fn prepend_runtime_path(prefix: &Path, current_path: Option<&OsStr>) -> Result<OsString> {
+    let mut parts = vec![normalize_runtime_path_for_host(prefix)];
+    if let Some(current_path) = current_path {
+        parts.extend(runtime_path_list_split(current_path));
+    }
+    runtime_path_list_join(parts)
+}
+
 pub(crate) fn runtime_path_for_child_process(path: &Path) -> String {
     if runtime_is_windows() {
         runtime_path_for_windows_child(path)
@@ -193,6 +306,111 @@ pub(crate) fn runtime_path_for_child_process(path: &Path) -> String {
 
 pub fn runtime_path_for_windows_child(path: &Path) -> String {
     normalize_runtime_path_text_for_storage(&path.display().to_string())
+}
+
+pub fn runtime_path_for_child(path: &Path) -> String {
+    runtime_path_for_child_process(path)
+}
+
+pub fn runtime_directory_label(path: &Path) -> String {
+    let mut label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    let separator = if runtime_is_windows() { '\\' } else { '/' };
+    if !label.ends_with(['/', '\\']) {
+        label.push(separator);
+    }
+    label
+}
+
+pub fn runtime_path_sort_key(path: &Path) -> String {
+    let key = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    if runtime_is_windows() {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+pub fn runtime_drive_roots() -> Vec<PathBuf> {
+    if !runtime_is_windows() {
+        return Vec::new();
+    }
+    ('A'..='Z')
+        .map(|letter| PathBuf::from(format!("{letter}:/")))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+pub fn runtime_drive_root_for_key(ch: char) -> Option<PathBuf> {
+    if !runtime_is_windows() || !ch.is_ascii_alphabetic() {
+        return None;
+    }
+    let path = PathBuf::from(format!("{}:/", ch.to_ascii_uppercase()));
+    path.is_dir().then_some(path)
+}
+
+pub fn runtime_paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = normalize_runtime_path_for_host(left)
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let right = normalize_runtime_path_for_host(right)
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    if runtime_is_windows() {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
+}
+
+pub fn runtime_path_is_same_or_inside(path: &Path, base: &Path) -> bool {
+    let path = normalize_runtime_path_for_host(path);
+    let base = normalize_runtime_path_for_host(base);
+    if runtime_paths_equivalent(&path, &base) {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| runtime_paths_equivalent(ancestor, &base))
+}
+
+pub fn runtime_install_root_is_protected(path: &Path) -> bool {
+    let path = normalize_runtime_path_for_host(path);
+    if let Some(home) = runtime_home_dir() {
+        let home = normalize_runtime_path_for_host(&home);
+        if runtime_path_is_same_or_inside(&path, &home) && !runtime_paths_equivalent(&path, &home) {
+            return false;
+        }
+    }
+
+    if runtime_is_windows() {
+        let system_roots = ["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"];
+        return system_roots
+            .iter()
+            .map(Path::new)
+            .any(|root| runtime_path_is_same_or_inside(&path, root));
+    }
+
+    if runtime_paths_equivalent(&path, Path::new("/")) {
+        return true;
+    }
+
+    [
+        "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
+        "/sys", "/usr", "/var",
+    ]
+    .iter()
+    .map(Path::new)
+    .any(|root| runtime_path_is_same_or_inside(&path, root))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

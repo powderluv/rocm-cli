@@ -25,10 +25,24 @@ Updated on 2026-06-07:
 - Done: routed `AppPaths::discover()`, setup pip-cache display, TheRock
   managed pip cache/tools root, ComfyUI pip cache, and Doctor pip-cache
   fallback through runtime storage helpers.
-- Remaining: migrate more feature-level `runtime_is_windows()` /
-  `runtime_is_linux()` decisions into intent-level helpers, add explicit
-  `spawn_self` / `find_on_path` helpers, and add an audit guard against new
-  scattered runtime decisions.
+- Done: added runtime helpers for Python venv layout, activation hints,
+  runtime library filenames, child-process path text, PATH splitting/joining,
+  shell command selection, drive roots, directory labels, path comparison,
+  protected install roots, and TCP timeout support.
+- Done: migrated TheRock installer curl/PATH/Python-venv helpers, engine shell
+  setup, ComfyUI runtime PATH/LD_LIBRARY_PATH assembly, setup/runtimes folder
+  protection, folder-picker drive/path labels, and runtime-manager Python path
+  lookups to the runtime helpers.
+- Done: added `scripts/tui_e2e_smoke.py`, a PTY-driven TUI smoke test that
+  launches the real TUI in isolated temp config/data/cache roots and validates
+  fresh setup, main-menu help, slash-popup behavior, and setup-specific `?`
+  handling. The single-exe release gate now runs this smoke on Windows.
+- Done: audited the remaining `cfg!(windows)` hits in app code. The remaining
+  occurrences are in tests/fixtures or are platform diagnostics, not shipped
+  feature-level path decisions.
+- Remaining: add higher-level `spawn_self` / `find_on_path` helpers, migrate
+  daemon/service process launch call sites to those intent APIs, and add an
+  audit guard against new scattered runtime decisions.
 
 ## Why This Exists
 

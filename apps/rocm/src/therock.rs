@@ -5,8 +5,9 @@ use rocm_core::{
     detect_managed_therock_family, managed_pip_cache_dir, managed_tools_dir,
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
-    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_python_bin_dir_name,
-    runtime_python_executable_name, unix_time_millis,
+    normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
+    runtime_path_for_child, runtime_path_list_split, runtime_python_executable_in_env,
+    unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -2187,11 +2188,7 @@ fn run_windows_curl_request(
         .with_context(|| format!("failed to create {}", status_path.display()))?;
     let stderr_file = fs::File::create(stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let curl_command = if runtime_is_windows() {
-        "curl.exe"
-    } else {
-        "curl"
-    };
+    let curl_command = platform_binary_name("curl");
     let mut command = Command::new(curl_command);
     command
         .args(["-sS", "-L", "--max-time", &timeout.to_string()])
@@ -2503,19 +2500,7 @@ fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
 }
 
 fn windows_child_path(path: &Path) -> String {
-    let raw = path.display().to_string();
-    let normalized = raw.replace('\\', "/");
-    let bytes = normalized.as_bytes();
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
-        let drive = (bytes[1] as char).to_ascii_uppercase();
-        let rest = normalized[3..].replace('/', "\\");
-        return format!("{drive}:\\{rest}");
-    }
-    if bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() {
-        let drive = (bytes[1] as char).to_ascii_uppercase();
-        return format!("{drive}:\\");
-    }
-    raw
+    runtime_path_for_child(path)
 }
 
 fn curl_child_path(path: &Path) -> String {
@@ -3367,16 +3352,7 @@ fn resolve_program_on_path(program: &str) -> Vec<PathBuf> {
 }
 
 fn split_runtime_path(value: &std::ffi::OsStr) -> Vec<PathBuf> {
-    if !runtime_is_windows() {
-        return std::env::split_paths(value).collect();
-    }
-    value
-        .to_string_lossy()
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| normalize_runtime_path_for_host(Path::new(entry)))
-        .collect()
+    runtime_path_list_split(value)
 }
 
 fn program_path_candidates(program: &str) -> Vec<String> {
@@ -3623,9 +3599,7 @@ fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
 }
 
 fn venv_python_path(install_root: &Path) -> PathBuf {
-    install_root
-        .join(runtime_python_bin_dir_name())
-        .join(runtime_python_executable_name())
+    runtime_python_executable_in_env(install_root)
 }
 
 fn slugify(value: &str) -> String {

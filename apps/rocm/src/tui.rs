@@ -39,9 +39,10 @@ use rocm_core::{
     daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary,
     find_automation_proposal, format_host_for_url, format_host_port, format_http_base_url,
     load_model_recipe_registry, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_model_ready, replace_automation_proposal, runtime_is_windows,
-    runtime_python_bin_dir_name, runtime_python_executable_name, sanitize_component,
-    unix_time_millis, update_automation_proposal_status,
+    managed_service_endpoint_model_ready, replace_automation_proposal, runtime_directory_label,
+    runtime_drive_root_for_key, runtime_drive_roots, runtime_is_windows,
+    runtime_path_is_same_or_inside, runtime_path_sort_key, sanitize_component, unix_time_millis,
+    update_automation_proposal_status,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -13747,46 +13748,19 @@ fn folder_browser_should_show_directory(current_dir: &Path, path: &Path) -> bool
 }
 
 fn folder_browser_drive_roots() -> Vec<PathBuf> {
-    if !runtime_is_windows() {
-        return Vec::new();
-    }
-    ('A'..='Z')
-        .map(|letter| PathBuf::from(format!("{letter}:/")))
-        .filter(|path| path.is_dir())
-        .collect()
+    runtime_drive_roots()
 }
 
 fn folder_browser_drive_root_for_key(ch: char) -> Option<PathBuf> {
-    if !runtime_is_windows() || !ch.is_ascii_alphabetic() {
-        return None;
-    }
-    let path = PathBuf::from(format!("{}:/", ch.to_ascii_uppercase()));
-    path.is_dir().then_some(path)
-}
-
-fn folder_browser_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| path.display().to_string())
+    runtime_drive_root_for_key(ch)
 }
 
 fn folder_browser_directory_label(path: &Path) -> String {
-    let mut label = folder_browser_name(path);
-    let separator = std::path::MAIN_SEPARATOR;
-    if !label.ends_with(separator) {
-        label.push(separator);
-    }
-    label
+    runtime_directory_label(path)
 }
 
 fn folder_browser_sort_key(path: &Path) -> String {
-    let key = folder_browser_name(path);
-    if runtime_is_windows() {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
+    runtime_path_sort_key(path)
 }
 
 fn folder_browser_selected_status(state: &FolderBrowserState) -> String {
@@ -13994,21 +13968,7 @@ fn system_folder_candidates() -> Vec<PathBuf> {
 }
 
 fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
-    if runtime_is_windows() {
-        let normalize = |value: &Path| {
-            value
-                .display()
-                .to_string()
-                .replace('/', "\\")
-                .trim_end_matches('\\')
-                .to_ascii_lowercase()
-        };
-        let path = normalize(path);
-        let base = normalize(base);
-        path == base || path.starts_with(&format!("{base}\\"))
-    } else {
-        path == base || path.starts_with(base)
-    }
+    runtime_path_is_same_or_inside(path, base)
 }
 
 fn setup_pip_cache_dir(paths: &AppPaths, config: &RocmCliConfig) -> PathBuf {
@@ -14016,9 +13976,7 @@ fn setup_pip_cache_dir(paths: &AppPaths, config: &RocmCliConfig) -> PathBuf {
 }
 
 fn venv_python_path(venv_path: &std::path::Path) -> PathBuf {
-    venv_path
-        .join(runtime_python_bin_dir_name())
-        .join(runtime_python_executable_name())
+    rocm_core::runtime_python_executable_in_env(venv_path)
 }
 
 fn quote_tui_arg(value: &str) -> String {

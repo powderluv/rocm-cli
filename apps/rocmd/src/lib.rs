@@ -2249,7 +2249,7 @@ fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    let rocm_binary = rocm_core::sibling_binary_path("rocm")?;
+    let rocm_binary = rocm_core::daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
     command
         .args(args)
@@ -2555,14 +2555,8 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
-    } else {
-        std::env::var_os("HOME")
-    }
-    .map(std::path::PathBuf::from);
-    match home {
-        Some(home) => !prefix.starts_with(home),
+    match rocm_core::runtime_home_dir() {
+        Some(home) => !rocm_core::runtime_path_is_same_or_inside(prefix, &home),
         None => true,
     }
 }

@@ -124,6 +124,7 @@ def run_windows_smoke(artifact: Path) -> None:
         require("os: windows" in doctor, "Windows doctor did not report os: windows")
         require("detected_gfx_target:" in doctor, "Windows doctor did not report GPU target")
         run_windows_safe_command_smokes(artifact, env)
+        run([sys.executable, "scripts/tui_e2e_smoke.py", "--rocm", str(artifact)], env=env)
 
 
 def run_windows_safe_command_smokes(artifact: Path, env: dict[str, str]) -> None:

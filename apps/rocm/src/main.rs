@@ -14,12 +14,15 @@ use rocm_core::{
     ModelRecipeRegistry, ModelRecipeRegistrySource, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
     builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
-    generate_service_id, interactive_terminal, load_model_recipe_registry,
+    default_interactive_shell_program, engine_binary_path, engine_plugin_dirs, format_host_port,
+    format_http_base_url, generate_service_id, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
     managed_pip_cache_dir, managed_service_endpoint_model_ready, model_artifact_cache_status,
-    process_is_running, read_tcp_stream_to_string, resolve_builtin_model_recipe,
-    resolve_model_recipe, sibling_binary_path, write_all_tcp_stream,
+    prepend_runtime_path, process_is_running, read_tcp_stream_to_string,
+    resolve_builtin_model_recipe, resolve_model_recipe, runtime_install_root_is_protected,
+    runtime_path_is_same_or_inside, runtime_python_activation_hint, runtime_python_env_bin_dir,
+    runtime_python_executable_in_env, shell_command_for_host, sibling_binary_path,
+    write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -1388,17 +1391,11 @@ fn installed_codex_binary() -> Option<PathBuf> {
 }
 
 fn vendored_codex_binary(workspace: &Path) -> Option<PathBuf> {
-    let candidates = if cfg!(windows) {
-        vec![
-            workspace.join("target").join("release").join("codex.exe"),
-            workspace.join("target").join("debug").join("codex.exe"),
-        ]
-    } else {
-        vec![
-            workspace.join("target").join("release").join("codex"),
-            workspace.join("target").join("debug").join("codex"),
-        ]
-    };
+    let binary_name = rocm_core::platform_binary_name("codex");
+    let candidates = vec![
+        workspace.join("target").join("release").join(&binary_name),
+        workspace.join("target").join("debug").join(&binary_name),
+    ];
 
     candidates.into_iter().find(|path| path.is_file())
 }
@@ -2324,7 +2321,7 @@ fn summarize_driver_passive_checks(checks: &[DriverPassiveCheck]) -> DriverPassi
 }
 
 fn passive_driver_checks() -> Vec<DriverPassiveCheck> {
-    if !cfg!(target_os = "linux") {
+    if !rocm_core::runtime_is_linux() {
         return Vec::new();
     }
     vec![
@@ -3090,19 +3087,12 @@ fn read_os_release() -> Result<String> {
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
-    let status = if cfg!(windows) {
-        ProcessCommand::new("cmd")
-            .args(["/C", command])
-            .stdin(Stdio::null())
-            .status()
-    } else {
-        ProcessCommand::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::null())
-            .status()
-    }
-    .with_context(|| format!("failed to launch `{command}`"))?;
+    let (program, args) = shell_command_for_host(command);
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to launch `{command}`"))?;
     if !status.success() {
         bail!("`{command}` exited with {status}");
     }
@@ -3498,10 +3488,10 @@ fn engine_shell(
     let resolved = resolve_engine_env(&paths, &config, engine, runtime_id, env_id)?;
     let shell_program = shell_override
         .map(str::to_owned)
-        .or_else(default_shell_program)
+        .or_else(default_interactive_shell_program)
         .context("unable to determine an interactive shell; set --shell or SHELL")?;
-    let venv_bin = managed_env_bin_dir(&resolved.env_path);
-    let shell_hint = activation_hint(&resolved.env_path);
+    let venv_bin = runtime_python_env_bin_dir(&resolved.env_path);
+    let shell_hint = runtime_python_activation_hint(&resolved.env_path);
 
     println!("engine shell");
     println!("  engine: {engine}");
@@ -3514,7 +3504,7 @@ fn engine_shell(
     println!("  activate_hint: {shell_hint}");
     println!("  exit_hint: use `exit` or Ctrl-D to leave the managed env shell");
 
-    let path_with_env = prepend_path(&venv_bin, std::env::var_os("PATH"))
+    let path_with_env = prepend_runtime_path(&venv_bin, std::env::var_os("PATH").as_deref())
         .context("failed to compose PATH for managed engine env shell")?;
     let mut command = ProcessCommand::new(&shell_program);
     command
@@ -3529,7 +3519,7 @@ fn engine_shell(
         .env("ROCM_CLI_PYTHON", &resolved.python_executable);
     apply_app_path_env(&mut command, &paths);
 
-    if !cfg!(windows) {
+    if !rocm_core::runtime_is_windows() {
         let prompt = format!("(rocm:{engine}) ");
         command.env("VIRTUAL_ENV_PROMPT", &prompt);
         command.env("PS1", format!("{prompt}${{PS1:-}}"));
@@ -3577,12 +3567,7 @@ fn resolve_engine_env(
         && let Some(manifest) = active_pytorch_runtime(paths, &runtime_id)?
     {
         let python_executable = manifest.python_executable.clone().unwrap_or_else(|| {
-            managed_env_bin_dir(&manifest.install_root)
-                .join(if cfg!(windows) {
-                    "python.exe"
-                } else {
-                    "python"
-                })
+            runtime_python_executable_in_env(&manifest.install_root)
                 .display()
                 .to_string()
         });
@@ -3632,45 +3617,6 @@ fn load_engine_env_manifest(
         .join(format!("{env_id}.json"));
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn managed_env_bin_dir(env_path: &Path) -> PathBuf {
-    if cfg!(windows) {
-        env_path.join("Scripts")
-    } else {
-        env_path.join("bin")
-    }
-}
-
-fn prepend_path(prefix: &Path, current_path: Option<OsString>) -> Result<OsString> {
-    let mut parts = vec![prefix.to_path_buf()];
-    if let Some(current_path) = current_path.as_ref() {
-        parts.extend(std::env::split_paths(current_path));
-    }
-    std::env::join_paths(parts).context("failed to join PATH entries")
-}
-
-fn default_shell_program() -> Option<String> {
-    if cfg!(windows) {
-        std::env::var("COMSPEC")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    } else {
-        std::env::var("SHELL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    }
-}
-
-fn activation_hint(env_path: &Path) -> String {
-    if cfg!(windows) {
-        format!(
-            "{}",
-            env_path.join("Scripts").join("activate.bat").display()
-        )
-    } else {
-        format!("source {}", env_path.join("bin").join("activate").display())
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -4998,27 +4944,13 @@ fn active_runtime_marker_matches(paths: &AppPaths, runtime_key: &str) -> Result<
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
     let left = normalize_path_for_compare(left);
     let right = normalize_path_for_compare(right);
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(right.to_string_lossy().as_ref())
-    } else {
-        left == right
-    }
+    rocm_core::runtime_paths_equivalent(&left, &right)
 }
 
 fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
     let path = normalize_path_for_compare(path);
     let base = normalize_path_for_compare(base);
-    if cfg!(windows) {
-        let path_text = path.to_string_lossy().replace('/', "\\").to_lowercase();
-        let base_text = base.to_string_lossy().replace('/', "\\").to_lowercase();
-        path_text == base_text
-            || path_text
-                .strip_prefix(&base_text)
-                .is_some_and(|rest| rest.starts_with('\\'))
-    } else {
-        path == base || path.starts_with(base)
-    }
+    runtime_path_is_same_or_inside(&path, &base)
 }
 
 fn normalize_path_for_compare(path: &Path) -> PathBuf {
@@ -5218,7 +5150,7 @@ fn resolve_adopt_python_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>)
                 absolute.display()
             )
         })?;
-        let python = python_executable_in_env(&env_root);
+        let python = runtime_python_executable_in_env(&env_root);
         if !python.is_file() {
             bail!(
                 "Python executable is missing in {}",
@@ -5235,14 +5167,6 @@ fn resolve_adopt_python_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>)
         "Python executable or folder is missing: {}",
         absolute.display()
     );
-}
-
-fn python_executable_in_env(env_root: &Path) -> PathBuf {
-    if cfg!(windows) {
-        env_root.join("Scripts").join("python.exe")
-    } else {
-        env_root.join("bin").join("python")
-    }
 }
 
 fn infer_python_env_root(python_executable: &Path) -> Option<PathBuf> {
@@ -7329,7 +7253,7 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
     if !matches!(format.as_str(), "pip" | "tarball") {
         bail!("local assistant requested unsupported TheRock install format `{format}`");
     }
-    if cfg!(windows) && format != "pip" {
+    if rocm_core::runtime_is_windows() && format != "pip" {
         bail!("local assistant cannot request `{format}` installs on Windows; use pip");
     }
     let version = json_string(object, "version");
@@ -7735,7 +7659,7 @@ fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
             .get(1)
             .is_some_and(|arg| arg.eq_ignore_ascii_case("sdk"))
     {
-        if cfg!(windows)
+        if rocm_core::runtime_is_windows()
             && chat_cli_arg_value(args, "--format")
                 .is_some_and(|value| !value.eq_ignore_ascii_case("pip"))
         {
@@ -7835,24 +7759,7 @@ fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
 }
 
 fn chat_install_prefix_is_system(prefix: &Path) -> bool {
-    let normalized = prefix
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    if cfg!(windows) {
-        matches!(
-            normalized.as_str(),
-            "c:" | "c:/windows" | "c:/program files" | "c:/program files (x86)"
-        ) || normalized.starts_with("c:/windows/")
-            || normalized.starts_with("c:/program files/")
-            || normalized.starts_with("c:/program files (x86)/")
-    } else {
-        matches!(normalized.as_str(), "" | "/" | "/usr" | "/opt" | "/etc")
-            || normalized.starts_with("/usr/")
-            || normalized.starts_with("/opt/")
-            || normalized.starts_with("/etc/")
-    }
+    prefix.as_os_str().is_empty() || runtime_install_root_is_protected(prefix)
 }
 
 pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> bool {
@@ -9928,15 +9835,15 @@ fn append_model_engine_support_lines(
 
 #[allow(dead_code)]
 fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if cfg!(windows) && engine.eq_ignore_ascii_case("vllm") {
+    if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
         Some(
             "runtime_status=unsupported_native_windows reason=use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
-    } else if cfg!(windows) && engine.eq_ignore_ascii_case("sglang") {
+    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("sglang") {
         Some(
             "runtime_status=unsupported_native_windows reason=use WSL/Linux SGLang ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
-    } else if cfg!(windows) && engine.eq_ignore_ascii_case("atom") {
+    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("atom") {
         Some(
             "runtime_status=unsupported_native_windows reason=use WSL/Linux ATOM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
@@ -10132,7 +10039,7 @@ fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'stati
 }
 
 fn engine_runtime_is_native_windows_unsupported(engine: &str, detect: &DetectResponse) -> bool {
-    if !cfg!(windows)
+    if !rocm_core::runtime_is_windows()
         || !(engine.eq_ignore_ascii_case("vllm")
             || engine.eq_ignore_ascii_case("sglang")
             || engine.eq_ignore_ascii_case("atom"))
@@ -13096,7 +13003,7 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
             ));
         } else {
             for path in collect_installed_binary_candidates(&current_exe)? {
-                if cfg!(windows) && path == current_exe {
+                if rocm_core::runtime_is_windows() && path == current_exe {
                     plan.skipped.push(format!(
                         "skipping running executable on Windows: {}",
                         path.display()
@@ -13951,7 +13858,7 @@ fn app_path_env_var_refs<'a>(vars: &'a [(&'static str, PathBuf)]) -> Vec<(&'stat
 
 fn managed_service_launcher_path() -> Result<PathBuf> {
     let current_exe = daemon_binary_path()?;
-    if rocm_core::runtime_is_windows() && std::path::MAIN_SEPARATOR == '\\' {
+    if rocm_core::runtime_is_windows() && !rocm_core::runtime_is_cosmopolitan_windows() {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)

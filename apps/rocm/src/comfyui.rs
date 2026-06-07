@@ -4,7 +4,8 @@ use flate2::read::GzDecoder;
 use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path, format_http_base_url, managed_pip_cache_dir,
     runtime_is_cosmopolitan_windows, runtime_is_linux, runtime_is_windows,
-    runtime_path_for_windows_child, unix_time_millis,
+    runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
+    runtime_paths_equivalent, unix_time_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -1375,29 +1376,11 @@ fn prepend_env_paths(entries: &[PathBuf], current: Option<OsString>) -> Result<O
 }
 
 fn split_runtime_paths(paths: &OsString) -> Vec<PathBuf> {
-    if runtime_is_windows() {
-        return paths
-            .to_string_lossy()
-            .split(';')
-            .filter(|part| !part.trim().is_empty())
-            .map(PathBuf::from)
-            .collect();
-    }
-    std::env::split_paths(paths).collect()
+    runtime_path_list_split(paths)
 }
 
 fn join_runtime_paths(paths: Vec<PathBuf>) -> Result<Option<OsString>> {
-    if runtime_is_windows() {
-        let joined = paths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(";");
-        return Ok(Some(OsString::from(joined)));
-    }
-    Ok(Some(
-        std::env::join_paths(paths).context("failed to join runtime environment paths")?,
-    ))
+    runtime_path_list_join(paths).map(Some)
 }
 
 fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1410,12 +1393,7 @@ fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn same_path_text(left: &Path, right: &Path) -> bool {
-    if runtime_is_windows() {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
+    runtime_paths_equivalent(left, right)
 }
 
 fn download_and_extract_source(
@@ -1829,7 +1807,7 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::{runtime_python_bin_dir_name, runtime_python_executable_name};
+    use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2134,24 +2112,19 @@ mod tests {
     fn default_runtime_selection_uses_single_ready_runtime() -> Result<()> {
         let paths = test_paths("comfyui-single-ready-runtime");
         let runtime_root = paths.data_dir.join("runtimes").join("default");
-        let python_bin = runtime_root.join(runtime_python_bin_dir_name());
-        let python = python_bin.join(runtime_python_executable_name());
+        let python = runtime_python_executable_in_env(&runtime_root);
+        let python_bin = python
+            .parent()
+            .context("runtime Python path has no parent")?
+            .to_path_buf();
         let sdk_root = runtime_root.join("sdk");
         let sdk_bin = sdk_root.join("bin");
         fs::create_dir_all(&python_bin)?;
         fs::create_dir_all(&sdk_bin)?;
         fs::write(runtime_root.join(".rocm-cli-runtime.json"), "{}")?;
         fs::write(&python, "python")?;
-        let amdhip = sdk_bin.join(if runtime_is_windows() {
-            "amdhip64.dll"
-        } else {
-            "libamdhip64.so"
-        });
-        let hipblas = sdk_bin.join(if runtime_is_windows() {
-            "hipblas.dll"
-        } else {
-            "libhipblas.so"
-        });
+        let amdhip = sdk_bin.join(runtime_rocm_library_filename("amdhip64"));
+        let hipblas = sdk_bin.join(runtime_rocm_library_filename("hipblas"));
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
@@ -2204,8 +2177,11 @@ mod tests {
     fn runtime_environment_preloads_managed_rocm_paths() -> Result<()> {
         let paths = test_paths("comfyui-runtime-env");
         let env_root = paths.data_dir.join("envs").join("therock");
-        let python_bin = env_root.join(runtime_python_bin_dir_name());
-        let python = python_bin.join(runtime_python_executable_name());
+        let python = runtime_python_executable_in_env(&env_root);
+        let python_bin = python
+            .parent()
+            .context("runtime Python path has no parent")?
+            .to_path_buf();
         let sdk_root = paths.data_dir.join("runtimes").join("sdk");
         let sdk_bin = sdk_root.join("bin");
         let sdk_lib = sdk_root.join("lib");
@@ -2297,24 +2273,19 @@ mod tests {
         runtime_key: &str,
     ) -> Result<therock::InstalledRuntimeManifest> {
         let runtime_root = paths.data_dir.join("runtime-root").join(runtime_key);
-        let python_bin = runtime_root.join(runtime_python_bin_dir_name());
-        let python = python_bin.join(runtime_python_executable_name());
+        let python = runtime_python_executable_in_env(&runtime_root);
+        let python_bin = python
+            .parent()
+            .context("runtime Python path has no parent")?
+            .to_path_buf();
         let sdk_root = runtime_root.join("sdk");
         let sdk_bin = sdk_root.join("bin");
         fs::create_dir_all(&python_bin)?;
         fs::create_dir_all(&sdk_bin)?;
         fs::write(runtime_root.join(".rocm-cli-runtime.json"), "{}")?;
         fs::write(&python, "python")?;
-        let amdhip = sdk_bin.join(if runtime_is_windows() {
-            "amdhip64.dll"
-        } else {
-            "libamdhip64.so"
-        });
-        let hipblas = sdk_bin.join(if runtime_is_windows() {
-            "hipblas.dll"
-        } else {
-            "libhipblas.so"
-        });
+        let amdhip = sdk_bin.join(runtime_rocm_library_filename("amdhip64"));
+        let hipblas = sdk_bin.join(runtime_rocm_library_filename("hipblas"));
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
