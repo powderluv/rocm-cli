@@ -332,10 +332,7 @@ fn detect_response() -> DetectResponse {
             } else if installed {
                 None
             } else {
-                Some(
-                    "SGLang command was not found in a Linux/WSL ROCm Python environment"
-                        .to_owned(),
-                )
+                Some("SGLang is not installed in a Linux/WSL ROCm Python environment".to_owned())
             },
         }],
         capabilities: capabilities(),
@@ -602,6 +599,8 @@ fn sglang_server_args(
         host.to_owned(),
         "--port".to_owned(),
         port.to_string(),
+        "--attention-backend".to_owned(),
+        "triton".to_owned(),
     ]);
     args
 }
@@ -761,7 +760,7 @@ fn resolve_sglang_runtime(runtime_id: Option<&str>) -> Result<SglangRuntime> {
     }
 
     bail!(
-        "SGLang command was not found. Install/build SGLang in a Linux or WSL ROCm Python environment, then set ROCM_CLI_SGLANG_COMMAND or install it into the active rocm-cli TheRock runtime. No CPU fallback is used."
+        "SGLang is not installed in a Linux/WSL ROCm Python environment. Install/build SGLang against a ROCm-capable Python environment, then set ROCM_CLI_SGLANG_COMMAND, set ROCM_CLI_SGLANG_PYTHON, or install it into the active rocm-cli TheRock runtime. Native Windows is skipped; no CPU fallback is used."
     )
 }
 
@@ -1328,7 +1327,7 @@ fn current_unix_millis() -> u128 {
 }
 
 fn windows_unsupported_message() -> &'static str {
-    "SGLang ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows SGLang is not enabled. No CPU fallback is used."
+    "SGLang ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows SGLang is skipped. No CPU fallback is used."
 }
 
 fn read_request() -> Result<EngineRequestEnvelope> {
@@ -1400,7 +1399,9 @@ mod tests {
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "30000"
+                "30000",
+                "--attention-backend",
+                "triton"
             ]
         );
         assert_eq!(
@@ -1413,7 +1414,9 @@ mod tests {
                 "--host",
                 "0.0.0.0",
                 "--port",
-                "30001"
+                "30001",
+                "--attention-backend",
+                "triton"
             ]
         );
     }

@@ -51,15 +51,29 @@ ROCm GPTQ half-atomic compatibility path enabled for TheRock 7.13 headers. The
 adapter passes `--gpu-memory-utilization 0.80` by default so display/WSL VRAM
 use does not prevent a small GPU model from starting.
 
+On the MI300X/gfx942 TheRock 7.13 runtime, current vLLM source required the
+GPTQ compatibility guard in
+`csrc/libtorch_stable/quantization/gptq/compat.cuh` to include HIP 7.13:
+
+```diff
+-    (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) < 713)
++    (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) <= 713)
+```
+
+Without that patch, `q_gemm.hip` fails to compile because TheRock 7.13 headers
+do not expose the `half`/`half2` `atomicAdd` overloads used by vLLM's GPTQ
+kernel. With the patch, the live acceptance harness passed on
+`facebook/opt-125m` and verified HIP/BLAS libraries loaded from the managed
+TheRock SDK wheel directories.
+
 Serving through rocm-cli:
 
 ```bash
 rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
 ```
 
-Native Windows vLLM serving is not enabled in this adapter. Use WSL/Linux for
-vLLM ROCm serving, or choose a different engine explicitly. No CPU fallback is
-used.
+Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
+ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 
 References:
 

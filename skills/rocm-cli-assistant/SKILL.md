@@ -21,6 +21,7 @@ Use this skill when answering ROCm CLI local assistant questions.
 - vLLM, SGLang, PyTorch, Lemonade, and llama.cpp are serving engines.
 - The built-in assistant is fixed to qwen served by Lemonade with GPU required. Do not switch the built-in assistant to vLLM or SGLang.
 - Installing an engine and running a model server are different states. Answer each separately when the user asks.
+- On native Windows, vLLM and SGLang serving/install live checks are skipped; tell the user to use WSL/Linux for those ROCm GPU engines and do not suggest CPU fallback.
 
 ## ComfyUI
 

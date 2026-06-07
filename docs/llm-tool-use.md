@@ -21,6 +21,9 @@ rocm-cli local assistants use structured tools, not shell commands.
   PyTorch, llama.cpp, and Lemonade are general serving engines; the assistant
   may inspect or manage them for model serving, but it should not switch its own
   built-in chat engine away from Lemonade.
+- On native Windows, vLLM and SGLang live serving/install checks are skipped.
+  The assistant should direct those requests to WSL/Linux and should not suggest
+  CPU fallback.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the

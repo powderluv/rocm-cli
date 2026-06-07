@@ -570,6 +570,8 @@ rocm engines list
 
 The packaged Linux/WSL-only ATOM, vLLM, and SGLang adapters should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
+The vLLM and SGLang live GPU acceptance scripts should return a clean skip on
+native Windows. They remain strict GPU-required tests on Linux/WSL.
 
 Serve resolver focused tests:
 
@@ -1094,6 +1096,11 @@ it must be an exact runtime key or an unambiguous runtime id. It requires
 `gpu_required`, rejects external vLLM command overrides, checks `/health` and
 `/v1/completions`, and verifies loaded ROCm libraries came from the managed
 TheRock SDK wheel directories.
+For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
+7.13 before building from source; otherwise `q_gemm.hip` can fail on missing
+`half`/`half2` `atomicAdd` overloads.
+On native Windows this script prints a JSON skip result; run it from WSL/Linux
+for live ROCm GPU acceptance.
 
 SGLang TheRock GPU acceptance:
 
@@ -1123,6 +1130,12 @@ python3 scripts/sglang_therock_gpu_test.py \
 The script defaults to the active exact runtime key. If `--runtime-id` is used,
 it must be an exact runtime key or an unambiguous runtime id. It rejects
 external SGLang command/Python overrides and does not allow CPU fallback.
+For MI300X/gfx942 TheRock 7.13, install SGLang from source with
+`python/pyproject_other.toml` and the ROCm `sgl-kernel` wheel. Use the
+rocm-cli adapter's Triton attention default unless AITER has been built and
+verified for the runtime.
+On native Windows this script prints a JSON skip result; run it from WSL/Linux
+for live ROCm GPU acceptance.
 
 ## Windows Tool Notes
 

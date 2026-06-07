@@ -326,7 +326,7 @@ fn detect_response() -> DetectResponse {
             } else if installed {
                 None
             } else {
-                Some("vLLM command was not found in a Linux/WSL ROCm Python environment".to_owned())
+                Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
             },
         }],
         capabilities: capabilities(),
@@ -717,7 +717,7 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
     }
 
     bail!(
-        "vLLM command was not found. Install/build vLLM in a Linux or WSL ROCm Python environment, then set ROCM_CLI_VLLM_COMMAND or install it into the active rocm-cli TheRock runtime. No CPU fallback is used."
+        "vLLM is not installed in a Linux/WSL ROCm Python environment. Install/build vLLM against a ROCm-capable Python environment, then set ROCM_CLI_VLLM_COMMAND, set ROCM_CLI_VLLM_PYTHON, or install it into the active rocm-cli TheRock runtime. Native Windows is skipped; no CPU fallback is used."
     )
 }
 
@@ -1217,7 +1217,7 @@ fn current_unix_millis() -> u128 {
 }
 
 fn windows_unsupported_message() -> &'static str {
-    "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is not enabled. No CPU fallback is used."
+    "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is skipped. No CPU fallback is used."
 }
 
 fn read_request() -> Result<EngineRequestEnvelope> {
