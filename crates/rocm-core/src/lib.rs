@@ -2938,7 +2938,7 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         "164d" | "1681" => Some("gfx1035"),
         "164e" => Some("gfx1036"),
         // RDNA3 APUs.
-        "164f" | "1900" | "1901" => Some("gfx1103"),
+        "15bf" | "164f" | "1900" | "1901" => Some("gfx1103"),
         // RDNA3.5 APUs with public PCI IDs that map cleanly to one gfx target.
         "1114" => Some("gfx1152"),
         // Navi 48: Radeon RX 9070 / 9070 XT / 9070 GRE.
@@ -5363,6 +5363,7 @@ mod tests {
             ("743F", "gfx1034"),
             ("1681", "gfx1035"),
             ("164E", "gfx1036"),
+            ("15BF", "gfx1103"),
             ("164F", "gfx1103"),
             ("1900", "gfx1103"),
             ("1114", "gfx1152"),
