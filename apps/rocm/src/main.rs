@@ -290,6 +290,9 @@ enum InstallTarget {
         /// Pick the TheRock package built on this date.
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
+        /// TheRock GPU package family to install, such as gfx110X-all.
+        #[arg(long)]
+        family: Option<String>,
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
@@ -1998,6 +2001,7 @@ fn install(target: InstallTarget) -> Result<()> {
             prefix,
             version,
             build_date,
+            family,
             dry_run,
         } => {
             let format_name = match format {
@@ -2019,6 +2023,7 @@ fn install(target: InstallTarget) -> Result<()> {
                 format_name,
                 prefix,
                 version_selector,
+                family.as_deref(),
                 dry_run,
             ) {
                 Ok(output) => {
@@ -9074,7 +9079,7 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, true)
+    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
 }
 
 fn run_command_with_timeout(
@@ -11631,7 +11636,7 @@ fn apply_runtime_update(
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
         let install_plan =
-            therock::install_sdk(paths, &source.channel, &source.format, None, None, true)?;
+            therock::install_sdk(paths, &source.channel, &source.format, None, None, None, true)?;
         let _ = writeln!(output, "  install_plan:");
         for line in install_plan.lines() {
             let _ = writeln!(output, "    {line}");
@@ -11640,7 +11645,7 @@ fn apply_runtime_update(
     }
 
     let install_output =
-        therock::install_sdk(paths, &source.channel, &source.format, None, None, false)?;
+        therock::install_sdk(paths, &source.channel, &source.format, None, None, None, false)?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
         .context("updated runtime install completed but the new runtime manifest was not found")?;
@@ -17685,6 +17690,24 @@ install therock";
             .expect("services stop should accept --yes");
         Cli::try_parse_from(["rocm", "services", "restart", "svc-qwen", "--yes"])
             .expect("services restart should accept --yes");
+    }
+
+    #[test]
+    fn install_sdk_accepts_family_override() {
+        Cli::try_parse_from([
+            "rocm",
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "pip",
+            "--prefix",
+            "D:\\jam\\temp\\therock_venvs",
+            "--family",
+            "gfx110X-all",
+        ])
+        .expect("install sdk should accept a TheRock family override");
     }
 
     #[test]

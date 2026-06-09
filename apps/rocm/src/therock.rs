@@ -452,17 +452,25 @@ pub(crate) fn install_sdk(
     format: &str,
     prefix: Option<PathBuf>,
     version_selector: Option<RuntimeVersionSelector>,
+    family_override: Option<&str>,
     dry_run: bool,
 ) -> Result<String> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
-        "pip" => install_pip_runtime(paths, channel, prefix, version_selector.as_ref(), dry_run),
+        "pip" => install_pip_runtime(
+            paths,
+            channel,
+            prefix,
+            family_override,
+            version_selector.as_ref(),
+            dry_run,
+        ),
         "tarball" => {
             if version_selector.is_some() {
                 bail!("specific TheRock version selection is only supported for pip wheel installs")
             }
-            install_tarball_runtime(paths, channel, prefix, dry_run)
+            install_tarball_runtime(paths, channel, prefix, family_override, dry_run)
         }
         other => bail!("unsupported install format: {other}"),
     }
@@ -763,6 +771,7 @@ fn install_pip_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
+    family_override: Option<&str>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
 ) -> Result<String> {
@@ -794,8 +803,13 @@ fn install_pip_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    let resolution =
-        resolve_pip_runtime(paths, channel, None, &wheel_compatibility, version_selector)?;
+    let resolution = resolve_pip_runtime(
+        paths,
+        channel,
+        family_override,
+        &wheel_compatibility,
+        version_selector,
+    )?;
     progress_line(format!(
         "Found TheRock package family {} version {} with a matching PyTorch stack.",
         resolution.family, resolution.latest_version
@@ -1039,9 +1053,10 @@ fn install_tarball_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
+    family_override: Option<&str>,
     dry_run: bool,
 ) -> Result<String> {
-    let artifact = resolve_tarball_artifact(paths, channel, None)?;
+    let artifact = resolve_tarball_artifact(paths, channel, family_override)?;
     let runtime_key = runtime_key(
         channel,
         "tarball",
@@ -4644,7 +4659,7 @@ echo Python 3.12.10
             cache_dir: root.join("cache"),
         };
 
-        let error = install_sdk(&paths, "release", "tarball", None, None, true)
+        let error = install_sdk(&paths, "release", "tarball", None, None, None, true)
             .unwrap_err()
             .to_string();
 

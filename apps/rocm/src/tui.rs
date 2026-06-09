@@ -12039,6 +12039,7 @@ impl App {
         reason: &str,
         display_command: Option<String>,
     ) {
+        let args = self.with_detected_therock_family_for_install_sdk(args);
         if self.config.permissions.full_access_enabled() && !cli_approval_must_show_review(&args) {
             let display = display_command
                 .clone()
@@ -12095,6 +12096,7 @@ impl App {
         display_command: Option<String>,
         explanation: Option<String>,
     ) {
+        let args = self.with_detected_therock_family_for_install_sdk(args);
         if self.config.permissions.full_access_enabled() && !cli_approval_must_show_review(&args) {
             self.record_activity(format!("full access: {pending_title}"));
             self.start_cli_command_with_kind(
@@ -12123,6 +12125,27 @@ impl App {
         self.record_activity(format!("approval requested: {pending_title}"));
         self.status =
             "Review the change. Press Enter or Y to approve; Esc or N cancels.".to_owned();
+    }
+
+    fn with_detected_therock_family_for_install_sdk(&self, mut args: Vec<String>) -> Vec<String> {
+        let is_install_sdk = args
+            .first()
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("install"))
+            && args
+                .get(1)
+                .is_some_and(|arg| arg.eq_ignore_ascii_case("sdk"));
+        let already_has_family = args.iter().any(|arg| {
+            arg.eq_ignore_ascii_case("--family")
+                || arg.to_ascii_lowercase().starts_with("--family=")
+        });
+        if is_install_sdk
+            && !already_has_family
+            && let Some(family) = self.host_gpu_summary.therock_family.as_deref()
+        {
+            args.push("--family".to_owned());
+            args.push(family.to_owned());
+        }
+        args
     }
 
     fn request_chat_tool_approval_or_dependency_install(
@@ -36788,6 +36811,11 @@ Full log
     #[test]
     fn onboarding_enter_requests_rocm_install_with_folder_prefix() {
         let mut app = test_app();
+        app.host_gpu_summary = HostGpuSummary {
+            name: Some("AMD Radeon 780M Graphics".to_owned()),
+            gfx_target: Some("gfx1103".to_owned()),
+            therock_family: Some("gfx110X-all".to_owned()),
+        };
         app.onboarding_active = true;
         app.reset_onboarding_selection();
         let install_root = super::setup_install_root(&app.paths, &app.config);
@@ -36807,11 +36835,30 @@ Full log
                     "pip".to_owned(),
                     "--prefix".to_owned(),
                     install_root.display().to_string(),
+                    "--family".to_owned(),
+                    "gfx110X-all".to_owned(),
                 ]
                 && display_command
                     .as_deref()
                     .is_some_and(|value| value.contains("--prefix"))
         ));
+    }
+
+    #[test]
+    fn onboarding_install_keeps_auto_detect_when_family_is_unknown() {
+        let mut app = test_app();
+        app.host_gpu_summary = HostGpuSummary::default();
+        app.onboarding_active = true;
+        app.reset_onboarding_selection();
+
+        super::handle_onboarding_key(&mut app, key_event(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Some(super::ApprovalAction::CliCommand { args, .. }) =
+            app.pending_approval.as_ref().map(|pending| &pending.action)
+        else {
+            panic!("expected install approval");
+        };
+        assert!(!args.iter().any(|arg| arg == "--family"));
     }
 
     #[test]
