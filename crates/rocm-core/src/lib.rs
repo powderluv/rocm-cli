@@ -8,20 +8,11 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 #[cfg(all(target_vendor = "cosmo", not(windows)))]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
-#[cfg(windows)]
-use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ,
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
@@ -56,6 +47,10 @@ use runtime::{env_path_override, runtime_path_for_child_process};
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
+const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
+const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { $_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
+const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
 
 pub fn format_host_for_url(host: &str) -> String {
     let trimmed = host.trim();
@@ -981,154 +976,48 @@ struct WindowsDisplayAdapter {
     pnp_device_id: Option<String>,
 }
 
-#[cfg(windows)]
-struct WindowsRegistryKey(HKEY);
-
-#[cfg(windows)]
-impl WindowsRegistryKey {
-    fn local_machine() -> Self {
-        Self(HKEY_LOCAL_MACHINE)
-    }
-
-    fn open_local_machine(path: &str) -> Option<Self> {
-        Self::local_machine().open(path)
-    }
-
-    fn open(&self, path: &str) -> Option<Self> {
-        let path = windows_wide_null(path);
-        let mut key = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(
-                self.0,
-                path.as_ptr(),
-                0,
-                KEY_READ | KEY_WOW64_64KEY,
-                &mut key,
-            )
-        };
-        (status == ERROR_SUCCESS).then_some(Self(key))
-    }
-
-    fn enum_subkeys(&self) -> Vec<String> {
-        let mut keys = Vec::new();
-        for index in 0.. {
-            let mut buffer = vec![0_u16; 512];
-            let mut len = buffer.len() as u32;
-            let status = unsafe {
-                RegEnumKeyExW(
-                    self.0,
-                    index,
-                    buffer.as_mut_ptr(),
-                    &mut len,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if status == ERROR_NO_MORE_ITEMS {
-                break;
-            }
-            if status != ERROR_SUCCESS {
-                continue;
-            }
-            buffer.truncate(len as usize);
-            let value = OsString::from_wide(&buffer).to_string_lossy().to_string();
-            if !value.trim().is_empty() {
-                keys.push(value);
-            }
-        }
-        keys
-    }
-
-    fn query_string(&self, name: &str) -> Option<String> {
-        let (kind, wide) = self.query_wide_value(name)?;
-        if kind != REG_SZ && kind != REG_EXPAND_SZ {
-            return None;
-        }
-        Some(trim_registry_wide_string(&wide)).filter(|value| !value.trim().is_empty())
-    }
-
-    fn query_multi_string(&self, name: &str) -> Option<Vec<String>> {
-        let (kind, wide) = self.query_wide_value(name)?;
-        match kind {
-            REG_MULTI_SZ => Some(
-                wide.split(|ch| *ch == 0)
-                    .filter(|part| !part.is_empty())
-                    .map(|part| OsString::from_wide(part).to_string_lossy().to_string())
-                    .filter(|value| !value.trim().is_empty())
-                    .collect(),
-            ),
-            REG_SZ | REG_EXPAND_SZ => Some(vec![trim_registry_wide_string(&wide)]),
-            _ => None,
-        }
-    }
-
-    fn query_wide_value(&self, name: &str) -> Option<(u32, Vec<u16>)> {
-        let name = windows_wide_null(name);
-        let mut kind = 0_u32;
-        let mut len = 0_u32;
-        let status = unsafe {
-            RegQueryValueExW(
-                self.0,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                std::ptr::null_mut(),
-                &mut len,
-            )
-        };
-        if status != ERROR_SUCCESS || len == 0 || !len.is_multiple_of(2) {
-            return None;
-        }
-        let mut wide = vec![0_u16; (len / 2) as usize];
-        let status = unsafe {
-            RegQueryValueExW(
-                self.0,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                wide.as_mut_ptr() as *mut u8,
-                &mut len,
-            )
-        };
-        if status != ERROR_SUCCESS || !len.is_multiple_of(2) {
-            return None;
-        }
-        wide.truncate((len / 2) as usize);
-        Some((kind, wide))
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsRegistryKey {
-    fn drop(&mut self) {
-        if self.0 != HKEY_LOCAL_MACHINE && !self.0.is_null() {
-            unsafe {
-                RegCloseKey(self.0);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn windows_wide_null(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
-}
-
-#[cfg(windows)]
-fn trim_registry_wide_string(wide: &[u16]) -> String {
-    let mut end = wide.len();
-    while end > 0 && wide[end - 1] == 0 {
-        end -= 1;
-    }
-    OsString::from_wide(&wide[..end])
-        .to_string_lossy()
-        .trim()
-        .to_owned()
-}
-
 impl WindowsDoctorInventory {
+    fn is_empty(&self) -> bool {
+        self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
+    }
+
+    fn merge_missing_from(&mut self, mut other: WindowsDoctorInventory) {
+        if self.cpu_model.is_none() {
+            self.cpu_model = other.cpu_model.take();
+        }
+        if self.system_ram_gib.is_none() {
+            self.system_ram_gib = other.system_ram_gib.take();
+        }
+        for display in other.displays {
+            let duplicate = self.displays.iter_mut().find(|existing| {
+                match (
+                    existing.pnp_device_id.as_deref(),
+                    display.pnp_device_id.as_deref(),
+                ) {
+                    (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                    _ => {
+                        !existing.name.trim().is_empty()
+                            && !display.name.trim().is_empty()
+                            && existing.name.eq_ignore_ascii_case(&display.name)
+                    }
+                }
+            });
+            if let Some(existing) = duplicate {
+                if existing.name.trim().is_empty() && !display.name.trim().is_empty() {
+                    existing.name = display.name;
+                }
+                if existing.driver_version.is_none() {
+                    existing.driver_version = display.driver_version;
+                }
+                if existing.pnp_device_id.is_none() {
+                    existing.pnp_device_id = display.pnp_device_id;
+                }
+            } else {
+                self.displays.push(display);
+            }
+        }
+    }
+
     fn amd_display_driver_detail(&self) -> Option<String> {
         self.displays.iter().find_map(|display| {
             let name = display.name.trim();
@@ -1293,11 +1182,9 @@ pub fn default_engine_for_platform() -> &'static str {
 
 fn detect_kernel_version() -> Option<String> {
     if runtime_is_windows() {
-        detect_windows_version_from_registry().or_else(|| {
-            capture_optional_command("cmd", &["/C", "ver"])
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        })
+        capture_optional_command("cmd", &["/C", "ver"])
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
     } else {
         capture_optional_command("uname", &["-r"])
             .map(|value| value.trim().to_owned())
@@ -1340,13 +1227,15 @@ fn detect_cpu_model_with_windows_inventory(
 
 fn detect_cpu_model() -> Option<String> {
     if runtime_is_windows() {
-        return detect_windows_cpu_model_from_registry().or_else(|| {
-            let script =
-                "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
-            capture_optional_command("powershell", &["-NoProfile", "-Command", script])
-                .map(|value| normalize_cpu_model(&value))
-                .filter(|value| !value.is_empty())
-        });
+        let script =
+            "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
+        return capture_optional_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-Command", script],
+            OPTIONAL_COMMAND_TIMEOUT,
+        )
+        .map(|value| normalize_cpu_model(&value))
+        .filter(|value| !value.is_empty());
     }
 
     if runtime_is_linux()
@@ -1384,11 +1273,13 @@ fn detect_system_ram_gib_with_windows_inventory(
 
 pub fn detect_system_ram_gib() -> Option<f64> {
     if runtime_is_windows() {
-        return detect_windows_system_ram_gib().or_else(|| {
-            let script = "(Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory).TotalPhysicalMemory";
-            capture_optional_command("powershell", &["-NoProfile", "-Command", script])
-                .and_then(|value| bytes_text_to_gib(&value))
-        });
+        let script = "(Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory).TotalPhysicalMemory";
+        return capture_optional_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-Command", script],
+            OPTIONAL_COMMAND_TIMEOUT,
+        )
+        .and_then(|value| bytes_text_to_gib(&value));
     }
 
     if runtime_is_linux()
@@ -1426,66 +1317,6 @@ fn format_gib_value(value: f64) -> String {
 
 fn normalize_cpu_model(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-#[cfg(windows)]
-fn detect_windows_version_from_registry() -> Option<String> {
-    let key =
-        WindowsRegistryKey::open_local_machine(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")?;
-    let product = key
-        .query_string("ProductName")
-        .unwrap_or_else(|| "Windows".to_owned());
-    let display = key.query_string("DisplayVersion");
-    let build = key.query_string("CurrentBuildNumber");
-    let ubr = key.query_string("UBR");
-    let mut value = product;
-    if let Some(display) = display {
-        value.push(' ');
-        value.push_str(&display);
-    }
-    if let Some(build) = build {
-        value.push_str(" build ");
-        value.push_str(&build);
-        if let Some(ubr) = ubr {
-            value.push('.');
-            value.push_str(&ubr);
-        }
-    }
-    Some(value)
-}
-
-#[cfg(not(windows))]
-fn detect_windows_version_from_registry() -> Option<String> {
-    None
-}
-
-#[cfg(windows)]
-fn detect_windows_cpu_model_from_registry() -> Option<String> {
-    WindowsRegistryKey::open_local_machine(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")?
-        .query_string("ProcessorNameString")
-        .map(|value| normalize_cpu_model(&value))
-        .filter(|value| !value.is_empty())
-}
-
-#[cfg(not(windows))]
-fn detect_windows_cpu_model_from_registry() -> Option<String> {
-    None
-}
-
-#[cfg(windows)]
-fn detect_windows_system_ram_gib() -> Option<f64> {
-    let mut status = MEMORYSTATUSEX {
-        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-        ..Default::default()
-    };
-    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-    (ok != 0 && status.ullTotalPhys > 0)
-        .then_some(status.ullTotalPhys as f64 / 1024.0 / 1024.0 / 1024.0)
-}
-
-#[cfg(not(windows))]
-fn detect_windows_system_ram_gib() -> Option<f64> {
-    None
 }
 
 fn detect_wsl_summary() -> Option<WslSummary> {
@@ -1713,141 +1544,117 @@ fn detect_windows_amd_display_driver() -> Option<String> {
     None
 }
 
-#[cfg(windows)]
-fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
-    detect_windows_doctor_inventory_from_registry()
-        .filter(|inventory| {
-            inventory.cpu_model.is_some()
-                || inventory.system_ram_gib.is_some()
-                || !inventory.displays.is_empty()
-        })
-        .or_else(detect_windows_doctor_inventory_from_cim)
-}
-
 #[cfg(any(windows, target_vendor = "cosmo"))]
-fn detect_windows_doctor_inventory_from_cim() -> Option<WindowsDoctorInventory> {
+fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
     if !runtime_is_windows() {
         return None;
     }
-    let script = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }; $gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
-    capture_optional_command(
+    let mut inventory = WindowsDoctorInventory::default();
+    if let Some(pnp_util) = detect_windows_doctor_inventory_from_pnputil() {
+        inventory.merge_missing_from(pnp_util);
+    }
+    if inventory.displays.is_empty()
+        && let Some(video) = detect_windows_doctor_inventory_from_video_controller()
+    {
+        inventory.merge_missing_from(video);
+    }
+    if inventory.displays.is_empty()
+        && let Some(pnp) = detect_windows_doctor_inventory_from_pnp_entity()
+    {
+        inventory.merge_missing_from(pnp);
+    }
+    if inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none() {
+        if let Some(system) = detect_windows_system_inventory_from_cim() {
+            inventory.merge_missing_from(system);
+        }
+    }
+
+    (!inventory.is_empty()).then_some(inventory)
+}
+
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn detect_windows_doctor_inventory_from_pnputil() -> Option<WindowsDoctorInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
+        "pnputil",
+        &["/enum-devices", "/class", "Display"],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_pnputil_display_inventory(&output))
+}
+
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn detect_windows_doctor_inventory_from_video_controller() -> Option<WindowsDoctorInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
         "powershell",
         &[
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            script,
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
         ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
     .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(windows)]
-fn detect_windows_doctor_inventory_from_registry() -> Option<WindowsDoctorInventory> {
-    let mut inventory = WindowsDoctorInventory {
-        cpu_model: detect_windows_cpu_model_from_registry(),
-        system_ram_gib: detect_windows_system_ram_gib(),
-        displays: Vec::new(),
-    };
-
-    let pci = WindowsRegistryKey::open_local_machine(r"SYSTEM\CurrentControlSet\Enum\PCI")?;
-    for vendor_key in pci.enum_subkeys() {
-        if !vendor_key.to_ascii_uppercase().contains("VEN_1002") {
-            continue;
-        }
-        let Some(vendor) = pci.open(&vendor_key) else {
-            continue;
-        };
-        for instance_key in vendor.enum_subkeys() {
-            let Some(device) = vendor.open(&instance_key) else {
-                continue;
-            };
-            let hardware_ids = device.query_multi_string("HardwareID").unwrap_or_default();
-            if !windows_registry_device_is_display_adapter(&device, &hardware_ids) {
-                continue;
-            }
-            let Some(name) = windows_registry_display_name(&device) else {
-                continue;
-            };
-            let driver_version = device
-                .query_string("Driver")
-                .and_then(|driver| windows_registry_display_driver_version(&driver));
-            inventory.displays.push(WindowsDisplayAdapter {
-                name,
-                driver_version,
-                pnp_device_id: Some(format!(r"PCI\{vendor_key}\{instance_key}")),
-            });
-        }
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn detect_windows_system_inventory_from_cim() -> Option<WindowsDoctorInventory> {
+    if !runtime_is_windows() {
+        return None;
     }
-
-    Some(inventory)
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_SYSTEM_INVENTORY_SCRIPT,
+        ],
+        OPTIONAL_COMMAND_TIMEOUT,
+    )
+    .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(windows)]
-fn windows_registry_device_is_display_adapter(
-    device: &WindowsRegistryKey,
-    hardware_ids: &[String],
-) -> bool {
-    const DISPLAY_CLASS_GUID: &str = "{4d36e968-e325-11ce-bfc1-08002be10318}";
-    if device
-        .query_string("ClassGUID")
-        .is_some_and(|value| value.eq_ignore_ascii_case(DISPLAY_CLASS_GUID))
-    {
-        return true;
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn detect_windows_doctor_inventory_from_pnp_entity() -> Option<WindowsDoctorInventory> {
+    if !runtime_is_windows() {
+        return None;
     }
-    if device
-        .query_string("Driver")
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with(DISPLAY_CLASS_GUID))
-    {
-        return true;
-    }
-    hardware_ids.iter().any(|value| {
-        let value = value.to_ascii_uppercase();
-        value.contains("VEN_1002") && (value.contains("CC_0300") || value.contains("CC_0302"))
-    })
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_doctor_inventory(&output))
 }
 
-#[cfg(windows)]
-fn windows_registry_display_name(device: &WindowsRegistryKey) -> Option<String> {
-    device
-        .query_string("FriendlyName")
-        .or_else(|| device.query_string("DeviceDesc"))
-        .map(|value| windows_registry_clean_display_name(&value))
-        .filter(|value| !value.trim().is_empty())
+#[cfg(not(any(windows, target_vendor = "cosmo")))]
+fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
+    None
 }
 
-#[cfg(any(windows, test))]
-fn windows_registry_clean_display_name(value: &str) -> String {
+#[cfg(any(windows, target_vendor = "cosmo", test))]
+fn clean_windows_display_name(value: &str) -> String {
     let value = value.trim();
     let value = value
         .rsplit_once(';')
         .map(|(_, name)| name)
         .unwrap_or(value);
     value.trim().to_owned()
-}
-
-#[cfg(windows)]
-fn windows_registry_display_driver_version(driver_key: &str) -> Option<String> {
-    let key = WindowsRegistryKey::open_local_machine(&format!(
-        r"SYSTEM\CurrentControlSet\Control\Class\{driver_key}"
-    ))?;
-    key.query_string("DriverVersion")
-        .filter(|value| !value.trim().is_empty())
-}
-
-#[cfg(all(not(windows), target_vendor = "cosmo"))]
-fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
-    detect_windows_doctor_inventory_from_cim().filter(|inventory| {
-        inventory.cpu_model.is_some()
-            || inventory.system_ram_gib.is_some()
-            || !inventory.displays.is_empty()
-    })
-}
-
-#[cfg(all(not(windows), not(target_vendor = "cosmo")))]
-fn detect_windows_doctor_inventory() -> Option<WindowsDoctorInventory> {
-    None
 }
 
 #[cfg_attr(all(not(windows), not(target_vendor = "cosmo")), allow(dead_code))]
@@ -1895,6 +1702,382 @@ fn parse_windows_doctor_inventory(text: &str) -> WindowsDoctorInventory {
     inventory
 }
 
+#[cfg(any(windows, target_vendor = "cosmo", test))]
+fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsDoctorInventory {
+    let mut inventory = WindowsDoctorInventory::default();
+    let mut name: Option<String> = None;
+    let mut instance_id: Option<String> = None;
+    let mut driver_version: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            push_windows_pnputil_display(
+                &mut inventory,
+                &mut name,
+                &mut instance_id,
+                &mut driver_version,
+            );
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "instance id" | "device instance id" => {
+                instance_id = Some(value.to_owned());
+            }
+            "device description" | "friendly name" | "name" => {
+                name = Some(clean_windows_display_name(value));
+            }
+            "driver version" => {
+                driver_version = Some(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+    push_windows_pnputil_display(
+        &mut inventory,
+        &mut name,
+        &mut instance_id,
+        &mut driver_version,
+    );
+
+    inventory
+}
+
+#[cfg(any(windows, target_vendor = "cosmo", test))]
+fn push_windows_pnputil_display(
+    inventory: &mut WindowsDoctorInventory,
+    name: &mut Option<String>,
+    instance_id: &mut Option<String>,
+    driver_version: &mut Option<String>,
+) {
+    let pnp = instance_id.take();
+    let display_name = name.take().unwrap_or_default();
+    let driver = driver_version.take();
+    let has_amd_id = pnp
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_uppercase().contains("VEN_1002"));
+    let has_amd_name = display_name
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .any(|token| matches!(token, "amd" | "radeon" | "instinct"));
+    if !has_amd_id && !has_amd_name {
+        return;
+    }
+    inventory.displays.push(WindowsDisplayAdapter {
+        name: display_name,
+        driver_version: driver,
+        pnp_device_id: pnp,
+    });
+}
+
+pub fn detect_host_gpu_diagnostics() -> String {
+    let mut output = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(output, "GPU detection diagnostics");
+    let _ = writeln!(output, "  runtime_os: {}", runtime_os_name());
+    let summary = detect_host_gpu_summary(None);
+    let _ = writeln!(
+        output,
+        "  detected_name: {}",
+        summary.name.as_deref().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(
+        output,
+        "  detected_gfx_target: {}",
+        summary.gfx_target.as_deref().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(
+        output,
+        "  detected_therock_family: {}",
+        summary.therock_family.as_deref().unwrap_or("<unknown>")
+    );
+
+    if runtime_is_windows() {
+        append_windows_gpu_probe_diagnostics(&mut output);
+    } else if runtime_is_linux() {
+        let _ = writeln!(
+            output,
+            "  linux_sysfs_gfx_target: {}",
+            detect_linux_sysfs_gfx_target()
+                .as_deref()
+                .unwrap_or("<not found>")
+        );
+        let _ = writeln!(
+            output,
+            "  linux_primary_gpu_name: {}",
+            detect_linux_primary_gpu_name()
+                .as_deref()
+                .unwrap_or("<not found>")
+        );
+        if is_wsl_environment_fast() {
+            let wsl_probe = detect_wsl_windows_display_probe_text().unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  wsl_windows_display_probe_lines: {}",
+                wsl_probe.lines().count()
+            );
+            for line in wsl_probe.lines().take(8) {
+                let _ = writeln!(output, "    {line}");
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn append_windows_gpu_probe_diagnostics(output: &mut String) {
+    append_windows_probe_diagnostics(
+        output,
+        "pnputil display devices",
+        "pnputil",
+        &["/enum-devices", "/class", "Display"],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_pnputil_display_inventory,
+    );
+    append_windows_probe_diagnostics(
+        output,
+        "Win32_VideoController",
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_doctor_inventory,
+    );
+    append_windows_probe_diagnostics(
+        output,
+        "Win32_PnPEntity",
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_doctor_inventory,
+    );
+}
+
+#[cfg(not(any(windows, target_vendor = "cosmo")))]
+fn append_windows_gpu_probe_diagnostics(_output: &mut String) {}
+
+#[cfg(any(windows, target_vendor = "cosmo"))]
+fn append_windows_probe_diagnostics(
+    output: &mut String,
+    label: &str,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    parse: fn(&str) -> WindowsDoctorInventory,
+) {
+    use std::fmt::Write as _;
+    let result = capture_diagnostic_command(program, args, timeout);
+    let _ = writeln!(output, "  probe: {label}");
+    let _ = writeln!(
+        output,
+        "    command: {} {}",
+        result
+            .program
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| program.to_owned()),
+        args.join(" ")
+    );
+    if let Some(error) = result.error.as_deref() {
+        let _ = writeln!(output, "    error: {error}");
+    }
+    if result.timed_out {
+        let _ = writeln!(output, "    error: timed out");
+    }
+    if let Some(status) = result.status.as_deref() {
+        let _ = writeln!(output, "    status: {status}");
+    }
+
+    let inventory = parse(&result.stdout);
+    let _ = writeln!(output, "    display_count: {}", inventory.displays.len());
+    for display in inventory.displays.iter().take(8) {
+        let gfx = display
+            .pnp_device_id
+            .as_deref()
+            .and_then(amd_pci_device_id_from_pnp_id)
+            .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id).map(str::to_owned))
+            .or_else(|| gfx_target_from_amd_marketing_name(&display.name).map(str::to_owned))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let _ = writeln!(
+            output,
+            "      gpu: name={} pnp={} driver={} gfx={}",
+            empty_as_unknown(&display.name),
+            display.pnp_device_id.as_deref().unwrap_or("<unknown>"),
+            display.driver_version.as_deref().unwrap_or("<unknown>"),
+            gfx
+        );
+    }
+    append_diagnostic_stream(output, "stdout", &result.stdout);
+    append_diagnostic_stream(output, "stderr", &result.stderr);
+}
+
+fn empty_as_unknown(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() { "<unknown>" } else { value }
+}
+
+#[derive(Debug)]
+struct DiagnosticCommandResult {
+    program: Option<PathBuf>,
+    status: Option<String>,
+    stdout: String,
+    stderr: String,
+    error: Option<String>,
+    timed_out: bool,
+}
+
+fn capture_diagnostic_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> DiagnosticCommandResult {
+    let candidates = tool_path_candidates(program);
+    let mut last_error = None;
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate);
+        let mut child = match Command::new(&path)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                last_error = Some(format!("failed to launch {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stdout.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stderr.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = stdout_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: Some(status.to_string()),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        error: None,
+                        timed_out: false,
+                    };
+                }
+                Ok(None) if start.elapsed() < timeout => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: None,
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        error: None,
+                        timed_out: true,
+                    };
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(format!("failed to wait: {error}")),
+                        timed_out: false,
+                    };
+                }
+            }
+        }
+    }
+
+    DiagnosticCommandResult {
+        program: None,
+        status: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: last_error.or_else(|| Some(format!("{program} was not found"))),
+        timed_out: false,
+    }
+}
+
+fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
+    use std::fmt::Write as _;
+    let mut lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    if lines.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(output, "    {name}:");
+    for line in lines.take(12) {
+        let _ = writeln!(
+            output,
+            "      {}",
+            truncate_diagnostic_line(line.trim(), 220)
+        );
+    }
+}
+
+fn truncate_diagnostic_line(line: &str, max_chars: usize) -> String {
+    let mut chars = line.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn count_json_files(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -1928,7 +2111,7 @@ pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
 
 #[cfg(windows)]
 fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
-    let windows_inventory = detect_windows_doctor_inventory_from_registry();
+    let windows_inventory = detect_windows_doctor_inventory();
     let gfx_target = detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
     let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
     let name = windows_inventory
@@ -2743,6 +2926,7 @@ fn windows_absolute_tool_candidates(program: &str) -> Vec<String> {
         .unwrap_or_else(|_| r"C:\Windows".to_owned());
     match program.as_str() {
         "cmd" | "cmd.exe" => vec![format!(r"{system_root}\System32\cmd.exe")],
+        "pnputil" | "pnputil.exe" => vec![format!(r"{system_root}\System32\pnputil.exe")],
         "powershell" | "powershell.exe" => vec![
             format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe"),
             "powershell.exe".to_owned(),
@@ -2757,9 +2941,19 @@ fn detect_windows_display_gfx_target() -> Option<String> {
     if !runtime_is_windows() {
         return None;
     }
-    let script = "$gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { \"$($gpu.Name)`t$($gpu.PNPDeviceID)\" }";
-    capture_optional_command("powershell", &["-NoProfile", "-Command", script])
-        .and_then(|output| parse_windows_display_gfx_target(&output))
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_doctor_inventory(&output).display_gfx_probe_text())
+    .and_then(|output| parse_windows_display_gfx_target(&output))
 }
 
 #[cfg(not(any(windows, target_vendor = "cosmo")))]
@@ -2818,7 +3012,6 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
         return None;
     }
 
-    let script = "$gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { \"$($gpu.Name)`t$($gpu.PNPDeviceID)\" }";
     capture_optional_command_with_timeout(
         "powershell.exe",
         &[
@@ -2826,11 +3019,16 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            script,
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
         ],
-        OPTIONAL_COMMAND_TIMEOUT,
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
     )
-    .map(|output| output.trim().to_owned())
+    .map(|output| {
+        parse_windows_doctor_inventory(&output)
+            .display_gfx_probe_text()
+            .trim()
+            .to_owned()
+    })
     .filter(|output| !output.is_empty())
 }
 
@@ -5395,13 +5593,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_registry_display_name_cleaner_removes_inf_resource_prefix() {
+    fn windows_display_name_cleaner_removes_inf_resource_prefix() {
         assert_eq!(
-            windows_registry_clean_display_name("@oem40.inf,%amd7550.23%;AMD Radeon RX 9070 XT"),
+            clean_windows_display_name("@oem40.inf,%amd7550.23%;AMD Radeon RX 9070 XT"),
             "AMD Radeon RX 9070 XT"
         );
         assert_eq!(
-            windows_registry_clean_display_name("AMD Radeon RX 9070 XT"),
+            clean_windows_display_name("AMD Radeon RX 9070 XT"),
             "AMD Radeon RX 9070 XT"
         );
     }
@@ -5467,6 +5665,40 @@ mod tests {
             Some("AMD Radeon RX 9070 XT driver 32.0.13031.9001")
         );
         assert_eq!(inventory.display_gfx_target(), Some("gfx1201".to_owned()));
+    }
+
+    #[test]
+    fn windows_pnputil_inventory_parser_detects_780m_device_id() {
+        let inventory = parse_windows_pnputil_display_inventory(
+            "\
+Instance ID:                PCI\\VEN_1002&DEV_15BF&SUBSYS_15021025&REV_C1\\4&2F6D7E4A&0&0041
+Device Description:        AMD Radeon 780M Graphics
+Class Name:                Display
+Class GUID:                {4d36e968-e325-11ce-bfc1-08002be10318}
+Manufacturer Name:         Advanced Micro Devices, Inc.
+Status:                    Started
+Driver Name:               oem42.inf
+",
+        );
+
+        assert_eq!(
+            inventory.amd_display_name().as_deref(),
+            Some("AMD Radeon 780M Graphics")
+        );
+        assert_eq!(inventory.display_gfx_target(), Some("gfx1103".to_owned()));
+    }
+
+    #[test]
+    fn windows_pnputil_inventory_parser_ignores_non_amd_display() {
+        let inventory = parse_windows_pnputil_display_inventory(
+            "\
+Instance ID:                PCI\\VEN_8086&DEV_9A49&SUBSYS_00000000
+Device Description:        Intel UHD Graphics
+Class Name:                Display
+",
+        );
+
+        assert!(inventory.displays.is_empty());
     }
 
     #[test]

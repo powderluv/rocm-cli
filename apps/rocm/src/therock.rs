@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_therock_family,
-    detect_managed_therock_family, managed_pip_cache_dir, managed_tools_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
+    detect_host_therock_family, detect_managed_therock_family, managed_pip_cache_dir,
+    managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, platform_binary_name, runtime_is_windows, runtime_os_name,
     runtime_path_for_windows_child, runtime_path_list_split, runtime_python_executable_in_env,
@@ -1301,7 +1301,10 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    bail!("unable to resolve a supported TheRock GPU family for this host")
+    bail!(
+        "unable to resolve a supported TheRock GPU family for this host\n\n{}",
+        detect_host_gpu_diagnostics()
+    )
 }
 
 fn select_matching_pip_package_versions(
